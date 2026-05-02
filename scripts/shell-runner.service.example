@@ -1,0 +1,32 @@
+[Unit]
+Description=Shell Runner MCP HTTP Server
+Documentation=https://github.com/Claire-s-Monster/shell-runner
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ClaudeCode/Servers/shell-runner
+ExecStart=pixi run http-server --port 4003
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target
+
+# Installation:
+#   mkdir -p ~/.config/systemd/user
+#   cp shell-runner.service.example ~/.config/systemd/user/shell-runner.service
+#   # Edit paths as needed
+#   systemctl --user daemon-reload
+#   systemctl --user enable shell-runner
+#   systemctl --user start shell-runner
+#
+# Management:
+#   systemctl --user status shell-runner
+#   journalctl --user -u shell-runner -f

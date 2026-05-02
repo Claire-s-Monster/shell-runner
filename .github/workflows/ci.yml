@@ -1,0 +1,44 @@
+---
+# CI pipeline using ci-framework reusable workflow
+name: CI
+
+on:
+  pull_request:
+    branches: [main, development]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+      id-token: write
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@e4eb667206af98c5499c8adf2ba46d395220b0f9  # v2.9.1
+    with:
+      pixi-environment: "ci"
+      python-versions: '["3.11", "3.12"]'
+      os-matrix: '["ubuntu-latest"]'
+      enable-performance: false
+      enable-postgres: false
+      editable-install: false
+    secrets: inherit
+
+  ci-success:
+    name: "CI Success"
+    runs-on: ubuntu-latest
+    needs: [ci]
+    if: always()
+    steps:
+      - name: Check CI status
+        run: |
+          if [[ "${{ needs.ci.result }}" == "success" ]]; then
+            echo "CI passed"
+          else
+            echo "CI failed with result: ${{ needs.ci.result }}"
+            exit 1
+          fi
