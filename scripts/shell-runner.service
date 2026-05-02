@@ -9,7 +9,7 @@ User=memento
 WorkingDirectory=/home/memento/ClaudeCode/Servers/shell-runner
 Environment=SHELL_RUNNER_DB=/home/memento/.local/share/shell-runner/telemetry.sqlite3
 Environment=SHELL_RUNNER_HOST=127.0.0.1
-Environment=SHELL_RUNNER_PORT=4003
+Environment=SHELL_RUNNER_PORT=4111
 ExecStart=/home/memento/ClaudeCode/Servers/shell-runner/scripts/shell-runner-daemon.sh start
 ExecStop=/home/memento/ClaudeCode/Servers/shell-runner/scripts/shell-runner-daemon.sh stop
 Restart=on-failure

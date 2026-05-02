@@ -10,7 +10,7 @@
 #
 # Environment Variables:
 #   SHELL_RUNNER_HOST   Host to bind to (default: 127.0.0.1)
-#   SHELL_RUNNER_PORT   Port to bind to (default: 4003)
+#   SHELL_RUNNER_PORT   Port to bind to (default: 4111)
 #   SHELL_RUNNER_DB     SQLite database path
 #                       (default: $HOME/.local/share/shell-runner/telemetry.sqlite3)
 
@@ -21,7 +21,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Defaults — override via environment
 DEFAULT_HOST="127.0.0.1"
-DEFAULT_PORT="4003"
+DEFAULT_PORT="4111"
 DEFAULT_DB="${HOME}/.local/share/shell-runner/telemetry.sqlite3"
 
 SHELL_RUNNER_HOST="${SHELL_RUNNER_HOST:-$DEFAULT_HOST}"
@@ -207,7 +207,7 @@ Commands:
 
 Environment Variables:
   SHELL_RUNNER_HOST   Bind address (default: 127.0.0.1)
-  SHELL_RUNNER_PORT   Port (default: 4003)
+  SHELL_RUNNER_PORT   Port (default: 4111)
   SHELL_RUNNER_DB     SQLite DB path
                       (default: $HOME/.local/share/shell-runner/telemetry.sqlite3)
 
