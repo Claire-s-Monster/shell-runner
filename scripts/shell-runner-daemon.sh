@@ -84,7 +84,8 @@ start_server() {
     # Start uvicorn via pixi in the project directory
     cd "$PROJECT_DIR"
     export SHELL_RUNNER_DB SHELL_RUNNER_HOST SHELL_RUNNER_PORT
-    nohup pixi run --environment ci uvicorn shell_runner.server:app \
+    export PYTHONPATH="${PROJECT_DIR}/src"
+    nohup "${HOME}/.conda/envs/ClaudeCode/bin/pixi" run --environment ci uvicorn shell_runner.server:app \
         --host "$SHELL_RUNNER_HOST" \
         --port "$SHELL_RUNNER_PORT" \
         >> "$LOG_FILE" 2>&1 &
