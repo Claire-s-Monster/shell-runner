@@ -84,6 +84,7 @@ quality = { depends-on = ["lint", "type-check-lenient"] }
 type-check-lenient = "mypy src/ || echo 'mypy: warnings found (non-blocking)'"
 check-all = { depends-on = ["test", "quality"] }
 build = "python -m build"
+verify-mcp-mount = "python scripts/verify_mcp_mount.py"
 
 [tool.pixi.feature.quality.dependencies]
 pytest = ">=7.0.0"

@@ -163,11 +163,18 @@ class Persistence:
         current_tier: int,
         was_denied: bool,
     ) -> None:
+        """Insert or update a template row, race-safe via BEGIN IMMEDIATE.
+
+        Uses an explicit exclusive transaction so that concurrent callers
+        serialise at the SQLite level: the second writer blocks until the
+        first commits rather than racing on a stale read.
+        """
         now = _now_utc()
+        denial_inc = 1 if was_denied else 0
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                "SELECT observed_agents_json, observed_count, denial_count"
-                " FROM templates WHERE template = ?",
+                "SELECT observed_agents_json FROM templates WHERE template = ?",
                 (template,),
             ).fetchone()
             if existing is None:
@@ -184,7 +191,7 @@ class Persistence:
                         now,
                         json.dumps([agent_id]),
                         current_tier,
-                        1 if was_denied else 0,
+                        denial_inc,
                     ),
                 )
             else:
@@ -205,10 +212,11 @@ class Persistence:
                         now,
                         json.dumps(agents),
                         current_tier,
-                        1 if was_denied else 0,
+                        denial_inc,
                         template,
                     ),
                 )
+            conn.execute("COMMIT")
 
     # --- pending prompts ---
 
@@ -276,8 +284,15 @@ class Persistence:
         return token
 
     def consume_approve_token(self, *, token: str) -> dict | None:
+        """Atomically validate and consume an approve token.
+
+        Uses BEGIN IMMEDIATE so that two concurrent callers serialise at the
+        SQLite level.  The first caller that wins the lock sets consumed_at;
+        the second sees consumed_at IS NOT NULL and returns None.
+        """
         now = _now_utc()
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
@@ -288,17 +303,21 @@ class Persistence:
                 (token,),
             ).fetchone()
             if row is None:
+                conn.execute("ROLLBACK")
                 return None
             # Already consumed
             if row["consumed_at"] is not None:
+                conn.execute("ROLLBACK")
                 return None
             # Expired
             if row["expires_at"] < now:
+                conn.execute("ROLLBACK")
                 return None
             conn.execute(
                 "UPDATE pending_prompts SET consumed_at = ? WHERE approve_token = ?",
                 (now, token),
             )
+            conn.execute("COMMIT")
             return {
                 "id": row["id"],
                 "raw_cmd": row["raw_cmd"],

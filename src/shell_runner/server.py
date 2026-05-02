@@ -5,12 +5,17 @@ Routes:
     POST /classify        — dry-run classification only
     POST /approve_pending — approve or deny a pending prompt
     GET  /health          — service health stats
+    *    /mcp             — FastMCP streamable-HTTP transport (MCP protocol)
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Literal, cast
 
 from fastapi import FastAPI, HTTPException
@@ -18,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from .catalog import Tier, all_rules
 from .classifier import classify
 from .executor import execute
+from .mcp_wrapper import mcp
 from .models import (
     ApproveRequest,
     ApproveResponse,
@@ -30,10 +36,42 @@ from .models import (
 )
 from .persistence import DEFAULT_DB_PATH, Persistence
 
-app = FastAPI(title="shell-runner", version="0.1.0")
+logger = logging.getLogger(__name__)
 
 _db_path = os.environ.get("SHELL_RUNNER_DB", str(DEFAULT_DB_PATH))
 db = Persistence(db_path=_db_path)
+
+_cleanup_task: asyncio.Task[None] | None = None
+
+
+async def _periodic_cleanup(interval_s: int = 60) -> None:
+    """Delete expired pending prompts every *interval_s* seconds."""
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            removed = db.cleanup_expired_prompts()
+            if removed:
+                logger.debug("Cleaned up %d expired pending prompt(s)", removed)
+        except Exception:
+            logger.exception("Error during periodic prompt cleanup")
+
+
+@asynccontextmanager
+async def _lifespan(_application: FastAPI) -> AsyncGenerator[None, None]:
+    global _cleanup_task
+    _cleanup_task = asyncio.create_task(_periodic_cleanup())
+    try:
+        yield
+    finally:
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+        _cleanup_task = None
+
+
+app = FastAPI(title="shell-runner", version="0.1.0", lifespan=_lifespan)
 
 
 @app.post("/execute", response_model=ExecuteResponse)
@@ -286,3 +324,9 @@ async def health_route() -> HealthResponse:
         pending_prompts=stats.get("pending_prompts_count", 0),
         last_error=stats.get("last_error"),
     )
+
+
+# ---------------------------------------------------------------------------
+# MCP HTTP transport — mounted after all REST routes
+# ---------------------------------------------------------------------------
+app.mount("/mcp", mcp.http_app())
