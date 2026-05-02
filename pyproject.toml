@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 readme = "README.md"
 license = {text = "MIT"}
 
+[project.scripts]
+shell-runner-mcp = "shell_runner.mcp_wrapper:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
@@ -46,6 +49,8 @@ shell-runner = { path = ".", editable = true }
 typing-extensions = ">=4.0.0"
 # HTTP transport dependencies
 sse-starlette = ">=2.0.0"
+# MCP wrapper HTTP client
+httpx = ">=0.27"
 # Resilience
 tenacity = ">=8.2.0"
 # Dead code detection
@@ -54,10 +59,15 @@ vulture = ">=2.10"
 [tool.pixi.tasks]
 # HTTP transport server
 http-server = { cmd = "python src/shell_runner/server.py", env = { PYTHONPATH = "src" } }
+# MCP wrapper (stdio transport)
+shell-runner-mcp = { cmd = "shell-runner-mcp", env = { PYTHONPATH = "src" } }
 # Daemon management
 start-daemon = { cmd = "scripts/shell-runner-daemon.sh start", env = { PYTHONPATH = "src" } }
 stop-daemon = { cmd = "scripts/shell-runner-daemon.sh stop" }
 daemon-status = { cmd = "scripts/shell-runner-daemon.sh status" }
+install-systemd = { cmd = "scripts/install-systemd.sh" }
+setup-scripts = { cmd = "python -c \"import os,stat; [os.chmod(f, os.stat(f).st_mode | 0o111) for f in ['scripts/shell-runner-daemon.sh','scripts/install-systemd.sh']]; print('scripts are executable')\"" }
+check-scripts = { cmd = "bash -n scripts/shell-runner-daemon.sh && bash -n scripts/install-systemd.sh && echo 'bash syntax OK'" }
 # Quality tasks
 test = "pytest tests/ -v --ignore=tests/live --ignore=tests/debug"
 test-unit = "pytest tests/unit -v"

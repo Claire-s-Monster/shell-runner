@@ -1,0 +1,21 @@
+[Unit]
+Description=Shell Runner MCP HTTP Server
+Documentation=https://github.com/MementoRC/shell-runner
+After=network.target
+
+[Service]
+Type=simple
+User=memento
+WorkingDirectory=/home/memento/ClaudeCode/Servers/shell-runner
+Environment=SHELL_RUNNER_DB=/home/memento/.local/share/shell-runner/telemetry.sqlite3
+Environment=SHELL_RUNNER_HOST=127.0.0.1
+Environment=SHELL_RUNNER_PORT=4003
+ExecStart=/home/memento/ClaudeCode/Servers/shell-runner/scripts/shell-runner-daemon.sh start
+ExecStop=/home/memento/ClaudeCode/Servers/shell-runner/scripts/shell-runner-daemon.sh stop
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
