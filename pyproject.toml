@@ -10,8 +10,6 @@ requires-python = ">=3.11"
 readme = "README.md"
 license = {text = "MIT"}
 
-[project.scripts]
-shell-runner-mcp = "shell_runner.mcp_wrapper:main"
 
 [project.optional-dependencies]
 dev = [
@@ -37,7 +35,6 @@ platforms = ["linux-64"]
 
 [tool.pixi.dependencies]
 python = ">=3.11"
-fastmcp = ">=1.0.0"
 pydantic = ">=2.0.0"
 aiofiles = ">=23.0.0"
 # HTTP transport dependencies
@@ -59,8 +56,6 @@ vulture = ">=2.10"
 [tool.pixi.tasks]
 # HTTP transport server
 http-server = { cmd = "python src/shell_runner/server.py", env = { PYTHONPATH = "src" } }
-# MCP wrapper (stdio transport)
-shell-runner-mcp = { cmd = "shell-runner-mcp", env = { PYTHONPATH = "src" } }
 # Daemon management
 start-daemon = { cmd = "scripts/shell-runner-daemon.sh start", env = { PYTHONPATH = "src" } }
 stop-daemon = { cmd = "scripts/shell-runner-daemon.sh stop" }

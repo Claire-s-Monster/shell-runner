@@ -5,25 +5,27 @@ Routes:
     POST /classify        — dry-run classification only
     POST /approve_pending — approve or deny a pending prompt
     GET  /health          — service health stats
-    *    /mcp             — FastMCP streamable-HTTP transport (MCP protocol)
+    POST /mcp             — MCP JSON-RPC 2.0 endpoint (Claude Code "type": "http" transport)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from .catalog import Tier, all_rules
 from .classifier import classify
 from .executor import execute
-from .mcp_wrapper import mcp
+from .mcp_wrapper import TOOLS
 from .models import (
     ApproveRequest,
     ApproveResponse,
@@ -327,6 +329,111 @@ async def health_route() -> HealthResponse:
 
 
 # ---------------------------------------------------------------------------
-# MCP HTTP transport — mounted after all REST routes
+# MCP JSON-RPC 2.0 endpoint — Claude Code "type": "http" transport
 # ---------------------------------------------------------------------------
-app.mount("/mcp", mcp.http_app())
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+
+@app.post("/mcp")
+async def handle_mcp_post(request: Request) -> JSONResponse:
+    """Handle MCP JSON-RPC 2.0 requests."""
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": "Parse error"},
+            },
+        )
+
+    method = body.get("method")
+    params = body.get("params", {})
+    req_id = body.get("id")
+
+    if method == "initialize":
+        response = JSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "shell-runner", "version": "0.1.0"},
+                },
+            }
+        )
+        response.headers["MCP-Protocol-Version"] = MCP_PROTOCOL_VERSION
+        return response
+
+    if method == "tools/list":
+        tools_list = [
+            {
+                "name": name,
+                "description": meta["description"],
+                "inputSchema": meta["schema"],
+            }
+            for name, meta in TOOLS.items()
+        ]
+        return JSONResponse(
+            content={"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools_list}}
+        )
+
+    if method == "tools/call":
+        result = await _dispatch_tool_call(params)
+        return JSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(result)}]
+                },
+            }
+        )
+
+    if method in ("notifications/initialized", "ping"):
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        },
+    )
+
+
+async def _dispatch_tool_call(params: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch a tools/call request to the appropriate internal handler."""
+    tool_name = params.get("name")
+    arguments = params.get("arguments", {})
+
+    if tool_name == "shell_execute":
+        try:
+            exec_req = ExecuteRequest(**arguments)
+        except Exception as exc:
+            return {"error": f"invalid arguments: {exc}"}
+        return (await execute_route(exec_req)).model_dump()
+
+    if tool_name == "shell_classify":
+        try:
+            cls_req = ClassifyRequest(**arguments)
+        except Exception as exc:
+            return {"error": f"invalid arguments: {exc}"}
+        return (await classify_route(cls_req)).model_dump()
+
+    if tool_name == "shell_approve_pending":
+        try:
+            approve_req = ApproveRequest(**arguments)
+        except Exception as exc:
+            return {"error": f"invalid arguments: {exc}"}
+        return (await approve_route(approve_req)).model_dump()
+
+    if tool_name == "shell_health":
+        return (await health_route()).model_dump()
+
+    return {"error": f"unknown tool: {tool_name}", "available": list(TOOLS.keys())}
