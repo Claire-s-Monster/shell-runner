@@ -2809,7 +2809,7 @@ packages:
 - pypi: ./
   name: shell-runner
   version: 0.1.0
-  sha256: 87b750ab7432c01784e8dd27cb21c727647392e9897fea08d3fd240bf3071223
+  sha256: b6b1361fb0522f2055eed0b26039956bf27c935e113779fbd1bab5facce64d71
   requires_dist:
   - pytest>=7.0.0 ; extra == 'dev'
   - pytest-asyncio>=0.21.0 ; extra == 'dev'

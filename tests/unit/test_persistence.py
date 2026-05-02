@@ -9,7 +9,6 @@ import pytest
 
 from shell_runner.persistence import Persistence
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -85,7 +84,9 @@ def test_upsert_template_tracks_distinct_agents(tmp_path: Path) -> None:
     db.upsert_template(template="ls", agent_id="a1", current_tier=1, was_denied=False)  # same again
     db.upsert_template(template="ls", agent_id="a2", current_tier=1, was_denied=False)
     with db._conn() as conn:
-        row = conn.execute("SELECT observed_agents_json FROM templates WHERE template = 'ls'").fetchone()
+        row = conn.execute(
+            "SELECT observed_agents_json FROM templates WHERE template = 'ls'"
+        ).fetchone()
     agents = json.loads(row["observed_agents_json"])
     assert sorted(agents) == ["a1", "a2"]
 
@@ -215,17 +216,13 @@ def test_cleanup_expired_prompts_deletes_only_expired(tmp_path: Path) -> None:
     )
     past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
     with db._conn() as conn:
-        conn.execute(
-            "UPDATE pending_prompts SET expires_at = ? WHERE id = ?", (past, expired_id)
-        )
+        conn.execute("UPDATE pending_prompts SET expires_at = ? WHERE id = ?", (past, expired_id))
 
     deleted = db.cleanup_expired_prompts()
     assert deleted == 1
 
     with db._conn() as conn:
-        remaining = conn.execute(
-            "SELECT id FROM pending_prompts", ()
-        ).fetchall()
+        remaining = conn.execute("SELECT id FROM pending_prompts", ()).fetchall()
     ids = [r["id"] for r in remaining]
     assert active_id in ids
     assert expired_id not in ids

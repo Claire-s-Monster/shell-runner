@@ -29,11 +29,11 @@ from .normalizer import Segment, normalize
 # ---------------------------------------------------------------------------
 
 PERMISSIVENESS: dict[Tier, int] = {
-    Tier.AUTO_LOG: 4,      # most permissive: auto-execute, log only
-    Tier.AUTO_CAPPED: 3,   # auto-execute with resource caps
+    Tier.AUTO_LOG: 4,  # most permissive: auto-execute, log only
+    Tier.AUTO_CAPPED: 3,  # auto-execute with resource caps
     Tier.APPROVE_ONCE: 2,  # interactive once, then learn
     Tier.ALWAYS_APPROVE: 1,  # interactive every time
-    Tier.DENY: 0,          # never execute
+    Tier.DENY: 0,  # never execute
 }
 
 # Sentinel permissiveness for ALWAYS_APPROVE agent cap: no restriction.
@@ -272,8 +272,7 @@ def classify(
     command_tier = command_tier_seg.tier
     matched_rule = command_tier_seg.matched_rule
     decision_path.append(
-        f"pipe combined -> {command_tier.name}"
-        f" (from segment {command_tier_seg.segment.verb!r})"
+        f"pipe combined -> {command_tier.name}" f" (from segment {command_tier_seg.segment.verb!r})"
     )
 
     # Step 6: Apply agent cap -- least permissive of (command_tier, agent_cap).

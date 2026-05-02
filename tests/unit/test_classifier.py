@@ -69,9 +69,9 @@ def test_t0_template_match_via_subshell_unsafe():
 def test_t4_before_t2_for_gh_api_post():
     """`gh api -X POST` must classify as T4, not the more permissive T2 `gh api \\S+`."""
     r = classify("gh api -X POST /repos/x/y/issues", CWD, "focused-ghc-ci-analyzer", env=ENV)
-    assert r.command_tier == Tier.ALWAYS_APPROVE, (
-        f"expected T4, got {r.command_tier.name}; path={r.decision_path}"
-    )
+    assert (
+        r.command_tier == Tier.ALWAYS_APPROVE
+    ), f"expected T4, got {r.command_tier.name}; path={r.decision_path}"
 
 
 def test_t4_before_t2_for_curl_post():
@@ -94,9 +94,10 @@ def test_pipe_with_t4_segment_escalates():
     """`find /tmp -name *.log | xargs rm` -- second segment is rm (T4); whole pipe T4."""
     r = classify("find /tmp -name '*.log' | xargs rm", CWD, "focused-ghc-ci-analyzer", env=ENV)
     # find segment is T1, xargs rm -- rm is T4; second segment should escalate above T1
-    assert r.command_tier in (Tier.ALWAYS_APPROVE, Tier.APPROVE_ONCE), (
-        f"pipe with destructive second segment should not be T1; got {r.command_tier.name}"
-    )
+    assert r.command_tier in (
+        Tier.ALWAYS_APPROVE,
+        Tier.APPROVE_ONCE,
+    ), f"pipe with destructive second segment should not be T1; got {r.command_tier.name}"
 
 
 def test_pipe_with_t0_segment_denied():

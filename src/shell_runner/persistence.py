@@ -132,10 +132,20 @@ class Persistence:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    telemetry_id, ts, agent_id, cwd, raw_cmd, normalized_template,
-                    command_tier, final_tier, decision,
-                    matched_rule_pattern, matched_rule_category,
-                    exit_code, stdout_bytes, stderr_bytes,
+                    telemetry_id,
+                    ts,
+                    agent_id,
+                    cwd,
+                    raw_cmd,
+                    normalized_template,
+                    command_tier,
+                    final_tier,
+                    decision,
+                    matched_rule_pattern,
+                    matched_rule_category,
+                    exit_code,
+                    stdout_bytes,
+                    stderr_bytes,
                     duration_ms,
                     json.dumps(decision_path),
                     json.dumps(normalizer_warnings),
@@ -169,7 +179,9 @@ class Persistence:
                     ) VALUES (?, ?, ?, 1, ?, ?, ?)
                     """,
                     (
-                        template, now, now,
+                        template,
+                        now,
+                        now,
                         json.dumps([agent_id]),
                         current_tier,
                         1 if was_denied else 0,
@@ -225,9 +237,15 @@ class Persistence:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    prompt_id, now.isoformat(), expires_at,
-                    agent_id, cwd, raw_cmd,
-                    normalized_template, command_tier, matched_rule_category,
+                    prompt_id,
+                    now.isoformat(),
+                    expires_at,
+                    agent_id,
+                    cwd,
+                    raw_cmd,
+                    normalized_template,
+                    command_tier,
+                    matched_rule_category,
                     json.dumps(decision_path),
                 ),
             )
@@ -294,9 +312,7 @@ class Persistence:
     def cleanup_expired_prompts(self) -> int:
         now = _now_utc()
         with self._conn() as conn:
-            cursor = conn.execute(
-                "DELETE FROM pending_prompts WHERE expires_at < ?", (now,)
-            )
+            cursor = conn.execute("DELETE FROM pending_prompts WHERE expires_at < ?", (now,))
             return cursor.rowcount
 
     # --- queries ---
