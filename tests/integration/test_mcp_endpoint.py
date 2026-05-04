@@ -177,3 +177,86 @@ def test_malformed_json_returns_parse_error(client: TestClient) -> None:
     assert r.status_code == 400
     data = r.json()
     assert data["error"]["code"] == -32700
+
+
+# ---------------------------------------------------------------------------
+# GET /mcp SSE endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_get_mcp_route_exists_not_405(client: TestClient) -> None:
+    """GET /mcp must be a registered route (not return 405 Method Not Allowed).
+
+    Starlette's TestClient buffers the full response body before returning, so
+    we cannot use client.stream() against an infinite SSE generator in-process.
+    Instead, we verify the route is registered by asking Starlette's router
+    directly, confirming Claude Code's client won't receive a 405.
+    """
+    from starlette.routing import Match
+
+    scope = {"type": "http", "method": "GET", "path": "/mcp"}
+    matched = any(
+        route.matches(scope)[0] == Match.FULL for route in client.app.routes  # type: ignore[attr-defined]
+    )
+    assert matched, "GET /mcp route is not registered — Claude Code client will receive 405"
+
+
+# ---------------------------------------------------------------------------
+# resources/* handlers
+# ---------------------------------------------------------------------------
+
+
+def test_resources_list_returns_empty(client: TestClient) -> None:
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "method": "resources/list", "id": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["result"] == {"resources": []}
+
+
+def test_resources_templates_list_returns_empty(client: TestClient) -> None:
+    r = client.post(
+        "/mcp", json={"jsonrpc": "2.0", "method": "resources/templates/list", "id": 1}
+    )
+    assert r.status_code == 200
+    assert r.json()["result"] == {"resourceTemplates": []}
+
+
+def test_resources_read_returns_error(client: TestClient) -> None:
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "method": "resources/read", "id": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert "error" in body
+    assert body["error"]["code"] == -32602
+
+
+# ---------------------------------------------------------------------------
+# prompts/* handlers
+# ---------------------------------------------------------------------------
+
+
+def test_prompts_list_returns_empty(client: TestClient) -> None:
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "method": "prompts/list", "id": 1})
+    assert r.status_code == 200
+    assert r.json()["result"] == {"prompts": []}
+
+
+def test_prompts_get_returns_error(client: TestClient) -> None:
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "method": "prompts/get", "id": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert "error" in body
+    assert body["error"]["code"] == -32602
+
+
+# ---------------------------------------------------------------------------
+# initialize — extended capabilities
+# ---------------------------------------------------------------------------
+
+
+def test_initialize_advertises_resources_and_prompts_capabilities(client: TestClient) -> None:
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "method": "initialize", "id": 1})
+    assert r.status_code == 200
+    caps = r.json()["result"]["capabilities"]
+    assert "tools" in caps
+    assert "resources" in caps
+    assert "prompts" in caps

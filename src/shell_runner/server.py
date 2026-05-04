@@ -6,6 +6,7 @@ Routes:
     POST /approve_pending — approve or deny a pending prompt
     GET  /health          — service health stats
     POST /mcp             — MCP JSON-RPC 2.0 endpoint (Claude Code "type": "http" transport)
+    GET  /mcp             — SSE keepalive stream for MCP server-push notifications
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .catalog import Tier, all_rules
 from .classifier import classify
@@ -361,7 +362,11 @@ async def handle_mcp_post(request: Request) -> JSONResponse:
                 "id": req_id,
                 "result": {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "resources": {"subscribe": False, "listChanged": False},
+                        "prompts": {"listChanged": False},
+                    },
                     "serverInfo": {"name": "shell-runner", "version": "0.1.0"},
                 },
             }
@@ -397,12 +402,75 @@ async def handle_mcp_post(request: Request) -> JSONResponse:
     if method in ("notifications/initialized", "ping"):
         return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
 
+    if method == "resources/list":
+        return JSONResponse(
+            content={"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}}
+        )
+
+    if method == "resources/templates/list":
+        return JSONResponse(
+            content={"jsonrpc": "2.0", "id": req_id, "result": {"resourceTemplates": []}}
+        )
+
+    if method == "resources/read":
+        return JSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": "shell-runner exposes no resources"},
+            }
+        )
+
+    if method == "prompts/list":
+        return JSONResponse(
+            content={"jsonrpc": "2.0", "id": req_id, "result": {"prompts": []}}
+        )
+
+    if method == "prompts/get":
+        return JSONResponse(
+            content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": "shell-runner exposes no prompts"},
+            }
+        )
+
     return JSONResponse(
         status_code=200,
         content={
             "jsonrpc": "2.0",
             "id": req_id,
             "error": {"code": -32601, "message": f"Method not found: {method}"},
+        },
+    )
+
+
+@app.get("/mcp")
+async def handle_mcp_sse(request: Request) -> StreamingResponse:
+    """SSE endpoint for server-pushed notifications.
+
+    Claude Code's HTTP MCP client opens this stream after `initialize`. We have
+    no notifications to push (Phase 1 MVP), so we keep the connection alive with
+    periodic comments. Without this route, Claude Code receives 405 and hangs.
+    """
+
+    async def _stream() -> AsyncGenerator[bytes, None]:
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                yield b": keepalive\n\n"
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
     )
 
