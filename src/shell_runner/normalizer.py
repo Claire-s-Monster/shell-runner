@@ -254,12 +254,12 @@ def _classify_token(
         if depth >= _MAX_SUBSHELL_DEPTH:
             state.warn("nested_subshell_depth>3")
             return "<subshell:...>"
-        inner = _normalize_internal(
+        inner_normalized = _normalize_internal(
             inner_cmd, cwd, env=env, safe_domains=safe_domains, depth=depth + 1
         )
-        if inner.segments and inner.segments[0].verb in _EXEC_UNSAFE_VERBS:
+        if inner_normalized.segments and inner_normalized.segments[0].verb in _EXEC_UNSAFE_VERBS:
             return "<subshell_exec_unsafe>"
-        return f"<subshell:{inner.template}>"
+        return f"<subshell:{inner_normalized.template}>"
 
     # 4. Backtick subshell `cmd` — same as 3
     if tok.startswith("`") and tok.endswith("`"):
@@ -267,12 +267,12 @@ def _classify_token(
         if depth >= _MAX_SUBSHELL_DEPTH:
             state.warn("nested_subshell_depth>3")
             return "<subshell:...>"
-        inner = _normalize_internal(
+        inner_normalized = _normalize_internal(
             inner_cmd, cwd, env=env, safe_domains=safe_domains, depth=depth + 1
         )
-        if inner.segments and inner.segments[0].verb in _EXEC_UNSAFE_VERBS:
+        if inner_normalized.segments and inner_normalized.segments[0].verb in _EXEC_UNSAFE_VERBS:
             return "<subshell_exec_unsafe>"
-        return f"<subshell:{inner.template}>"
+        return f"<subshell:{inner_normalized.template}>"
 
     # 5. Variable $VAR or ${VAR}
     var_match = re.fullmatch(r"\$\{?(\w+)\}?", tok)

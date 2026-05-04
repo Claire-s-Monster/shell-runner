@@ -169,10 +169,6 @@ warn_unused_ignores = false
 warn_return_any = false
 no_implicit_reexport = false
 
-[[tool.mypy.overrides]]
-module = "shell_runner.normalizer"
-ignore_errors = true
-
 # ============================================================================
 # Pytest Configuration
 # ============================================================================
