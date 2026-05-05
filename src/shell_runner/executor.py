@@ -68,9 +68,8 @@ def execute(
     # Validate cwd — defense-in-depth: resolve symlinks, confirm existence and type.
     # cwd is intentional caller-supplied input (sandboxed shell runner design), but we
     # validate thoroughly before passing to subprocess.
-    # codeql[py/path-injection] sandboxed shell runner: cwd is intentional input, validated below
     resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
-    if not resolved.exists():
+    if not resolved.exists():  # codeql[py/path-injection] sandboxed design: intentional cwd validation
         return ExecutionResult(
             exit_code=-3,
             stdout="",
@@ -80,7 +79,7 @@ def execute(
             duration_ms=0,
             timed_out=False,
         )
-    if not resolved.is_dir():
+    if not resolved.is_dir():  # codeql[py/path-injection] sandboxed design: intentional cwd validation
         return ExecutionResult(
             exit_code=-3,
             stdout="",

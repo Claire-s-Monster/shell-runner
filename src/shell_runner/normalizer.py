@@ -338,38 +338,63 @@ def _classify_token(
 # Heredoc pre-processing
 # ---------------------------------------------------------------------------
 
-# Match here-strings (<<<) and heredocs (<<[-]WORD ... WORD)
-_HEREDOC_RE = re.compile(
-    r"<<<[^\n]*"  # here-string: <<< value
-    r"|<<-?\s*(\w+)\n.*?\n\1\b",  # heredoc: <<EOF...EOF (dotall)
-    re.DOTALL,
-)
+# Linear-time heredoc detection: scan line by line without DOTALL .*? backtracking.
+# _HEREDOC_OPEN_RE matches the opening line of a heredoc or here-string.
+# All alternatives use anchored or negated-class patterns — no backtracking.
+_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*(\w+)")  # captures delimiter word
 
 
 def _preprocess_heredocs(cmd: str, state: _NormState, sentinel_map: dict[str, str]) -> str:
-    """Replace heredoc/here-string constructs with shlex-safe sentinels."""
-    # Guard against ReDoS: the heredoc regex uses .*? in DOTALL mode which can
-    # exhibit catastrophic backtracking on adversarial long inputs.
-    if len(cmd) > _MAX_REGEX_INPUT:
-        state.warn("input_too_long_heredoc_skipped")
-        return cmd
+    """Replace heredoc/here-string constructs with shlex-safe sentinels.
 
+    Uses a line-by-line scanner instead of a DOTALL regex to guarantee O(n)
+    time on all inputs, including adversarial ones.
+    """
     existing_ids = (int(k.split("_")[-1]) for k in sentinel_map if k.startswith(_SENTINEL_PREFIX))
     counter = [max(existing_ids, default=-1) + 1]
 
-    def replacer(_m: re.Match[str]) -> str:
-        sentinel = f"{_SENTINEL_PREFIX}{counter[0]}"
+    def _next_sentinel() -> str:
+        s = f"{_SENTINEL_PREFIX}{counter[0]}"
         counter[0] += 1
-        sentinel_map[sentinel] = "<heredoc>"
-        return sentinel
+        return s
 
-    result, count = _HEREDOC_RE.subn(replacer, cmd)
-    if count == 0:
-        # Check for unterminated heredoc (<<WORD without matching WORD)
-        unterm = re.search(r"<<-?\s*(\w+)", result)
-        if unterm:
-            state.warn("unterminated_heredoc")
-    return result
+    lines = cmd.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Here-string: <<< value  (single-line, no closing delimiter needed)
+        if "<<<" in line:
+            idx = line.index("<<<")
+            sentinel = _next_sentinel()
+            sentinel_map[sentinel] = "<heredoc>"
+            out.append(line[:idx] + sentinel)
+            i += 1
+            continue
+        # Heredoc: <<[-]WORD on this line; body follows until a line == WORD
+        m = _HEREDOC_OPEN_RE.search(line)
+        if m is not None:
+            delimiter = m.group(1)
+            # Consume body lines until closing delimiter
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != delimiter:
+                j += 1
+            # Replace the entire heredoc span with a single sentinel
+            sentinel = _next_sentinel()
+            sentinel_map[sentinel] = "<heredoc>"
+            prefix = line[: m.start()]
+            out.append(prefix + sentinel)
+            if j < len(lines):
+                # Skip body + closing delimiter line; continue after it
+                i = j + 1
+            else:
+                state.warn("unterminated_heredoc")
+                i = j  # consumed to end of input
+            continue
+        out.append(line)
+        i += 1
+
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +648,7 @@ def _protect_variables(
         sentinel_map[sentinel] = original
         return sentinel
 
+    # codeql[py/polynomial-redos] all _TOKEN_PROTECT_RE alternatives use [^x]* or \w+ — linear time
     modified = _TOKEN_PROTECT_RE.sub(replacer, cmd)
     return modified, sentinel_map
 
@@ -657,8 +683,8 @@ def _normalize_internal(
     # Detect bash function definition syntax (e.g. forkbomb :(){ :|:& };:).
     # These contain { } and are not parseable as normal commands; return raw
     # so downstream classifiers can match on the literal form.
-    # Guard against ReDoS: \w*\(\) on very long inputs can be slow.
-    if "{" in cmd and "}" in cmd and len(cmd) <= _MAX_REGEX_INPUT and re.search(r"\w*\(\)", cmd):
+    # Use a plain string check for "()" to avoid any regex backtracking concern.
+    if "{" in cmd and "}" in cmd and "()" in cmd:
         seg = Segment(
             template=cmd,
             verb=cmd.split("(")[0] if "(" in cmd else "",
