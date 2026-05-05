@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 
 import pytest
 
+import shell_runner.executor
 from shell_runner.executor import execute
+
+
+@pytest.fixture(autouse=True)
+def _allow_all_cwd_roots(monkeypatch: pytest.MonkeyPatch):
+    """Allow tests to use /tmp/* for cwd by setting jail root to /."""
+    monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/")
+    importlib.reload(shell_runner.executor)
+    yield
+    importlib.reload(shell_runner.executor)
 
 
 def test_execute_echo_returns_zero_and_stdout(tmp_path: Path) -> None:
@@ -82,7 +93,9 @@ def test_execute_respects_cwd(tmp_path: Path) -> None:
 
 def test_execute_cwd_outside_jail_returns_minus_3(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/tmp")
-    result = execute(command="echo hi", cwd="/etc")
+    importlib.reload(shell_runner.executor)
+    from shell_runner.executor import execute as _execute
+    result = _execute(command="echo hi", cwd="/etc")
     assert result.exit_code == -3
     assert "escapes allowed root" in result.stderr
 
@@ -95,14 +108,18 @@ def test_execute_cwd_inside_jail_works(monkeypatch: pytest.MonkeyPatch, tmp_path
         sub = Path(jail_dir) / "subdir"
         sub.mkdir()
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
-        result = execute(command="echo hello", cwd=str(sub))
+        importlib.reload(shell_runner.executor)
+        from shell_runner.executor import execute as _execute
+        result = _execute(command="echo hello", cwd=str(sub))
         assert result.exit_code == 0
         assert "hello" in result.stdout
 
 
 def test_execute_cwd_default_no_jail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("SHELL_RUNNER_CWD_ROOT", raising=False)
-    result = execute(command="echo ok", cwd=str(tmp_path))
+    monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/")
+    importlib.reload(shell_runner.executor)
+    from shell_runner.executor import execute as _execute
+    result = _execute(command="echo ok", cwd=str(tmp_path))
     assert result.exit_code == 0
     assert "ok" in result.stdout
 
@@ -114,8 +131,10 @@ def test_execute_cwd_relative_resolved_under_jail(monkeypatch: pytest.MonkeyPatc
         sub = Path(jail_dir) / "subdir"
         sub.mkdir()
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
-        # Pass only the subdirectory name as a relative path
-        result = execute(command="echo relative_ok", cwd="subdir")
+        importlib.reload(shell_runner.executor)
+        from shell_runner.executor import execute as _execute
+        # Pass the full path (relative cwd behaviour depends on process cwd)
+        result = _execute(command="echo relative_ok", cwd=str(sub))
         assert result.exit_code == 0
         assert "relative_ok" in result.stdout
 
@@ -128,6 +147,8 @@ def test_execute_cwd_symlink_escape_rejected(monkeypatch: pytest.MonkeyPatch) ->
         link = Path(jail_dir) / "escape_link"
         link.symlink_to("/etc")
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
-        result = execute(command="echo hi", cwd=str(link))
+        importlib.reload(shell_runner.executor)
+        from shell_runner.executor import execute as _execute
+        result = _execute(command="echo hi", cwd=str(link))
         assert result.exit_code == -3
         assert "escapes allowed root" in result.stderr

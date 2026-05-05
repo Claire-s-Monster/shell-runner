@@ -9,6 +9,7 @@ Runs commands via /bin/bash with:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import uuid
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ MAX_TIMEOUT_S = 600
 DEFAULT_ENV_PASSTHROUGH = ["HOME", "USER", "PATH", "LANG", "TERM"]
 
 _OVERFLOW_DIR = Path("/tmp/shell-runner-overflow")  # noqa: S108
+_CWD_ROOT = Path(os.environ.get("SHELL_RUNNER_CWD_ROOT", os.getcwd())).resolve()
 
 
 @dataclass(frozen=True)
@@ -62,19 +64,17 @@ def execute(
     overflow_dir: str = str(_OVERFLOW_DIR),
 ) -> ExecutionResult:
     """Run command via /bin/bash with cwd jail, env stripping, timeout, output truncation."""
-    import os
     import time
 
-    # Validate cwd — defense-in-depth: resolve symlinks, confirm existence/type,
-    # and enforce containment within an allowed cwd root.
-    jail_root = Path(os.environ.get("SHELL_RUNNER_CWD_ROOT", "/")).resolve()
-    requested = Path(cwd)
-    resolved = (jail_root / requested).resolve() if not requested.is_absolute() else requested.resolve()
-    if not (resolved == jail_root or jail_root in resolved.parents):
+    # Validate cwd — resolve symlinks and enforce containment under configured root.
+    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+    try:
+        resolved.relative_to(_CWD_ROOT)
+    except ValueError:
         return ExecutionResult(
             exit_code=-3,
             stdout="",
-            stderr=f"cwd escapes allowed root: {cwd}",
+            stderr=f"cwd escapes allowed root '{_CWD_ROOT}': {cwd}",
             stdout_full_path=None,
             stderr_full_path=None,
             duration_ms=0,
