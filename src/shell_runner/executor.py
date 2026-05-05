@@ -68,9 +68,7 @@ def execute(
 
     # Validate cwd — resolve symlinks and enforce containment under configured root.
     resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
-    try:
-        resolved.relative_to(_CWD_ROOT)
-    except ValueError:
+    if not resolved.is_relative_to(_CWD_ROOT):
         return ExecutionResult(
             exit_code=-3,
             stdout="",
