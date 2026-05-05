@@ -55,6 +55,10 @@ _DESTRUCTIVE_VERBS: frozenset[str] = frozenset({"rm", "mv", "cp", "chmod"})
 # Maximum subshell recursion depth before truncating
 _MAX_SUBSHELL_DEPTH = 3
 
+# Maximum input length for regex operations to prevent ReDoS on adversarial input.
+# Commands longer than this are treated as oversized and regex steps are skipped.
+_MAX_REGEX_INPUT = 100_000
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -344,6 +348,12 @@ _HEREDOC_RE = re.compile(
 
 def _preprocess_heredocs(cmd: str, state: _NormState, sentinel_map: dict[str, str]) -> str:
     """Replace heredoc/here-string constructs with shlex-safe sentinels."""
+    # Guard against ReDoS: the heredoc regex uses .*? in DOTALL mode which can
+    # exhibit catastrophic backtracking on adversarial long inputs.
+    if len(cmd) > _MAX_REGEX_INPUT:
+        state.warn("input_too_long_heredoc_skipped")
+        return cmd
+
     existing_ids = (int(k.split("_")[-1]) for k in sentinel_map if k.startswith(_SENTINEL_PREFIX))
     counter = [max(existing_ids, default=-1) + 1]
 
@@ -582,6 +592,12 @@ def _protect_variables(
     Returns (modified_cmd, sentinel_to_original_map).
     """
     sentinel_map: dict[str, str] = existing or {}
+
+    # Guard against ReDoS: alternation in _TOKEN_PROTECT_RE on very long inputs
+    # can exhibit super-linear matching time.
+    if len(cmd) > _MAX_REGEX_INPUT:
+        return cmd, sentinel_map
+
     # Start counter above any already-allocated sentinels
     start = (
         max(
@@ -641,7 +657,8 @@ def _normalize_internal(
     # Detect bash function definition syntax (e.g. forkbomb :(){ :|:& };:).
     # These contain { } and are not parseable as normal commands; return raw
     # so downstream classifiers can match on the literal form.
-    if "{" in cmd and "}" in cmd and re.search(r"\w*\(\)", cmd):
+    # Guard against ReDoS: \w*\(\) on very long inputs can be slow.
+    if "{" in cmd and "}" in cmd and len(cmd) <= _MAX_REGEX_INPUT and re.search(r"\w*\(\)", cmd):
         seg = Segment(
             template=cmd,
             verb=cmd.split("(")[0] if "(" in cmd else "",

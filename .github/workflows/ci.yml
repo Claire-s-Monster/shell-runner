@@ -35,10 +35,13 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     steps:
       - name: Check source branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          if [ "${{ github.head_ref }}" != "development" ]; then
+          if [ "$HEAD_REF" != "development" ]; then
             echo "PRs to main must come from development branch"
-            echo "   Source: ${{ github.head_ref }}"
+            echo "   Source: $HEAD_REF"
             echo "   Expected: development"
             exit 1
           fi
@@ -51,10 +54,12 @@ jobs:
     if: always()
     steps:
       - name: Check CI status
+        env:
+          CI_RESULT: ${{ needs.ci.result }}
         run: |
-          if [[ "${{ needs.ci.result }}" == "success" ]]; then
+          if [[ "$CI_RESULT" == "success" ]]; then
             echo "CI passed"
           else
-            echo "CI failed with result: ${{ needs.ci.result }}"
+            echo "CI failed with result: $CI_RESULT"
             exit 1
           fi

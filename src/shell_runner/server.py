@@ -483,22 +483,25 @@ async def _dispatch_tool_call(params: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "shell_execute":
         try:
             exec_req = ExecuteRequest(**arguments)
-        except Exception as exc:
-            return {"error": f"invalid arguments: {exc}"}
+        except Exception:
+            logger.exception("Invalid arguments for shell_execute")
+            return {"error": "invalid arguments"}
         return (await execute_route(exec_req)).model_dump()
 
     if tool_name == "shell_classify":
         try:
             cls_req = ClassifyRequest(**arguments)
-        except Exception as exc:
-            return {"error": f"invalid arguments: {exc}"}
+        except Exception:
+            logger.exception("Invalid arguments for shell_classify")
+            return {"error": "invalid arguments"}
         return (await classify_route(cls_req)).model_dump()
 
     if tool_name == "shell_approve_pending":
         try:
             approve_req = ApproveRequest(**arguments)
-        except Exception as exc:
-            return {"error": f"invalid arguments: {exc}"}
+        except Exception:
+            logger.exception("Invalid arguments for shell_approve_pending")
+            return {"error": "invalid arguments"}
         return (await approve_route(approve_req)).model_dump()
 
     if tool_name == "shell_health":

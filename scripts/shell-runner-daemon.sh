@@ -159,7 +159,11 @@ status_server() {
     if command -v curl > /dev/null 2>&1; then
         if curl -fsS "$health_url" > /dev/null 2>&1; then
             log "Health check: OK"
-            curl -fsS "$health_url" | python3 -m json.tool 2>/dev/null || true
+            # Capture response to variable first; python3 -m json.tool only
+            # pretty-prints JSON — it does not execute the response as code.
+            local health_json
+            health_json="$(curl -fsS "$health_url" 2>/dev/null)" || true
+            echo "$health_json" | python3 -m json.tool 2>/dev/null || true
         else
             log "Health check: FAILED (server may still be starting)"
         fi

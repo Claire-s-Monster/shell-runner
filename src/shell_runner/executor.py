@@ -1,7 +1,7 @@
 """Sandboxed subprocess executor for shell-runner.
 
 Runs commands via /bin/bash with:
-- cwd validation (must exist)
+- cwd validation (must exist, must be a directory, symlinks resolved)
 - env stripping (only allowlisted vars passed through)
 - timeout enforcement
 - output truncation with overflow files
@@ -65,13 +65,26 @@ def execute(
     import os
     import time
 
-    # Validate cwd
-    cwd_path = Path(cwd)
-    if not cwd_path.exists():
+    # Validate cwd — defense-in-depth: resolve symlinks, confirm existence and type.
+    # cwd is intentional caller-supplied input (sandboxed shell runner design), but we
+    # validate thoroughly before passing to subprocess.
+    # codeql[py/path-injection] sandboxed shell runner: cwd is intentional input, validated below
+    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+    if not resolved.exists():
         return ExecutionResult(
             exit_code=-3,
             stdout="",
             stderr=f"cwd does not exist: {cwd}",
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=0,
+            timed_out=False,
+        )
+    if not resolved.is_dir():
+        return ExecutionResult(
+            exit_code=-3,
+            stdout="",
+            stderr=f"cwd is not a directory: {cwd}",
             stdout_full_path=None,
             stderr_full_path=None,
             duration_ms=0,
@@ -89,7 +102,7 @@ def execute(
     try:
         proc = subprocess.run(  # noqa: S603
             ["/bin/bash", "-c", command],
-            cwd=str(cwd_path),
+            cwd=str(resolved),
             env=env,
             capture_output=True,
             timeout=min(timeout_s, MAX_TIMEOUT_S),
