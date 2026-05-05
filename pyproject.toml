@@ -3,12 +3,27 @@ name = "shell-runner"
 version = "0.1.0"
 description = "Sandboxed shell execution MCP server with telemetry and adaptive allowlist learning"
 authors = [
-    {name = "Claude Code Agent Ecosystem Team", email = "claude-code@anthropic.com"},
+    {name = "Claire-s-Monster", email = "w3m3nt0.w0ri@gmail.com"},
 ]
 dependencies = []
 requires-python = ">=3.11"
 readme = "README.md"
 license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/Claire-s-Monster/shell-runner"
+Repository = "https://github.com/Claire-s-Monster/shell-runner"
+Issues = "https://github.com/Claire-s-Monster/shell-runner/issues"
+
 
 [project.optional-dependencies]
 dev = [
@@ -34,7 +49,6 @@ platforms = ["linux-64"]
 
 [tool.pixi.dependencies]
 python = ">=3.11"
-fastmcp = ">=1.0.0"
 pydantic = ">=2.0.0"
 aiofiles = ">=23.0.0"
 # HTTP transport dependencies
@@ -46,6 +60,8 @@ shell-runner = { path = ".", editable = true }
 typing-extensions = ">=4.0.0"
 # HTTP transport dependencies
 sse-starlette = ">=2.0.0"
+# MCP wrapper HTTP client
+httpx = ">=0.27"
 # Resilience
 tenacity = ">=8.2.0"
 # Dead code detection
@@ -58,6 +74,9 @@ http-server = { cmd = "python src/shell_runner/server.py", env = { PYTHONPATH = 
 start-daemon = { cmd = "scripts/shell-runner-daemon.sh start", env = { PYTHONPATH = "src" } }
 stop-daemon = { cmd = "scripts/shell-runner-daemon.sh stop" }
 daemon-status = { cmd = "scripts/shell-runner-daemon.sh status" }
+install-systemd = { cmd = "scripts/install-systemd.sh" }
+setup-scripts = { cmd = "python -c \"import os,stat; [os.chmod(f, os.stat(f).st_mode | 0o111) for f in ['scripts/shell-runner-daemon.sh','scripts/install-systemd.sh']]; print('scripts are executable')\"" }
+check-scripts = { cmd = "bash -n scripts/shell-runner-daemon.sh && bash -n scripts/install-systemd.sh && echo 'bash syntax OK'" }
 # Quality tasks
 test = "pytest tests/ -v --ignore=tests/live --ignore=tests/debug"
 test-unit = "pytest tests/unit -v"
@@ -74,19 +93,32 @@ quality = { depends-on = ["lint", "type-check-lenient"] }
 type-check-lenient = "mypy src/ || echo 'mypy: warnings found (non-blocking)'"
 check-all = { depends-on = ["test", "quality"] }
 build = "python -m build"
+verify-mcp-mount = "python scripts/verify_mcp_mount.py"
 
 [tool.pixi.feature.quality.dependencies]
-pytest = ">=7.0.0"
+pytest = ">=8.0.0"
 pytest-asyncio = ">=0.21.0,<1.0.0"
-pytest-cov = ">=4.0.0"
-ruff = ">=0.1.0"
-mypy = ">=1.5.0"
+pytest-cov = ">=6.0.0"
+ruff = ">=0.8.4"
+mypy = ">=1.14.0"
+bandit = ">=1.8.0"
+pre-commit = ">=4.0.0"
 
 [tool.pixi.feature.quality.pypi-dependencies]
 black = ">=23.0.0"
 build = ">=1.0.0"
 httpx = ">=0.27"
 pytest-timeout = ">=2.1.0"
+
+[tool.pixi.feature.quality.tasks]
+lint-fix = "ruff check --fix ."
+format-check = "ruff format --check ."
+type-check = "mypy src/"
+security = "bandit -c pyproject.toml -r src/"
+pre-commit-install = "pre-commit install"
+pre-commit-run = "pre-commit run --all-files"
+test-unit = "pytest tests/unit -v"
+test-integration = "pytest tests/integration -v"
 
 [tool.pixi.feature.quality-extended.dependencies]
 bandit = ">=1.7.0"
@@ -108,10 +140,16 @@ select = [
     "W",  # pycodestyle warnings
     "F",  # pyflakes
     "I",  # isort
-    "B",  # flake8-bugbear
-    "C4", # flake8-comprehensions
+    "N",  # pep8-naming
     "UP", # pyupgrade
+    "B",  # flake8-bugbear
+    "A",  # flake8-builtins
+    "C4", # flake8-comprehensions
+    "PT", # flake8-pytest-style
+    "SIM", # flake8-simplify
+    "RET", # flake8-return
 ]
+ignore = ["E501", "SIM105"]
 
 [tool.black]
 target-version = ["py311"]
@@ -201,3 +239,7 @@ directory = "htmlcov"
 
 [tool.coverage.xml]
 output = "coverage.xml"
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B101"]
