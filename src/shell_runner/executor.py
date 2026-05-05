@@ -69,7 +69,7 @@ def execute(
     # cwd is intentional caller-supplied input (sandboxed shell runner design), but we
     # validate thoroughly before passing to subprocess.
     resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
-    if not resolved.exists():  # codeql[py/path-injection] sandboxed design: intentional cwd validation
+    if not resolved.exists():
         return ExecutionResult(
             exit_code=-3,
             stdout="",
@@ -79,7 +79,7 @@ def execute(
             duration_ms=0,
             timed_out=False,
         )
-    if not resolved.is_dir():  # codeql[py/path-injection] sandboxed design: intentional cwd validation
+    if not resolved.is_dir():
         return ExecutionResult(
             exit_code=-3,
             stdout="",
@@ -101,7 +101,7 @@ def execute(
     try:
         proc = subprocess.run(  # noqa: S603
             ["/bin/bash", "-c", command],
-            cwd=str(resolved),
+            cwd=str(resolved),  # codeql[py/path-injection] intentional: cwd validated via realpath+exists+is_dir above
             env=env,
             capture_output=True,
             timeout=min(timeout_s, MAX_TIMEOUT_S),

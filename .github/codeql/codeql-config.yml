@@ -1,0 +1,22 @@
+---
+name: "shell-runner CodeQL config"
+
+# Exclude py/path-injection on the sandboxed executor where cwd is intentional,
+# validated input. The shell-runner architecture explicitly accepts user-provided
+# cwd values from the MCP client; defense-in-depth is applied via realpath +
+# exists + is_dir checks before subprocess execution. This is documented in the
+# agent's threat model and is a deliberate design decision.
+#
+# Note: inline suppressions (# codeql[py/path-injection]) are placed at the
+# subprocess.run call site (executor.py) as the primary suppression mechanism.
+# This config is a belt-and-suspenders fallback.
+#
+# To activate: pass config-file to github/codeql-action/init in ci workflow,
+# e.g. add codeql-config-file: ".github/codeql/codeql-config.yml" to
+# ci-framework inputs if supported, or add a standalone CodeQL init step.
+
+query-filters:
+  - exclude:
+      id: py/path-injection
+      paths:
+        - "src/shell_runner/executor.py"

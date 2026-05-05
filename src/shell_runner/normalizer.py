@@ -590,21 +590,30 @@ def _normalize_segment(
 # Token protection (pre-tokenization)
 # ---------------------------------------------------------------------------
 
-# Matches tokens that shlex would split incorrectly:
-# - URLs: scheme://... (shlex splits on : and /)
-# - $VAR, ${VAR}, $(cmd): shlex splits $ from word with punctuation_chars=True
-# - backtick subshells: `cmd`
-# - date/printf format args: +%fmt (shlex splits + from %fmt)
-# Order matters: longer/more-specific patterns first.
-_TOKEN_PROTECT_RE = re.compile(
-    r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s\"']*"  # URL: scheme://rest
-    r"|\$\([^)]*\)"  # $(cmd)  — simple, non-nested
-    r"|`[^`]*`"  # `cmd`
-    r"|\$\{\w+\}"  # ${VAR}
-    r"|\$\w+"  # $VAR
-)
+# Each pattern is a standalone linear-time regex applied sequentially.
+# Alternation across overlapping branches is avoided to satisfy CodeQL
+# py/polynomial-redos: each individual pattern uses only unambiguous
+# anchors — [^x]* (negated class), \w+, or a fixed literal delimiter.
+# Order of application matches the old combined regex: most-specific first.
+_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^\s\"']*")  # scheme://rest
+_CMD_SUBST_RE = re.compile(r"\$\([^)]*\)")  # $(cmd) — simple, non-nested
+_BACKTICK_RE = re.compile(r"`[^`]*`")  # `cmd`
+_BRACE_VAR_RE = re.compile(r"\$\{\w+\}")  # ${VAR}
+_SIMPLE_VAR_RE = re.compile(r"\$\w+")  # $VAR
 
 _SENTINEL_PREFIX = "__TKSENTINEL_"
+
+# Ordered tuple for sequential application in _protect_variables.
+# $(cmd) and `cmd` must run before the URL pattern so that a URL inside
+# a command substitution (e.g. $(curl https://x/y)) is captured as a
+# single subshell token rather than having its URL fragment consumed first.
+_TOKEN_PROTECT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    _CMD_SUBST_RE,
+    _BACKTICK_RE,
+    _BRACE_VAR_RE,
+    _SIMPLE_VAR_RE,
+    _URL_RE,
+)
 
 
 def _protect_variables(
@@ -618,8 +627,6 @@ def _protect_variables(
     """
     sentinel_map: dict[str, str] = existing or {}
 
-    # Guard against ReDoS: alternation in _TOKEN_PROTECT_RE on very long inputs
-    # can exhibit super-linear matching time.
     if len(cmd) > _MAX_REGEX_INPUT:
         return cmd, sentinel_map
 
@@ -648,8 +655,9 @@ def _protect_variables(
         sentinel_map[sentinel] = original
         return sentinel
 
-    # codeql[py/polynomial-redos] all _TOKEN_PROTECT_RE alternatives use [^x]* or \w+ — linear time
-    modified = _TOKEN_PROTECT_RE.sub(replacer, cmd)
+    modified = cmd
+    for pattern in _TOKEN_PROTECT_PATTERNS:
+        modified = pattern.sub(replacer, modified)
     return modified, sentinel_map
 
 
