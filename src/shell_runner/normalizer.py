@@ -129,6 +129,22 @@ def classify_url(url: str, safe_domains: frozenset[str]) -> str:
     return "<unsafe_url>"
 
 
+# Valid characters in a URL scheme per RFC 3986 (letter, digit, +, -, .)
+_URL_SCHEME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789+-.")
+
+
+def _has_url_scheme(s: str) -> bool:
+    """Return True if s starts with a valid URL scheme followed by '://'.
+
+    Linear-time string scan: avoids regex backtracking on user-controlled input.
+    """
+    idx = s.find("://")
+    if idx <= 0:
+        return False
+    scheme = s[:idx].lower()
+    return bool(scheme) and all(c in _URL_SCHEME_CHARS for c in scheme)
+
+
 # ---------------------------------------------------------------------------
 # Path classification
 # ---------------------------------------------------------------------------
@@ -240,7 +256,7 @@ def _classify_token(
     # A quoted URL ('https://...') should produce <safe_url>/<unsafe_url>.
     if (tok.startswith("'") and tok.endswith("'")) or (tok.startswith('"') and tok.endswith('"')):
         inner = tok[1:-1]
-        if re.match(r"^[a-z][a-z0-9+.-]*://", inner):
+        if _has_url_scheme(inner):
             return classify_url(inner, safe_domains)
         return "<arg>"
 
@@ -289,7 +305,7 @@ def _classify_token(
         return "<var>"
 
     # 6. URL (must have scheme://)
-    if re.match(r"^[a-z][a-z0-9+.-]*://", tok):
+    if _has_url_scheme(tok):
         return classify_url(tok, safe_domains)
 
     # 7. Numeric (optionally suffixed k/K/m/M/g/G)
@@ -590,12 +606,11 @@ def _normalize_segment(
 # Token protection (pre-tokenization)
 # ---------------------------------------------------------------------------
 
-# Each pattern is a standalone linear-time regex applied sequentially.
-# Alternation across overlapping branches is avoided to satisfy CodeQL
-# py/polynomial-redos: each individual pattern uses only unambiguous
-# anchors — [^x]* (negated class), \w+, or a fixed literal delimiter.
-# Order of application matches the old combined regex: most-specific first.
-_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^\s\"']*")  # scheme://rest
+# Linear-time patterns for shell token protection (pre-tokenization).
+# These use only unambiguous negated character classes or \w — no backtracking.
+# $(cmd) and `cmd` must run before URL scanning so that a URL inside
+# a command substitution (e.g. $(curl https://x/y)) is captured as a
+# single subshell token rather than having its URL fragment scanned first.
 _CMD_SUBST_RE = re.compile(r"\$\([^)]*\)")  # $(cmd) — simple, non-nested
 _BACKTICK_RE = re.compile(r"`[^`]*`")  # `cmd`
 _BRACE_VAR_RE = re.compile(r"\$\{\w+\}")  # ${VAR}
@@ -603,17 +618,47 @@ _SIMPLE_VAR_RE = re.compile(r"\$\w+")  # $VAR
 
 _SENTINEL_PREFIX = "__TKSENTINEL_"
 
-# Ordered tuple for sequential application in _protect_variables.
-# $(cmd) and `cmd` must run before the URL pattern so that a URL inside
-# a command substitution (e.g. $(curl https://x/y)) is captured as a
-# single subshell token rather than having its URL fragment consumed first.
+# Ordered tuple for sequential regex application (URLs handled separately below).
 _TOKEN_PROTECT_PATTERNS: tuple[re.Pattern[str], ...] = (
     _CMD_SUBST_RE,
     _BACKTICK_RE,
     _BRACE_VAR_RE,
     _SIMPLE_VAR_RE,
-    _URL_RE,
 )
+
+
+def _scan_urls(s: str) -> list[tuple[int, int]]:
+    """Return (start, end) spans of URL tokens in s using a linear string scan.
+
+    A URL token starts with a valid scheme (letters/digits/+/-/.) followed by
+    '://' and ends at the first whitespace or quote character.  This manual
+    scan replaces a regex with a character-class overlap that CodeQL flags as
+    potentially polynomial on user-controlled input.
+    """
+    spans: list[tuple[int, int]] = []
+    n = len(s)
+    i = 0
+    while i < n:
+        # Find the next '://'
+        idx = s.find("://", i)
+        if idx < 0:
+            break
+        # Walk backward from idx to find the start of the scheme
+        start = idx - 1
+        while start >= i and s[start] in _URL_SCHEME_CHARS:
+            start -= 1
+        start += 1  # first char of scheme
+        if start == idx:
+            # No scheme chars before '://' — not a URL; skip past '://'
+            i = idx + 3
+            continue
+        # Walk forward from idx+3 to find the end of the URL
+        end = idx + 3
+        while end < n and s[end] not in (" ", "\t", "\r", "\n", '"', "'"):
+            end += 1
+        spans.append((start, end))
+        i = end
+    return spans
 
 
 def _protect_variables(
@@ -644,9 +689,7 @@ def _protect_variables(
     )
     counter = [start]
 
-    def replacer(m: re.Match[str]) -> str:
-        original = m.group(0)
-        # Reuse existing sentinel if same expression appears twice
+    def _make_sentinel(original: str) -> str:
         existing_key = next((k for k, v in sentinel_map.items() if v == original), None)
         if existing_key:
             return existing_key
@@ -655,9 +698,30 @@ def _protect_variables(
         sentinel_map[sentinel] = original
         return sentinel
 
+    def replacer(m: re.Match[str]) -> str:
+        return _make_sentinel(m.group(0))
+
+    # Step 1: apply regex-based patterns (all use [^x]* or \w — linear time).
     modified = cmd
     for pattern in _TOKEN_PROTECT_PATTERNS:
         modified = pattern.sub(replacer, modified)
+
+    # Step 2: replace URL tokens using a manual linear scanner (no regex).
+    # URLs must be sentinelized last so that command-substitution tokens
+    # already replaced in Step 1 are not re-scanned.
+    url_spans = _scan_urls(modified)
+    if url_spans:
+        # Rebuild the string with URL spans replaced by sentinels (right-to-left
+        # to preserve earlier span indices).
+        parts: list[str] = []
+        prev = 0
+        for s_start, s_end in url_spans:
+            parts.append(modified[prev:s_start])
+            parts.append(_make_sentinel(modified[s_start:s_end]))
+            prev = s_end
+        parts.append(modified[prev:])
+        modified = "".join(parts)
+
     return modified, sentinel_map
 
 
