@@ -78,3 +78,56 @@ def test_execute_respects_cwd(tmp_path: Path) -> None:
     result = execute(command="pwd", cwd=str(sub))
     assert result.exit_code == 0
     assert str(sub) in result.stdout
+
+
+def test_execute_cwd_outside_jail_returns_minus_3(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/tmp")
+    result = execute(command="echo hi", cwd="/etc")
+    assert result.exit_code == -3
+    assert "escapes allowed root" in result.stderr
+
+
+def test_execute_cwd_inside_jail_works(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Use /tmp as jail; tmp_path is under /tmp on most Linux systems
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as jail_dir:
+        sub = Path(jail_dir) / "subdir"
+        sub.mkdir()
+        monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
+        result = execute(command="echo hello", cwd=str(sub))
+        assert result.exit_code == 0
+        assert "hello" in result.stdout
+
+
+def test_execute_cwd_default_no_jail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("SHELL_RUNNER_CWD_ROOT", raising=False)
+    result = execute(command="echo ok", cwd=str(tmp_path))
+    assert result.exit_code == 0
+    assert "ok" in result.stdout
+
+
+def test_execute_cwd_relative_resolved_under_jail(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as jail_dir:
+        sub = Path(jail_dir) / "subdir"
+        sub.mkdir()
+        monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
+        # Pass only the subdirectory name as a relative path
+        result = execute(command="echo relative_ok", cwd="subdir")
+        assert result.exit_code == 0
+        assert "relative_ok" in result.stdout
+
+
+def test_execute_cwd_symlink_escape_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as jail_dir:
+        # Create a symlink inside the jail that points outside (/etc)
+        link = Path(jail_dir) / "escape_link"
+        link.symlink_to("/etc")
+        monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
+        result = execute(command="echo hi", cwd=str(link))
+        assert result.exit_code == -3
+        assert "escapes allowed root" in result.stderr

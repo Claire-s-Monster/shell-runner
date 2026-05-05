@@ -65,10 +65,21 @@ def execute(
     import os
     import time
 
-    # Validate cwd — defense-in-depth: resolve symlinks, confirm existence and type.
-    # cwd is intentional caller-supplied input (sandboxed shell runner design), but we
-    # validate thoroughly before passing to subprocess.
-    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+    # Validate cwd — defense-in-depth: resolve symlinks, confirm existence/type,
+    # and enforce containment within an allowed cwd root.
+    jail_root = Path(os.environ.get("SHELL_RUNNER_CWD_ROOT", "/")).resolve()
+    requested = Path(cwd)
+    resolved = (jail_root / requested).resolve() if not requested.is_absolute() else requested.resolve()
+    if not (resolved == jail_root or jail_root in resolved.parents):
+        return ExecutionResult(
+            exit_code=-3,
+            stdout="",
+            stderr=f"cwd escapes allowed root: {cwd}",
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=0,
+            timed_out=False,
+        )
     if not resolved.exists():
         return ExecutionResult(
             exit_code=-3,
@@ -101,7 +112,7 @@ def execute(
     try:
         proc = subprocess.run(  # noqa: S603
             ["/bin/bash", "-c", command],
-            cwd=str(resolved),  # codeql[py/path-injection] intentional: cwd validated via realpath+exists+is_dir above
+            cwd=str(resolved),
             env=env,
             capture_output=True,
             timeout=min(timeout_s, MAX_TIMEOUT_S),
