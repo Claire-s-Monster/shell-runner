@@ -48,6 +48,9 @@ jobs:
           echo "PR from development to main - allowed"
 
   ci-success:
+    # GitHub names direct caller-workflow jobs as just the job display name (no workflow prefix).
+    # The check run emitted here is "CI Success" (not "CI / CI Success").
+    # Branch protection must require: "CI Success"
     name: "CI Success"  # CRITICAL: Must match branch protection check name exactly
     runs-on: ubuntu-latest
     needs: [ci]
