@@ -26,6 +26,7 @@ jobs:
       enable-performance: false
       enable-postgres: false
       editable-install: false
+      package-path: development
     secrets: inherit
 
   # Enforce main only accepts PRs from development
