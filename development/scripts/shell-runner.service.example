@@ -5,7 +5,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/ClaudeCode/Servers/shell-runner
+WorkingDirectory=%h/ClaudeCode/Servers/shell-runner/development
 ExecStart=pixi run http-server --port 4003
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
