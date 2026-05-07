@@ -3,6 +3,7 @@
 Routes:
     POST /execute         — classify + execute or create pending prompt
     POST /classify        — dry-run classification only
+    POST /observe         — record an externally-executed command for T3 promotion review
     POST /approve_pending — approve or deny a pending prompt
     GET  /health          — service health stats
     POST /mcp             — MCP JSON-RPC 2.0 endpoint (Claude Code "type": "http" transport)
@@ -36,6 +37,8 @@ from .models import (
     ExecuteRequest,
     ExecuteResponse,
     HealthResponse,
+    ObserveRequest,
+    ObserveResponse,
 )
 from .persistence import DEFAULT_DB_PATH, Persistence
 
@@ -299,6 +302,39 @@ async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
             {"verb": s.segment.verb, "tier": int(s.tier), "step": s.decision_step}
             for s in cls.segments
         ],
+    )
+
+
+@app.post("/observe", response_model=ObserveResponse)
+async def observe_route(req: ObserveRequest) -> ObserveResponse:
+    cls = classify(req.command, req.cwd, req.agent_id)
+    telemetry_id = db.record_call(
+        agent_id=req.agent_id,
+        cwd=req.cwd,
+        raw_cmd=req.command,
+        normalized_template=cls.template,
+        command_tier=int(cls.command_tier),
+        final_tier=int(cls.tier),
+        decision="observed_externally",
+        matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+        matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+        exit_code=req.exit_code,
+        stdout_bytes=0,
+        stderr_bytes=0,
+        duration_ms=req.duration_ms,
+        decision_path=["observe_endpoint"],
+        normalizer_warnings=list(cls.normalizer_warnings),
+    )
+    db.upsert_template(
+        template=cls.template,
+        agent_id=req.agent_id,
+        current_tier=int(cls.command_tier),
+        was_denied=False,
+    )
+    return ObserveResponse(
+        telemetry_id=telemetry_id,
+        classified_tier=int(cls.command_tier),
+        normalized_template=cls.template,
     )
 
 
