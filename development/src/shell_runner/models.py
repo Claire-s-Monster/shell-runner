@@ -88,3 +88,17 @@ class HealthResponse(BaseModel):
     catalog_size: int
     pending_prompts: int
     last_error: str | None = None
+
+
+class ObserveRequest(BaseModel):
+    command: str
+    cwd: str
+    agent_id: str
+    exit_code: int | None = None
+    duration_ms: int | None = None
+
+
+class ObserveResponse(BaseModel):
+    telemetry_id: str
+    classified_tier: int
+    normalized_template: str
