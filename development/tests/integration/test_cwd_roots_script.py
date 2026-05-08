@@ -182,10 +182,9 @@ def test_add_nonexistent_directory_fails(tmp_path: Path) -> None:
 @pytest.mark.integration
 def test_reload_fails_gracefully_without_pid_file(tmp_path: Path) -> None:
     """reload exits 2 when no PID file is present — not a crash."""
-    # Use a XDG_RUNTIME_DIR that doesn't contain a PID file
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir()
-    env = _make_env(tmp_path, extra={"XDG_RUNTIME_DIR": str(runtime_dir)})
+    # Point to a file that doesn't exist via the override
+    fake_pid_file = tmp_path / "nonexistent.pid"
+    env = _make_env(tmp_path, extra={"SHELL_RUNNER_PID_FILE": str(fake_pid_file)})
 
     result = _run(["reload"], env=env)
     assert result.returncode == 2
@@ -215,3 +214,57 @@ def test_multiple_paths_preserved_in_order(tmp_path: Path) -> None:
     pos_tmp = content.index('"/tmp"')
     pos_var = content.index('"/var/tmp"')
     assert pos_tmp < pos_var, "Insertion order should be preserved"
+
+
+# ---------------------------------------------------------------------------
+# PID file fallback chain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_pid_file_fallback_chain_with_tmp(tmp_path: Path) -> None:
+    """Verify script finds PID file via SHELL_RUNNER_PID_FILE override.
+
+    The fallback chain correctly finds /run/user/$UID/shell-runner.pid on
+    machines with a live daemon, so tests use SHELL_RUNNER_PID_FILE to point
+    at a controlled temp path for hermetic isolation.
+    """
+    # Create a fake PID file in tmp_path
+    fake_pid_file = tmp_path / "shell-runner.pid"
+    fake_pid_file.write_text("12345\n")
+
+    # Set up env with SHELL_RUNNER_PID_FILE override and XDG_CONFIG_HOME for TOML
+    env = _make_env(tmp_path, extra={"SHELL_RUNNER_PID_FILE": str(fake_pid_file)})
+
+    # Create TOML first
+    _run(["list"], env=env)
+
+    # status should find the PID via the override
+    result = _run(["status"], env=env)
+    assert result.returncode == 0
+    assert "12345" in result.stdout
+
+
+@pytest.mark.integration
+def test_status_with_unset_xdg_runtime_dir(tmp_path: Path) -> None:
+    """Verify 'status' command works gracefully when SHELL_RUNNER_PID_FILE points to nonexistent file.
+
+    When the PID file doesn't exist, the script should still run without crashing
+    and should report that the PID file was not found.
+    """
+    # Point to a file that doesn't exist
+    fake_pid_file = tmp_path / "nonexistent.pid"
+    env = _make_env(tmp_path, extra={"SHELL_RUNNER_PID_FILE": str(fake_pid_file)})
+    # Explicitly unset XDG_RUNTIME_DIR (already done by _make_env)
+    assert "XDG_RUNTIME_DIR" not in env
+
+    # Pre-populate TOML
+    _run(["add", "/tmp"], env=env)
+
+    # status should succeed (return 0) even without a PID file
+    result = _run(["status"], env=env)
+    assert result.returncode == 0
+    # Should show TOML contents
+    assert "/tmp" in result.stdout
+    # Should indicate no PID file found
+    assert "not found" in result.stdout.lower() or "may not be running" in result.stdout.lower()

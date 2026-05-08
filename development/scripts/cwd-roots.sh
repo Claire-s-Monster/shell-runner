@@ -18,7 +18,35 @@ set -euo pipefail
 
 TOML_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/shell-runner"
 TOML_FILE="${TOML_DIR}/cwd-roots.toml"
-PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/shell-runner.pid"
+
+# PID file resolution — XDG_RUNTIME_DIR may be unset in restricted subprocess
+# environments (e.g. when invoked via shell-runner). Try in order:
+#   0. $SHELL_RUNNER_PID_FILE (explicit override, used directly without existence check)
+#   1. $XDG_RUNTIME_DIR/shell-runner.pid (if XDG_RUNTIME_DIR is set)
+#   2. /run/user/$UID/shell-runner.pid (canonical Linux systemd path)
+#   3. /tmp/shell-runner.pid (last resort)
+resolve_pid_file() {
+    # Explicit override always wins (even if file does not exist)
+    if [ -n "${SHELL_RUNNER_PID_FILE:-}" ]; then
+        printf '%s\n' "$SHELL_RUNNER_PID_FILE"
+        [ -f "$SHELL_RUNNER_PID_FILE" ] && return 0 || return 1
+    fi
+    local cand
+    for cand in "${XDG_RUNTIME_DIR:-}/shell-runner.pid" \
+                "/run/user/$(id -u)/shell-runner.pid" \
+                "/tmp/shell-runner.pid"; do
+        if [ -n "$cand" ] && [ "$cand" != "/shell-runner.pid" ] && [ -f "$cand" ]; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    # Nothing found — return default candidate for clearer error message later
+    printf '%s\n' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/shell-runner.pid"
+    return 1
+}
+
+PID_FILE="$(resolve_pid_file)" || PID_FILE_FOUND=0
+PID_FILE_FOUND="${PID_FILE_FOUND:-1}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,7 +66,10 @@ Subcommands:
 
 Paths:
   TOML config : ${XDG_CONFIG_HOME:-$HOME/.config}/shell-runner/cwd-roots.toml
-  PID file    : ${XDG_RUNTIME_DIR:-/tmp}/shell-runner.pid
+  PID file    : $XDG_RUNTIME_DIR/shell-runner.pid (or /run/user/\$UID or /tmp, in order)
+
+Environment Variables:
+  SHELL_RUNNER_PID_FILE  Override PID file path (for testing; used directly without existence check)
 EOF
 }
 
@@ -54,6 +85,10 @@ ensure_toml() {
 get_parent_pid() {
     if [ ! -f "${PID_FILE}" ]; then
         echo "ERROR: PID file not found: ${PID_FILE}" >&2
+        echo "Candidates checked (in order):" >&2
+        echo "  - \${XDG_RUNTIME_DIR:-}/shell-runner.pid" >&2
+        echo "  - /run/user/\$(id -u)/shell-runner.pid" >&2
+        echo "  - /tmp/shell-runner.pid" >&2
         echo "Is the shell-runner daemon running?" >&2
         exit 2
     fi
