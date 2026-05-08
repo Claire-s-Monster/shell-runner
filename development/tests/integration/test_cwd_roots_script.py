@@ -182,10 +182,9 @@ def test_add_nonexistent_directory_fails(tmp_path: Path) -> None:
 @pytest.mark.integration
 def test_reload_fails_gracefully_without_pid_file(tmp_path: Path) -> None:
     """reload exits 2 when no PID file is present — not a crash."""
-    # Use a XDG_RUNTIME_DIR that doesn't contain a PID file
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir()
-    env = _make_env(tmp_path, extra={"XDG_RUNTIME_DIR": str(runtime_dir)})
+    # Point to a file that doesn't exist via the override
+    fake_pid_file = tmp_path / "nonexistent.pid"
+    env = _make_env(tmp_path, extra={"SHELL_RUNNER_PID_FILE": str(fake_pid_file)})
 
     result = _run(["reload"], env=env)
     assert result.returncode == 2
@@ -224,51 +223,38 @@ def test_multiple_paths_preserved_in_order(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 def test_pid_file_fallback_chain_with_tmp(tmp_path: Path) -> None:
-    """Verify script finds PID file at /tmp when XDG_RUNTIME_DIR is unset.
+    """Verify script finds PID file via SHELL_RUNNER_PID_FILE override.
 
-    This tests the fallback chain: when the script is invoked from a
-    subprocess (e.g. shell-runner executor) where XDG_RUNTIME_DIR is stripped,
-    it should still find the PID file at /tmp/shell-runner.pid.
+    The fallback chain correctly finds /run/user/$UID/shell-runner.pid on
+    machines with a live daemon, so tests use SHELL_RUNNER_PID_FILE to point
+    at a controlled temp path for hermetic isolation.
     """
-    # Create a fake PID file at /tmp/shell-runner.pid (mocked via tmp_path)
-    fake_tmp = tmp_path / "mock_tmp"
-    fake_tmp.mkdir()
-    pid_file = fake_tmp / "shell-runner.pid"
-    pid_file.write_text("12345\n")
+    # Create a fake PID file in tmp_path
+    fake_pid_file = tmp_path / "shell-runner.pid"
+    fake_pid_file.write_text("12345\n")
 
-    # Set up env: XDG_CONFIG_HOME for TOML, and /tmp redirected to fake_tmp
-    # We'll pass fake /tmp path via explicit env var if needed, but for now,
-    # unset XDG_RUNTIME_DIR so it falls back to /tmp
-    env = _make_env(tmp_path)
+    # Set up env with SHELL_RUNNER_PID_FILE override and XDG_CONFIG_HOME for TOML
+    env = _make_env(tmp_path, extra={"SHELL_RUNNER_PID_FILE": str(fake_pid_file)})
 
     # Create TOML first
     _run(["list"], env=env)
 
-    # For this test, manually create a PID file in the fallback location
-    # Since we can't easily mock /tmp at the filesystem level, we use a
-    # workaround: set XDG_RUNTIME_DIR to a non-existent dir, then verify
-    # the script doesn't crash and properly reports the candidates
-    runtime_dir = tmp_path / "runtime"
-    # Don't create it so the first candidate fails
-    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
-    # Also unset the /tmp candidate to test error handling
-    result = _run(["reload"], env=env)
-    assert result.returncode == 2
-    assert "PID file not found" in result.stderr
-    # Verify it mentions the fallback candidates
-    assert "/run/user/" in result.stderr
-    assert "/tmp/shell-runner.pid" in result.stderr
+    # status should find the PID via the override
+    result = _run(["status"], env=env)
+    assert result.returncode == 0
+    assert "12345" in result.stdout
 
 
 @pytest.mark.integration
 def test_status_with_unset_xdg_runtime_dir(tmp_path: Path) -> None:
-    """Verify 'status' command works gracefully when XDG_RUNTIME_DIR is unset.
+    """Verify 'status' command works gracefully when SHELL_RUNNER_PID_FILE points to nonexistent file.
 
-    When XDG_RUNTIME_DIR is unset, the script should still run without crashing
-    and should report that the PID file was not found (since /tmp doesn't have it
-    in test environment).
+    When the PID file doesn't exist, the script should still run without crashing
+    and should report that the PID file was not found.
     """
-    env = _make_env(tmp_path)
+    # Point to a file that doesn't exist
+    fake_pid_file = tmp_path / "nonexistent.pid"
+    env = _make_env(tmp_path, extra={"SHELL_RUNNER_PID_FILE": str(fake_pid_file)})
     # Explicitly unset XDG_RUNTIME_DIR (already done by _make_env)
     assert "XDG_RUNTIME_DIR" not in env
 
