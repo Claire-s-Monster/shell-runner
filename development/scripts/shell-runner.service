@@ -9,6 +9,8 @@ WorkingDirectory=/home/memento/ClaudeCode/Servers/shell-runner/development
 Environment=SHELL_RUNNER_DB=/home/memento/.local/share/shell-runner/telemetry.sqlite3
 Environment=SHELL_RUNNER_HOST=127.0.0.1
 Environment=SHELL_RUNNER_PORT=4111
+# Preferred: edit ~/.config/shell-runner/cwd-roots.toml and send SIGHUP to reload without restart.
+# SHELL_RUNNER_CWD_ROOTS (colon-separated) and SHELL_RUNNER_CWD_ROOT (legacy) are also supported.
 Environment=SHELL_RUNNER_CWD_ROOT=/
 Environment=PYTHONPATH=/home/memento/ClaudeCode/Servers/shell-runner/development/src
 ExecStart=/home/memento/.conda/envs/ClaudeCode/bin/pixi run --manifest-path /home/memento/ClaudeCode/Servers/shell-runner/development/pyproject.toml --environment ci uvicorn shell_runner.server:app --host 127.0.0.1 --port 4111

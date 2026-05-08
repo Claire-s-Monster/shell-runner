@@ -1,0 +1,9 @@
+# Shell-runner allowed cwd roots.
+# The server will accept commands whose cwd is under any of these paths.
+# Edit this file (or copy to ~/.config/shell-runner/cwd-roots.toml) and send
+# SIGHUP to the daemon to reload without restarting.
+#
+#   kill -HUP "$(cat ${XDG_RUNTIME_DIR:-/tmp}/shell-runner.pid)"
+roots = [
+  # "/home/you/projects/my-project",
+]
