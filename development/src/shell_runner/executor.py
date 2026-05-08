@@ -13,11 +13,10 @@ import logging
 import os
 import subprocess
 import threading
+import tomllib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-
-import tomllib
 
 OUTPUT_HEAD_BYTES = 4096
 OUTPUT_TAIL_BYTES = 4096

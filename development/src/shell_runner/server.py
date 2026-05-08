@@ -25,9 +25,9 @@ from typing import Any, Literal, cast
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import executor
 from .catalog import Tier, all_rules
 from .classifier import classify
-from . import executor
 from .executor import execute
 from .mcp_wrapper import TOOLS
 from .models import (
