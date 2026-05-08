@@ -28,6 +28,22 @@ SHELL_RUNNER_HOST="${SHELL_RUNNER_HOST:-$DEFAULT_HOST}"
 SHELL_RUNNER_PORT="${SHELL_RUNNER_PORT:-$DEFAULT_PORT}"
 SHELL_RUNNER_DB="${SHELL_RUNNER_DB:-$DEFAULT_DB}"
 
+# CWD allow-list configuration (three mutually compatible sources, all merged):
+#
+#   Recommended — TOML config (live-reload via SIGHUP):
+#     ~/.config/shell-runner/cwd-roots.toml   (or $XDG_CONFIG_HOME/shell-runner/cwd-roots.toml)
+#     roots = ["/home/you/projects/my-project", "/home/you/worktrees"]
+#
+#   SHELL_RUNNER_CWD_ROOTS — colon-separated list of allowed roots (like PATH):
+#     export SHELL_RUNNER_CWD_ROOTS="/home/you/projects:/home/you/worktrees"
+#
+#   SHELL_RUNNER_CWD_ROOT — legacy single-path fallback (still honoured):
+#     export SHELL_RUNNER_CWD_ROOT="/home/you/projects"
+#
+# All three sources are unioned and deduplicated at startup, and on SIGHUP.
+[ -n "${SHELL_RUNNER_CWD_ROOTS:-}" ] && export SHELL_RUNNER_CWD_ROOTS
+[ -n "${SHELL_RUNNER_CWD_ROOT:-}" ]  && export SHELL_RUNNER_CWD_ROOT
+
 # PID file location — prefer XDG_RUNTIME_DIR when available
 if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     PID_FILE="${XDG_RUNTIME_DIR}/shell-runner.pid"

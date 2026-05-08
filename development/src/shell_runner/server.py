@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .catalog import Tier, all_rules
 from .classifier import classify
+from . import executor
 from .executor import execute
 from .mcp_wrapper import TOOLS
 from .models import (
@@ -62,10 +64,24 @@ async def _periodic_cleanup(interval_s: int = 60) -> None:
             logger.exception("Error during periodic prompt cleanup")
 
 
+def _on_sighup() -> None:
+    """Reload cwd roots on SIGHUP without restarting the server."""
+    roots = executor.reload_cwd_roots()
+    logger.info("reloaded cwd-roots: %s", [str(r) for r in roots])
+
+
 @asynccontextmanager
 async def _lifespan(_application: FastAPI) -> AsyncGenerator[None, None]:
     global _cleanup_task
     _cleanup_task = asyncio.create_task(_periodic_cleanup())
+
+    # Register SIGHUP handler for live cwd-roots reload (Linux only).
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+    except (NotImplementedError, AttributeError):
+        logger.debug("SIGHUP not supported on this platform; skipping signal handler")
+
     try:
         yield
     finally:
@@ -75,6 +91,11 @@ async def _lifespan(_application: FastAPI) -> AsyncGenerator[None, None]:
         except asyncio.CancelledError:
             pass
         _cleanup_task = None
+
+        try:
+            loop.remove_signal_handler(signal.SIGHUP)
+        except (NotImplementedError, AttributeError):
+            pass
 
 
 app = FastAPI(title="shell-runner", version="0.1.0", lifespan=_lifespan)

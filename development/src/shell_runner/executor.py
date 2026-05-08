@@ -9,11 +9,15 @@ Runs commands via /bin/bash with:
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+import tomllib
 
 OUTPUT_HEAD_BYTES = 4096
 OUTPUT_TAIL_BYTES = 4096
@@ -23,7 +27,78 @@ MAX_TIMEOUT_S = 600
 DEFAULT_ENV_PASSTHROUGH = ["HOME", "USER", "PATH", "LANG", "TERM"]
 
 _OVERFLOW_DIR = Path("/tmp/shell-runner-overflow")  # noqa: S108
-_CWD_ROOT = Path(os.environ.get("SHELL_RUNNER_CWD_ROOT", os.getcwd())).resolve()
+
+logger = logging.getLogger(__name__)
+
+_cwd_roots_lock = threading.Lock()
+_CWD_ROOTS: list[Path] = []
+
+
+def _load_cwd_roots() -> list[Path]:
+    """Load the allowed cwd roots from all configured sources and return a deduplicated list.
+
+    Precedence (union, later sources do not override — all are merged):
+      1. TOML file at ${XDG_CONFIG_HOME:-$HOME/.config}/shell-runner/cwd-roots.toml
+      2. SHELL_RUNNER_CWD_ROOTS env var (colon-separated)
+      3. SHELL_RUNNER_CWD_ROOT env var (legacy single-path)
+      4. Fallback: [cwd] when all three are empty
+    """
+    paths: list[Path] = []
+
+    # 1. TOML config file
+    xdg_config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    toml_path = Path(xdg_config) / "shell-runner" / "cwd-roots.toml"
+    if toml_path.exists():
+        try:
+            with toml_path.open("rb") as fh:
+                data = tomllib.load(fh)
+            for raw in data.get("roots", []):
+                paths.append(Path(raw).resolve())
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to parse cwd-roots TOML at %s; ignoring", toml_path)
+
+    # 2. SHELL_RUNNER_CWD_ROOTS (colon-separated list)
+    roots_env = os.environ.get("SHELL_RUNNER_CWD_ROOTS", "")
+    if roots_env:
+        for part in roots_env.split(":"):
+            part = part.strip()
+            if part:
+                paths.append(Path(part).resolve())
+
+    # 3. SHELL_RUNNER_CWD_ROOT (legacy single-path)
+    root_env = os.environ.get("SHELL_RUNNER_CWD_ROOT", "")
+    if root_env:
+        paths.append(Path(root_env).resolve())
+
+    # 4. Fallback to cwd when all sources are empty
+    if not paths:
+        paths.append(Path(os.getcwd()).resolve())
+
+    # Deduplicate while preserving order
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+def reload_cwd_roots() -> list[Path]:
+    """Reload allowed cwd roots from all configured sources.
+
+    Thread-safe via module-level lock. Safe to call from a signal handler
+    dispatched onto the asyncio event loop (not a raw OS signal handler).
+    """
+    global _CWD_ROOTS
+    new_roots = _load_cwd_roots()
+    with _cwd_roots_lock:
+        _CWD_ROOTS = new_roots
+    return new_roots
+
+
+# Initialise on import
+_CWD_ROOTS = _load_cwd_roots()
 
 
 @dataclass(frozen=True)
@@ -66,13 +141,16 @@ def execute(
     """Run command via /bin/bash with cwd jail, env stripping, timeout, output truncation."""
     import time
 
-    # Validate cwd — resolve symlinks and enforce containment under configured root.
+    # Validate cwd — resolve symlinks and enforce containment under any configured root.
     resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
-    if not resolved.is_relative_to(_CWD_ROOT):
+    with _cwd_roots_lock:
+        current_roots = list(_CWD_ROOTS)
+    if not any(resolved.is_relative_to(r) for r in current_roots):
+        sorted_roots = sorted(str(r) for r in current_roots)
         return ExecutionResult(
             exit_code=-3,
             stdout="",
-            stderr=f"cwd escapes allowed root '{_CWD_ROOT}': {cwd}",
+            stderr=f"cwd escapes allowed root(s) {sorted_roots}: {cwd}",
             stdout_full_path=None,
             stderr_full_path=None,
             duration_ms=0,
