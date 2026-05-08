@@ -1836,7 +1836,7 @@ packages:
 - pypi: ./
   name: shell-runner
   version: 0.1.0
-  sha256: 8774b4c8c8ded85d90dd912b610edecad44652e49deecd46a4010dfd1f95645b
+  sha256: ebf6981b6da9e5c4cf02fb2e8c442400875a57c93e4cbef7cd91256bc5df6b8c
   requires_dist:
   - pytest>=7.0.0 ; extra == 'dev'
   - pytest-asyncio>=0.21.0 ; extra == 'dev'
