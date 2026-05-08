@@ -84,3 +84,61 @@ fi
 
 This appends the project path once (idempotent check via `grep -qF`) and sends
 a SIGHUP so the change takes effect immediately.
+
+---
+
+## `cwd-roots.sh` Helper Script
+
+`development/scripts/cwd-roots.sh` provides TOML-aware subcommands so you
+never need to hand-edit the config file or hunt for the uvicorn child PID.
+
+### Manual usage
+
+```bash
+# Add the current project to the allow-list and reload the daemon
+./cwd-roots.sh add /home/you/projects/my-project
+
+# Remove a path
+./cwd-roots.sh remove /home/you/projects/old-project
+
+# Inspect the current allow-list
+./cwd-roots.sh list
+
+# Show daemon PID, uvicorn child PID, and TOML contents
+./cwd-roots.sh status
+
+# Reload without modifying the TOML (e.g. after editing it manually)
+./cwd-roots.sh reload
+```
+
+Exit codes: `0` success, `1` invalid path / missing directory,
+`2` missing PID file or bad arguments.
+
+### SessionStart hook (recommended)
+
+Replace the manual `sed` snippet above with the helper for a cleaner,
+TOML-safe registration:
+
+```json
+"hooks": {
+  "SessionStart": [
+    {
+      "type": "command",
+      "command": "\"${HOME}/ClaudeCode/Servers/shell-runner/development/scripts/cwd-roots.sh\" add \"$CLAUDE_PROJECT_DIR\""
+    }
+  ]
+}
+```
+
+Or as a one-liner in `.claude/settings.json`:
+
+```bash
+"${HOME}/ClaudeCode/Servers/shell-runner/development/scripts/cwd-roots.sh" \
+  add "$CLAUDE_PROJECT_DIR"
+```
+
+The script uses `realpath` to resolve symlinks, deduplicates entries, and
+signals the uvicorn child directly (or falls back to the parent process).
+If the daemon is not running the `add` still writes the TOML so it takes
+effect on next startup; only the `reload` step is skipped (exit 2, which
+you can suppress with `|| true` in the hook).
