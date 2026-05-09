@@ -123,12 +123,23 @@ test-integration = "pytest tests/integration -v"
 [tool.pixi.feature.quality-extended.dependencies]
 bandit = ">=1.7.0"
 
+[tool.pixi.feature.ui.dependencies]
+streamlit = ">=1.30.0"
+pandas = ">=2.0.0"
+
+[tool.pixi.feature.ui.pypi-dependencies]
+httpx = ">=0.27"
+
+[tool.pixi.feature.ui.tasks]
+ui = "streamlit run ui/app.py --server.address 127.0.0.1 --server.port 8501 --browser.gatherUsageStats false"
+
 [tool.pixi.environments]
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 ci = { features = ["quality"], solve-group = "default" }
 quality-ci = { features = ["quality"], solve-group = "default" }
 quality-extended = { features = ["quality", "quality-extended"], solve-group = "default" }
+ui = { features = ["ui"], solve-group = "default" }
 
 [tool.ruff]
 target-version = "py311"
@@ -175,7 +186,7 @@ no_implicit_reexport = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "tests"]
+pythonpath = ["src", "tests", "."]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
