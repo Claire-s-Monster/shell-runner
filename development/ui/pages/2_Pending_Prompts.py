@@ -4,7 +4,15 @@ import streamlit as st
 
 from ui.data import approve_prompt, get_pending_prompts
 
-st.title("\U0001f514 Pending Prompts")
+# Header row: title on left, refresh button on right
+hcol1, hcol2 = st.columns([4, 1])
+with hcol1:
+    st.title("\U0001f514 Pending Prompts")
+with hcol2:
+    if st.button("🔄 Refresh list", use_container_width=True):
+        st.rerun()
+
+st.caption("Updates after each approve/deny action.")
 
 
 def _act(pid: str, decision: str, reason: str) -> None:
