@@ -9,10 +9,12 @@
 #   ./shell-runner-daemon.sh restart
 #
 # Environment Variables:
-#   SHELL_RUNNER_HOST   Host to bind to (default: 127.0.0.1)
-#   SHELL_RUNNER_PORT   Port to bind to (default: 4111)
-#   SHELL_RUNNER_DB     SQLite database path
-#                       (default: $HOME/.local/share/shell-runner/telemetry.sqlite3)
+#   SHELL_RUNNER_HOST            Host to bind to (default: 127.0.0.1)
+#   SHELL_RUNNER_PORT            Port to bind to (default: 4111)
+#   SHELL_RUNNER_DB              SQLite database path
+#                                (default: $HOME/.local/share/shell-runner/telemetry.sqlite3)
+#   SHELL_RUNNER_MAX_TIMEOUT_S   Max subprocess timeout in seconds
+#                                (default: 3600 = 1 hour)
 
 set -euo pipefail
 
@@ -43,6 +45,9 @@ SHELL_RUNNER_DB="${SHELL_RUNNER_DB:-$DEFAULT_DB}"
 # All three sources are unioned and deduplicated at startup, and on SIGHUP.
 [ -n "${SHELL_RUNNER_CWD_ROOTS:-}" ] && export SHELL_RUNNER_CWD_ROOTS
 [ -n "${SHELL_RUNNER_CWD_ROOT:-}" ]  && export SHELL_RUNNER_CWD_ROOT
+
+# Subprocess timeout cap — operators can override via env
+[ -n "${SHELL_RUNNER_MAX_TIMEOUT_S:-}" ] && export SHELL_RUNNER_MAX_TIMEOUT_S
 
 # PID file location — prefer XDG_RUNTIME_DIR when available
 if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
@@ -99,7 +104,7 @@ start_server() {
 
     # Start uvicorn via pixi in the project directory
     cd "$PROJECT_DIR"
-    export SHELL_RUNNER_DB SHELL_RUNNER_HOST SHELL_RUNNER_PORT
+    export SHELL_RUNNER_DB SHELL_RUNNER_HOST SHELL_RUNNER_PORT SHELL_RUNNER_MAX_TIMEOUT_S
     export PYTHONPATH="${PROJECT_DIR}/src"
     nohup "${HOME}/.conda/envs/ClaudeCode/bin/pixi" run --environment ci uvicorn shell_runner.server:app \
         --host "$SHELL_RUNNER_HOST" \
@@ -227,10 +232,12 @@ Commands:
   status    Check server status and health endpoint
 
 Environment Variables:
-  SHELL_RUNNER_HOST   Bind address (default: 127.0.0.1)
-  SHELL_RUNNER_PORT   Port (default: 4111)
-  SHELL_RUNNER_DB     SQLite DB path
-                      (default: $HOME/.local/share/shell-runner/telemetry.sqlite3)
+  SHELL_RUNNER_HOST            Bind address (default: 127.0.0.1)
+  SHELL_RUNNER_PORT            Port (default: 4111)
+  SHELL_RUNNER_DB              SQLite DB path
+                               (default: $HOME/.local/share/shell-runner/telemetry.sqlite3)
+  SHELL_RUNNER_MAX_TIMEOUT_S   Max subprocess timeout in seconds
+                               (default: 3600)
 
 Examples:
   ./shell-runner-daemon.sh start
