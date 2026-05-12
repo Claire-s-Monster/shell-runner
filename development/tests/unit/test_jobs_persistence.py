@@ -50,7 +50,7 @@ def _create_job(db: Persistence, telemetry_id: str, **overrides: object) -> str:
     )
     kwargs.update(overrides)
     db.create_job(**kwargs)  # type: ignore[arg-type]
-    return job_id
+    return str(kwargs["job_id"])
 
 
 # ---------------------------------------------------------------------------
