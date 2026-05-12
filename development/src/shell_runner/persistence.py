@@ -429,16 +429,25 @@ class Persistence:
 
         Returns rows that were removed so the caller can delete stdout/stderr files.
         """
-        cutoff = (
-            datetime.now(UTC) - timedelta(seconds=retention_seconds)
-        ).isoformat()
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM jobs WHERE started_at < ?", (cutoff,)
+                """
+                SELECT * FROM jobs
+                WHERE CAST(strftime('%s', started_at) AS INTEGER)
+                      < CAST(strftime('%s', 'now') AS INTEGER) - ?
+                """,
+                (retention_seconds,),
             ).fetchall()
             removed = [dict(r) for r in rows]
             if removed:
-                conn.execute("DELETE FROM jobs WHERE started_at < ?", (cutoff,))
+                conn.execute(
+                    """
+                    DELETE FROM jobs
+                    WHERE CAST(strftime('%s', started_at) AS INTEGER)
+                          < CAST(strftime('%s', 'now') AS INTEGER) - ?
+                    """,
+                    (retention_seconds,),
+                )
         return removed
 
     # --- queries ---
