@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from pydantic import BaseModel, Field
+
+# Maximum subprocess timeout in seconds. Configurable via env to support
+# long-running commands (e.g. 30-min builds) while keeping a runaway-guard.
+DEFAULT_MAX_TIMEOUT_S = 3600  # 1 hour
+MAX_TIMEOUT_S = int(os.environ.get("SHELL_RUNNER_MAX_TIMEOUT_S", str(DEFAULT_MAX_TIMEOUT_S)))
 
 
 class ExecuteRequest(BaseModel):
     command: str
     cwd: str
-    timeout_s: int = Field(default=30, ge=1, le=600)
+    timeout_s: int = Field(
+        default=30,
+        ge=1,
+        le=MAX_TIMEOUT_S,
+        description=(
+            "Subprocess timeout in seconds. Max is configurable via "
+            "SHELL_RUNNER_MAX_TIMEOUT_S (default 3600s = 1h)."
+        ),
+    )
     agent_id: str
     approve_token: str | None = None
     output_mode: Literal["inline", "file", "summarize"] = "inline"

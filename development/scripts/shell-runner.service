@@ -12,6 +12,8 @@ Environment=SHELL_RUNNER_PORT=4111
 # Preferred: edit ~/.config/shell-runner/cwd-roots.toml and send SIGHUP to reload without restart.
 # SHELL_RUNNER_CWD_ROOTS (colon-separated) and SHELL_RUNNER_CWD_ROOT (legacy) are also supported.
 Environment=SHELL_RUNNER_CWD_ROOT=/
+# Subprocess timeout cap in seconds (default: 3600 = 1h). Override to support longer builds.
+Environment=SHELL_RUNNER_MAX_TIMEOUT_S=3600
 Environment=PYTHONPATH=/home/memento/ClaudeCode/Servers/shell-runner/development/src
 ExecStart=/home/memento/.conda/envs/ClaudeCode/bin/pixi run --manifest-path /home/memento/ClaudeCode/Servers/shell-runner/development/pyproject.toml --environment ci uvicorn shell_runner.server:app --host 127.0.0.1 --port 4111
 Restart=on-failure
