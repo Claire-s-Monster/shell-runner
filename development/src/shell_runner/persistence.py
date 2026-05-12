@@ -428,13 +428,16 @@ class Persistence:
         """Delete jobs older than retention_seconds (by started_at).
 
         Returns rows that were removed so the caller can delete stdout/stderr files.
+
+        Uses julianday() for timestamp arithmetic because strftime('%s', ...)
+        returns NULL for ISO 8601 strings with timezone suffix (e.g. '+00:00'),
+        which is the format produced by _now_iso().
         """
         with self._conn() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE CAST(strftime('%s', started_at) AS INTEGER)
-                      < CAST(strftime('%s', 'now') AS INTEGER) - ?
+                WHERE (julianday('now') - julianday(started_at)) * 86400.0 > ?
                 """,
                 (retention_seconds,),
             ).fetchall()
@@ -443,8 +446,7 @@ class Persistence:
                 conn.execute(
                     """
                     DELETE FROM jobs
-                    WHERE CAST(strftime('%s', started_at) AS INTEGER)
-                          < CAST(strftime('%s', 'now') AS INTEGER) - ?
+                    WHERE (julianday('now') - julianday(started_at)) * 86400.0 > ?
                     """,
                     (retention_seconds,),
                 )
