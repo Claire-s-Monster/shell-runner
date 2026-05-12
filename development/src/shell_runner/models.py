@@ -28,6 +28,14 @@ class ExecuteRequest(BaseModel):
     agent_id: str
     approve_token: str | None = None
     output_mode: Literal["inline", "file", "summarize"] = "inline"
+    run_in_background: bool = Field(
+        default=False,
+        description=(
+            "If True, spawn the subprocess and return immediately with a job_id. "
+            "Use shell_status(job_id) to poll and shell_kill(job_id) to terminate. "
+            "T3/T4 approval flow still applies before spawn."
+        ),
+    )
 
 
 class ExecutePromptInfo(BaseModel):
@@ -47,7 +55,7 @@ class ExecuteSuggestion(BaseModel):
 
 
 class ExecuteResponse(BaseModel):
-    decision: Literal["executed", "denied", "prompt_required", "reformulate_suggested"]
+    decision: Literal["executed", "denied", "prompt_required", "reformulate_suggested", "running"]
     tier: int
     matched_rule: str | None
     exit_code: int | None
@@ -59,6 +67,7 @@ class ExecuteResponse(BaseModel):
     telemetry_id: str
     prompt: ExecutePromptInfo | None = None
     suggestions: list[ExecuteSuggestion] | None = None
+    job_id: str | None = None
 
 
 class ClassifyRequest(BaseModel):
@@ -116,3 +125,41 @@ class ObserveResponse(BaseModel):
     telemetry_id: str
     classified_tier: int
     normalized_template: str
+
+
+# ---------------------------------------------------------------------------
+# Background job models
+# ---------------------------------------------------------------------------
+
+JobStatus = Literal["running", "completed", "failed", "killed", "timed_out"]
+
+
+class ShellStatusRequest(BaseModel):
+    job_id: str
+
+
+class ShellStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    started_at: str
+    finished_at: str | None
+    exit_code: int | None
+    duration_ms: int | None
+    stdout_tail: str
+    stderr_tail: str
+    stdout_full_path: str | None
+    stderr_full_path: str | None
+
+
+class ShellKillRequest(BaseModel):
+    job_id: str
+    sig: str = Field(
+        default="SIGTERM",
+        description="Signal name to send, e.g. SIGTERM or SIGKILL.",
+    )
+
+
+class ShellKillResponse(BaseModel):
+    killed: bool
+    sig: str | None = None
+    reason: str | None = None

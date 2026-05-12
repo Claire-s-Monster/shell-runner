@@ -69,6 +69,26 @@ CREATE TABLE IF NOT EXISTS pending_prompts (
 
 CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_prompts(expires_at);
 CREATE INDEX IF NOT EXISTS idx_pending_token ON pending_prompts(approve_token);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    telemetry_id TEXT NOT NULL,
+    raw_cmd TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    exit_code INTEGER,
+    status TEXT NOT NULL,
+    pid INTEGER,
+    stdout_path TEXT,
+    stderr_path TEXT,
+    timeout_s INTEGER NOT NULL,
+    FOREIGN KEY(telemetry_id) REFERENCES shell_calls(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(started_at);
 """
 
 
@@ -334,6 +354,92 @@ class Persistence:
         with self._conn() as conn:
             cursor = conn.execute("DELETE FROM pending_prompts WHERE expires_at < ?", (now,))
             return cursor.rowcount
+
+    # --- jobs ---
+
+    def create_job(
+        self,
+        *,
+        job_id: str,
+        telemetry_id: str,
+        raw_cmd: str,
+        cwd: str,
+        agent_id: str,
+        timeout_s: int,
+        stdout_path: str,
+        stderr_path: str,
+        pid: int,
+    ) -> None:
+        started_at = _now_utc()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    job_id, telemetry_id, raw_cmd, cwd, agent_id,
+                    started_at, status, pid, stdout_path, stderr_path, timeout_s
+                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    telemetry_id,
+                    raw_cmd,
+                    cwd,
+                    agent_id,
+                    started_at,
+                    pid,
+                    stdout_path,
+                    stderr_path,
+                    timeout_s,
+                ),
+            )
+
+    def update_job_status(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        exit_code: int | None = None,
+        finished_at: str | None = None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs SET status = ?, exit_code = ?, finished_at = ?
+                WHERE job_id = ?
+                """,
+                (status, exit_code, finished_at, job_id),
+            )
+
+    def get_job(self, job_id: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_running_jobs(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status = 'running' ORDER BY started_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def cleanup_old_jobs(self, retention_seconds: int) -> list[dict]:
+        """Delete jobs older than retention_seconds (by started_at).
+
+        Returns rows that were removed so the caller can delete stdout/stderr files.
+        """
+        cutoff = (
+            datetime.now(UTC) - timedelta(seconds=retention_seconds)
+        ).isoformat()
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE started_at < ?", (cutoff,)
+            ).fetchall()
+            removed = [dict(r) for r in rows]
+            if removed:
+                conn.execute("DELETE FROM jobs WHERE started_at < ?", (cutoff,))
+        return removed
 
     # --- queries ---
 

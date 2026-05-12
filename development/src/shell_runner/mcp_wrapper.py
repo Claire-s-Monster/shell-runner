@@ -18,9 +18,10 @@ TOOLS: dict[str, dict[str, Any]] = {
     "shell_execute": {
         "description": (
             "Execute a shell command with sandboxing. Returns decision "
-            "(executed|denied|prompt_required), exit_code, stdout, stderr, telemetry_id. "
+            "(executed|denied|prompt_required|running), exit_code, stdout, stderr, telemetry_id. "
             "For T3/T4 commands, returns prompt_required with prompt_id; user must call "
-            "shell_approve_pending then re-call shell_execute with approve_token."
+            "shell_approve_pending then re-call shell_execute with approve_token. "
+            "Set run_in_background=true to spawn asynchronously and get a job_id."
         ),
         "schema": {
             "type": "object",
@@ -45,6 +46,14 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "enum": ["inline", "file", "summarize"],
                     "default": "inline",
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "If true, spawn asynchronously. Returns decision=running and job_id. "
+                        "Use shell_status(job_id) to poll, shell_kill(job_id) to terminate."
+                    ),
                 },
             },
         },
@@ -95,5 +104,40 @@ TOOLS: dict[str, dict[str, Any]] = {
             "catalog size, pending prompt count."
         ),
         "schema": {"type": "object", "properties": {}},
+    },
+    "shell_status": {
+        "description": (
+            "Poll the status of a background job started with shell_execute(run_in_background=true). "
+            "Returns status (running|completed|failed|killed|timed_out), exit_code, "
+            "stdout/stderr tails, and full log paths."
+        ),
+        "schema": {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "Job ID returned by shell_execute with run_in_background=true",
+                },
+            },
+        },
+    },
+    "shell_kill": {
+        "description": (
+            "Send a signal to a running background job. "
+            "Defaults to SIGTERM; use sig='SIGKILL' for forceful termination."
+        ),
+        "schema": {
+            "type": "object",
+            "required": ["job_id"],
+            "properties": {
+                "job_id": {"type": "string", "description": "Job ID to terminate"},
+                "sig": {
+                    "type": "string",
+                    "default": "SIGTERM",
+                    "description": "Signal name, e.g. SIGTERM or SIGKILL",
+                },
+            },
+        },
     },
 }

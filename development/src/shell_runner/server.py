@@ -20,6 +20,8 @@ import signal
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,7 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import executor
 from .catalog import Tier, all_rules
 from .classifier import classify
-from .executor import execute
+from .executor import OUTPUT_TAIL_BYTES, execute, execute_background
 from .mcp_wrapper import TOOLS
 from .models import (
     ApproveRequest,
@@ -41,6 +43,10 @@ from .models import (
     HealthResponse,
     ObserveRequest,
     ObserveResponse,
+    ShellKillRequest,
+    ShellKillResponse,
+    ShellStatusRequest,
+    ShellStatusResponse,
 )
 from .persistence import DEFAULT_DB_PATH, Persistence
 
@@ -51,17 +57,68 @@ db = Persistence(db_path=_db_path)
 
 _cleanup_task: asyncio.Task[None] | None = None
 
+RETENTION_S = int(os.environ.get("SHELL_RUNNER_JOB_RETENTION_S", str(7 * 24 * 3600)))
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _tail(path: str | None, max_bytes: int) -> str:
+    """Read the last *max_bytes* bytes of a file, decoded as UTF-8."""
+    if not path:
+        return ""
+    p = Path(path)
+    if not p.exists():
+        return ""
+    size = p.stat().st_size
+    with p.open("rb") as fh:
+        if size > max_bytes:
+            fh.seek(-max_bytes, 2)
+        raw = fh.read()
+    return raw.decode("utf-8", errors="replace")
+
+
+def _compute_duration_ms(job: dict) -> int | None:
+    if job.get("finished_at") is None:
+        return None
+    try:
+        start = datetime.fromisoformat(job["started_at"])
+        end = datetime.fromisoformat(job["finished_at"])
+        return int((end - start).total_seconds() * 1000)
+    except (ValueError, TypeError):
+        return None
+
 
 async def _periodic_cleanup(interval_s: int = 60) -> None:
-    """Delete expired pending prompts every *interval_s* seconds."""
+    """Delete expired pending prompts and stale jobs every *interval_s* seconds."""
     while True:
         await asyncio.sleep(interval_s)
         try:
-            removed = db.cleanup_expired_prompts()
-            if removed:
-                logger.debug("Cleaned up %d expired pending prompt(s)", removed)
+            removed_prompts = db.cleanup_expired_prompts()
+            if removed_prompts:
+                logger.debug("Cleaned up %d expired pending prompt(s)", removed_prompts)
         except Exception:
             logger.exception("Error during periodic prompt cleanup")
+        try:
+            removed_jobs = db.cleanup_old_jobs(RETENTION_S)
+            for job in removed_jobs:
+                for file_path in (job.get("stdout_path"), job.get("stderr_path")):
+                    if file_path and Path(file_path).exists():
+                        try:
+                            Path(file_path).unlink()
+                        except OSError:
+                            pass
+                job_dir = Path(job["stdout_path"]).parent if job.get("stdout_path") else None
+                if job_dir and job_dir.exists():
+                    try:
+                        job_dir.rmdir()
+                    except OSError:
+                        pass
+            if removed_jobs:
+                logger.debug("Cleaned up %d stale job(s)", len(removed_jobs))
+        except Exception:
+            logger.exception("Error during periodic job cleanup")
 
 
 def _on_sighup() -> None:
@@ -117,6 +174,51 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
         ):
             raise HTTPException(
                 status_code=403, detail="approve_token does not match command/cwd/agent"
+            )
+        if req.run_in_background:
+            telemetry_id = db.record_call(
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=prompt["normalized_template"],
+                command_tier=prompt["command_tier"],
+                final_tier=prompt["command_tier"],
+                decision="running",
+                matched_rule_pattern=None,
+                matched_rule_category=prompt["matched_rule_category"],
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                decision_path=["approve_token consumed", "background"],
+                normalizer_warnings=[],
+            )
+            db.upsert_template(
+                template=prompt["normalized_template"],
+                agent_id=req.agent_id,
+                current_tier=prompt["command_tier"],
+                was_denied=False,
+            )
+            job_id = await execute_background(
+                command=req.command,
+                cwd=req.cwd,
+                timeout_s=req.timeout_s,
+                telemetry_id=telemetry_id,
+                agent_id=req.agent_id,
+                persistence=db,
+            )
+            return ExecuteResponse(
+                decision="running",
+                tier=prompt["command_tier"],
+                matched_rule=None,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                stdout_full_path=None,
+                stderr_full_path=None,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                telemetry_id=telemetry_id,
+                job_id=job_id,
             )
         exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
         duration_ms = int((time.monotonic() - t0) * 1000)
@@ -205,6 +307,51 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
 
     # T1/T2 — auto-execute
     if cls.tier in (Tier.AUTO_LOG, Tier.AUTO_CAPPED):
+        if req.run_in_background:
+            telemetry_id = db.record_call(
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                decision="running",
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                decision_path=list(cls.decision_path) + ["background"],
+                normalizer_warnings=list(cls.normalizer_warnings),
+            )
+            db.upsert_template(
+                template=cls.template,
+                agent_id=req.agent_id,
+                current_tier=int(cls.tier),
+                was_denied=False,
+            )
+            job_id = await execute_background(
+                command=req.command,
+                cwd=req.cwd,
+                timeout_s=req.timeout_s,
+                telemetry_id=telemetry_id,
+                agent_id=req.agent_id,
+                persistence=db,
+            )
+            return ExecuteResponse(
+                decision="running",
+                tier=int(cls.tier),
+                matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                stdout_full_path=None,
+                stderr_full_path=None,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                telemetry_id=telemetry_id,
+                job_id=job_id,
+            )
         exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
         duration_ms = int((time.monotonic() - t0) * 1000)
         telemetry_id = db.record_call(
@@ -368,6 +515,39 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         template_promoted=False,  # Phase 2
         catalog_entry_id=None,  # Phase 2
     )
+
+
+@app.post("/tools/shell_status", response_model=ShellStatusResponse)
+async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
+    job = db.get_job(body.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"job {body.job_id} not found")
+    return ShellStatusResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        started_at=job["started_at"],
+        finished_at=job["finished_at"],
+        exit_code=job["exit_code"],
+        duration_ms=_compute_duration_ms(job),
+        stdout_tail=_tail(job["stdout_path"], OUTPUT_TAIL_BYTES),
+        stderr_tail=_tail(job["stderr_path"], OUTPUT_TAIL_BYTES),
+        stdout_full_path=job["stdout_path"],
+        stderr_full_path=job["stderr_path"],
+    )
+
+
+@app.post("/tools/shell_kill", response_model=ShellKillResponse)
+async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
+    job = db.get_job(body.job_id)
+    if not job or job["status"] != "running":
+        return ShellKillResponse(killed=False, reason="job not running or not found")
+    sig = getattr(signal, body.sig, signal.SIGTERM)
+    try:
+        os.kill(job["pid"], sig)
+        return ShellKillResponse(killed=True, sig=body.sig)
+    except ProcessLookupError:
+        db.update_job_status(body.job_id, status="killed", finished_at=_now_iso())
+        return ShellKillResponse(killed=True, reason="process already gone, status updated")
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -563,5 +743,21 @@ async def _dispatch_tool_call(params: dict[str, Any]) -> dict[str, Any]:
 
     if tool_name == "shell_health":
         return (await health_route()).model_dump()
+
+    if tool_name == "shell_status":
+        try:
+            status_req = ShellStatusRequest(**arguments)
+        except Exception:
+            logger.exception("Invalid arguments for shell_status")
+            return {"error": "invalid arguments"}
+        return (await shell_status_route(status_req)).model_dump()
+
+    if tool_name == "shell_kill":
+        try:
+            kill_req = ShellKillRequest(**arguments)
+        except Exception:
+            logger.exception("Invalid arguments for shell_kill")
+            return {"error": "invalid arguments"}
+        return (await shell_kill_route(kill_req)).model_dump()
 
     return {"error": f"unknown tool: {tool_name}", "available": list(TOOLS.keys())}

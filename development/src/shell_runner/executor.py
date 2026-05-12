@@ -9,14 +9,21 @@ Runs commands via /bin/bash with:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import shlex
 import subprocess
 import threading
 import tomllib
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .persistence import Persistence
 
 OUTPUT_HEAD_BYTES = 4096
 OUTPUT_TAIL_BYTES = 4096
@@ -236,3 +243,114 @@ def execute(
         duration_ms=duration_ms,
         timed_out=timed_out,
     )
+
+
+def _job_dir_base() -> Path:
+    default = str(Path.home() / ".local/share/shell-runner/jobs")
+    return Path(os.environ.get("SHELL_RUNNER_JOB_DIR", default))
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+async def execute_background(
+    *,
+    command: str,
+    cwd: str,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+    telemetry_id: str,
+    agent_id: str,
+    persistence: "Persistence",
+    env_passthrough: list[str] | None = None,
+) -> str:
+    """Spawn command in background, persist a jobs row, return job_id immediately.
+
+    The asyncio watcher task handles timeout and final status update.
+    Foreground execution path is completely unchanged.
+    """
+    # Validate cwd — same logic as foreground execute()
+    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+    with _cwd_roots_lock:
+        current_roots = list(_CWD_ROOTS)
+    if not any(resolved.is_relative_to(r) for r in current_roots):
+        sorted_roots = sorted(str(r) for r in current_roots)
+        msg = f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"
+        raise ValueError(msg)
+    if not resolved.exists():
+        raise ValueError(f"cwd does not exist: {cwd}")
+    if not resolved.is_dir():
+        raise ValueError(f"cwd is not a directory: {cwd}")
+
+    job_id = str(uuid.uuid4())
+    job_dir = _job_dir_base() / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    stdout_path = job_dir / "stdout.log"
+    stderr_path = job_dir / "stderr.log"
+
+    allowed = env_passthrough if env_passthrough is not None else DEFAULT_ENV_PASSTHROUGH
+    env = {k: v for k, v in os.environ.items() if k in allowed}
+
+    effective_timeout = min(timeout_s, MAX_TIMEOUT_S)
+
+    stdout_file = stdout_path.open("wb")
+    stderr_file = stderr_path.open("wb")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *shlex.split(command),
+            cwd=str(resolved),
+            stdout=stdout_file,
+            stderr=stderr_file,
+            env=env,
+        )
+    except Exception:
+        stdout_file.close()
+        stderr_file.close()
+        raise
+
+    stdout_file.close()
+    stderr_file.close()
+
+    persistence.create_job(
+        job_id=job_id,
+        telemetry_id=telemetry_id,
+        raw_cmd=command,
+        cwd=cwd,
+        agent_id=agent_id,
+        timeout_s=timeout_s,
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+        pid=proc.pid,
+    )
+
+    async def _watch() -> None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
+            rc = proc.returncode
+            status = "completed" if rc == 0 else "failed"
+            persistence.update_job_status(
+                job_id,
+                status=status,
+                exit_code=rc,
+                finished_at=_now_iso(),
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            persistence.update_job_status(
+                job_id,
+                status="timed_out",
+                exit_code=proc.returncode,
+                finished_at=_now_iso(),
+            )
+        except Exception:
+            logger.exception("Unexpected error in background watcher for job %s", job_id)
+
+    asyncio.create_task(_watch(), name=f"bg-watch-{job_id}")
+
+    return job_id
