@@ -135,7 +135,9 @@ async def test_shell_kill_terminates_running_job(job_dir: Path) -> None:
             },
         )
         assert resp.status_code == 200
-        job_id = resp.json()["job_id"]
+        data = resp.json()
+        assert data["decision"] == "running", f"expected background, got {data}"
+        job_id = data["job_id"]
 
         # Give subprocess a moment to start
         await asyncio.sleep(0.3)
@@ -199,7 +201,9 @@ async def test_background_timeout_marks_timed_out(job_dir: Path) -> None:
             },
         )
         assert resp.status_code == 200
-        job_id = resp.json()["job_id"]
+        data = resp.json()
+        assert data["decision"] == "running", f"expected background, got {data}"
+        job_id = data["job_id"]
 
         final = await _wait_for_status(
             client,

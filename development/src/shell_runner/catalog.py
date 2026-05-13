@@ -206,6 +206,7 @@ T1_AUTO_LOG: list[Rule] = [
     Rule(r"^date(\s+\+<arg>)?$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^ps(\s+aux)?$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^echo(\s+\S+)*$", Tier.AUTO_LOG, "system-info"),
+    Rule(r"^sleep\s+<n>$", Tier.AUTO_LOG, "process"),
     Rule(r"^env$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^printenv(\s+\w+)?$", Tier.AUTO_LOG, "system-info"),
     # Pure pipeline (no fs-write — sed -i is T2)
