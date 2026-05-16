@@ -117,3 +117,45 @@ def test_health_unreachable_returns_error_dict() -> None:
     h = get_health(api_url="http://127.0.0.1:1", timeout=0.5)
     assert h["status"] == "unreachable"
     assert "error" in h
+
+
+# ---------------------------------------------------------------------------
+# approve_prompt — promote_to_tier forwarding
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock, patch  # noqa: E402
+
+
+def test_approve_prompt_includes_promote_to_tier_when_provided() -> None:
+    from ui.data import approve_prompt
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"applied": True}
+    mock_resp.raise_for_status = MagicMock()
+    with patch("ui.data.httpx.post", return_value=mock_resp) as mock_post:
+        approve_prompt("pid-x", "approve_template", promote_to_tier=2)
+        assert mock_post.call_args.kwargs["json"]["promote_to_tier"] == 2
+
+
+def test_approve_prompt_omits_promote_to_tier_when_none() -> None:
+    from ui.data import approve_prompt
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"applied": True}
+    mock_resp.raise_for_status = MagicMock()
+    with patch("ui.data.httpx.post", return_value=mock_resp) as mock_post:
+        approve_prompt("pid-x", "approve_once")
+        assert "promote_to_tier" not in mock_post.call_args.kwargs["json"]
+
+
+def test_approve_prompt_sends_global_decision() -> None:
+    from ui.data import approve_prompt
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"applied": True}
+    mock_resp.raise_for_status = MagicMock()
+    with patch("ui.data.httpx.post", return_value=mock_resp) as mock_post:
+        approve_prompt("pid-x", "approve_template_global", promote_to_tier=1)
+        body = mock_post.call_args.kwargs["json"]
+        assert body["decision"] == "approve_template_global"
+        assert body["promote_to_tier"] == 1

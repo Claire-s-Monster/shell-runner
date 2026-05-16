@@ -15,9 +15,9 @@ with hcol2:
 st.caption("Updates after each approve/deny action.")
 
 
-def _act(pid: str, decision: str, reason: str) -> None:
+def _act(pid: str, decision: str, reason: str, promote_to_tier: int | None = None) -> None:
     try:
-        approve_prompt(pid, decision, reason)
+        approve_prompt(pid, decision, reason, promote_to_tier=promote_to_tier)
         st.toast(f"{decision} → {pid[:8]}…", icon="✅")
         st.rerun()
     except Exception as exc:  # noqa: BLE001
@@ -45,10 +45,21 @@ for p in prompts:
             )
         with cols[1]:
             reason = st.text_input("Reason (optional)", key=f"reason_{pid}")
-            b1, b2, b3 = st.columns(3)
+            tier_label = st.selectbox(
+                "Promote to tier (templates only)",
+                options=["T2 (auto-execute, logged)", "T1 (auto-execute, silent)"],
+                index=0,
+                key=f"tier_{pid}",
+                help="Applies only to 'Approve template' and 'Approve global'. Ignored for 'Approve once'.",
+            )
+            promote_to_tier = 2 if tier_label.startswith("T2") else 1
+
+            b1, b2, b3, b4 = st.columns(4)
             if b1.button("Approve once", key=f"once_{pid}", type="primary"):
                 _act(pid, "approve_once", reason)
-            if b2.button("Approve template", key=f"tmpl_{pid}"):
-                _act(pid, "approve_template", reason)
-            if b3.button("Deny", key=f"deny_{pid}"):
+            if b2.button("Approve template", key=f"tmpl_{pid}", help="Permanent for THIS agent only"):
+                _act(pid, "approve_template", reason, promote_to_tier=promote_to_tier)
+            if b3.button("Approve global", key=f"global_{pid}", help="Permanent for ALL agents"):
+                _act(pid, "approve_template_global", reason, promote_to_tier=promote_to_tier)
+            if b4.button("Deny", key=f"deny_{pid}"):
                 _act(pid, "deny", reason)
