@@ -90,12 +90,15 @@ def approve_prompt(
     prompt_id: str,
     decision: str,
     reason: str = "",
+    promote_to_tier: int | None = None,
     api_url: str = DEFAULT_API_URL,
     timeout: float = 5.0,
 ) -> dict[str, Any]:
     """POST to /approve_pending.
 
     decision is one of: approve_once, approve_template, approve_template_global, deny.
+    promote_to_tier is forwarded to the server when provided (T1 or T2); applies only
+    to template decisions. Server defaults to T2 when omitted.
     Returns the JSON response. Raises on HTTP error.
     """
     body: dict[str, Any] = {
@@ -103,6 +106,8 @@ def approve_prompt(
         "decision": decision,
         "reason": reason if reason else None,
     }
+    if promote_to_tier is not None:
+        body["promote_to_tier"] = promote_to_tier
     r = httpx.post(f"{api_url}/approve_pending", json=body, timeout=timeout)
     r.raise_for_status()
     return r.json()
