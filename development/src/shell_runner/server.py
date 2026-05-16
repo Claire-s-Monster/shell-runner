@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import executor
 from .catalog import Tier, all_rules
-from .classifier import classify
+from .classifier import PERMISSIVENESS, ClassificationResult, _cap_permissiveness, classify
 from .executor import OUTPUT_TAIL_BYTES, execute, execute_background
 from .mcp_wrapper import TOOLS
 from .models import (
@@ -88,6 +88,46 @@ def _compute_duration_ms(job: dict) -> int | None:
         return int((end - start).total_seconds() * 1000)
     except (ValueError, TypeError):
         return None
+
+
+def _apply_template_approval(cls: ClassificationResult, agent_id: str) -> ClassificationResult:
+    """Override classification tier if a persisted template approval exists.
+
+    Global approvals take precedence over agent-specific ones (handled by
+    get_template_approved_tier). The override only applies when the approved
+    tier is strictly more permissive than the classified command_tier.
+    The agent cap is re-applied after the override so the cap still constrains.
+    """
+    approved_int = db.get_template_approved_tier(cls.template, agent_id)
+    if approved_int is None:
+        return cls
+
+    approved_tier = Tier(approved_int)
+    # Only override if approved tier is more permissive (higher PERMISSIVENESS value)
+    if PERMISSIVENESS.get(approved_tier, 0) <= PERMISSIVENESS.get(cls.command_tier, 0):
+        return cls
+
+    # Re-apply agent cap with the new command_tier (same formula as classifier.py)
+    new_cmd_perm = PERMISSIVENESS[approved_tier]
+    cap_perm = _cap_permissiveness(cls.agent_cap)
+    new_final_tier = approved_tier if new_cmd_perm <= cap_perm else cls.agent_cap
+
+    new_path = list(cls.decision_path) + [
+        f"approved_template_T{approved_int}: {cls.command_tier.name} -> {approved_tier.name}"
+    ]
+    if new_final_tier != approved_tier:
+        new_path.append(f"agent cap applied: {approved_tier.name} -> {new_final_tier.name}")
+
+    return ClassificationResult(
+        tier=new_final_tier,
+        command_tier=approved_tier,
+        agent_cap=cls.agent_cap,
+        matched_rule=cls.matched_rule,
+        template=cls.template,
+        segments=cls.segments,
+        normalizer_warnings=cls.normalizer_warnings,
+        decision_path=tuple(new_path),
+    )
 
 
 async def _periodic_cleanup(interval_s: int = 60) -> None:
@@ -260,6 +300,7 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
 
     # Path B: no token — classify first
     cls = classify(req.command, req.cwd, req.agent_id)
+    cls = _apply_template_approval(cls, req.agent_id)
 
     # DENY
     if cls.tier == Tier.DENY:
@@ -447,6 +488,7 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
     cls = classify(req.command, req.cwd, req.agent_id)
+    cls = _apply_template_approval(cls, req.agent_id)
     _preview_map: dict[Tier, str] = {
         Tier.DENY: "would_deny",
         Tier.AUTO_LOG: "would_execute",
@@ -509,11 +551,51 @@ async def observe_route(req: ObserveRequest) -> ObserveResponse:
 @app.post("/approve_pending", response_model=ApproveResponse)
 async def approve_route(req: ApproveRequest) -> ApproveResponse:
     token = db.approve_prompt(prompt_id=req.prompt_id, decision=req.decision)
+    if token is None and req.decision != "deny":
+        raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
+
+    template_promoted = False
+    catalog_entry_id: str | None = None
+
+    if req.decision in ("approve_template", "approve_template_global"):
+        prompt = db.get_pending_prompt(req.prompt_id)
+        if prompt is None:
+            raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
+
+        # Default to T2 (AUTO_CAPPED) — auto-execute but still logged
+        promoted_tier = req.promote_to_tier if req.promote_to_tier is not None else int(Tier.AUTO_CAPPED)
+
+        # Must be a real promotion (more permissive than original)
+        original_tier = int(prompt["command_tier"])
+        if promoted_tier >= original_tier:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"promote_to_tier={promoted_tier} is not more permissive than "
+                    f"original command_tier={original_tier}; promotions must lower the tier"
+                ),
+            )
+        if promoted_tier <= int(Tier.DENY):
+            raise HTTPException(
+                status_code=400,
+                detail=f"promote_to_tier={promoted_tier} (DENY) is invalid for approval",
+            )
+
+        agent_scope = None if req.decision == "approve_template_global" else prompt["agent_id"]
+        entry_id = db.create_template_approval(
+            template=prompt["normalized_template"],
+            agent_id=agent_scope,
+            approved_tier=promoted_tier,
+            approved_via_prompt_id=req.prompt_id,
+        )
+        template_promoted = True
+        catalog_entry_id = str(entry_id)
+
     return ApproveResponse(
-        applied=True,  # approve_prompt always applies (approve or deny)
+        applied=True,
         approve_token=token,
-        template_promoted=False,  # Phase 2
-        catalog_entry_id=None,  # Phase 2
+        template_promoted=template_promoted,
+        catalog_entry_id=catalog_entry_id,
     )
 
 

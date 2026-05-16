@@ -89,6 +89,20 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_started ON jobs(started_at);
+
+CREATE TABLE IF NOT EXISTS template_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template TEXT NOT NULL,
+    agent_id TEXT,
+    approved_tier INTEGER NOT NULL,
+    approved_at TEXT NOT NULL,
+    approved_via_prompt_id TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_template_approvals_unique
+    ON template_approvals(template, COALESCE(agent_id, ''));
+
+CREATE INDEX IF NOT EXISTS idx_template_approvals_template ON template_approvals(template);
 """
 
 
@@ -348,6 +362,79 @@ class Persistence:
                 "command_tier": row["command_tier"],
                 "matched_rule_category": row["matched_rule_category"],
             }
+
+    def get_pending_prompt(self, prompt_id: str) -> dict | None:
+        """Fetch a pending prompt by id (full row as dict)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id, raw_cmd, agent_id, cwd, normalized_template,
+                       command_tier, matched_rule_category, expires_at,
+                       approve_token, approve_decision, approved_at, consumed_at
+                FROM pending_prompts WHERE id = ?
+                """,
+                (prompt_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def create_template_approval(
+        self,
+        *,
+        template: str,
+        agent_id: str | None,
+        approved_tier: int,
+        approved_via_prompt_id: str | None = None,
+    ) -> int:
+        """Persist a template approval. Replaces any prior approval for the
+        same (template, agent_id) pair. agent_id=None means global approval.
+        Returns the row id."""
+        now = _now_utc()
+        scope_key = agent_id if agent_id is not None else ""
+        with self._conn() as conn:
+            # Delete any existing approval for this scope (replace semantics)
+            conn.execute(
+                """
+                DELETE FROM template_approvals
+                WHERE template = ? AND COALESCE(agent_id, '') = ?
+                """,
+                (template, scope_key),
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO template_approvals
+                    (template, agent_id, approved_tier, approved_at, approved_via_prompt_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (template, agent_id, approved_tier, now, approved_via_prompt_id),
+            )
+            return int(cur.lastrowid)
+
+    def get_template_approved_tier(self, template: str, agent_id: str) -> int | None:
+        """Get the most permissive approved tier for a template.
+        Global approval (agent_id IS NULL) takes precedence over agent-specific.
+        Returns None if no approval exists."""
+        with self._conn() as conn:
+            # Global first
+            row = conn.execute(
+                """
+                SELECT approved_tier FROM template_approvals
+                WHERE template = ? AND agent_id IS NULL
+                ORDER BY approved_at DESC LIMIT 1
+                """,
+                (template,),
+            ).fetchone()
+            if row is not None:
+                return int(row[0])
+            # Then agent-specific
+            row = conn.execute(
+                """
+                SELECT approved_tier FROM template_approvals
+                WHERE template = ? AND agent_id = ?
+                ORDER BY approved_at DESC LIMIT 1
+                """,
+                (template, agent_id),
+            ).fetchone()
+            return int(row[0]) if row is not None else None
 
     def cleanup_expired_prompts(self) -> int:
         now = _now_utc()
