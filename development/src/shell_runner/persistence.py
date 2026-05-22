@@ -387,7 +387,8 @@ class Persistence:
     ) -> int:
         """Persist a template approval. Replaces any prior approval for the
         same (template, agent_id) pair. agent_id=None means global approval.
-        Returns the row id."""
+        Returns the row id.
+        """
         now = _now_utc()
         scope_key = agent_id if agent_id is not None else ""
         with self._conn() as conn:
@@ -412,7 +413,8 @@ class Persistence:
     def get_template_approved_tier(self, template: str, agent_id: str) -> int | None:
         """Get the most permissive approved tier for a template.
         Global approval (agent_id IS NULL) takes precedence over agent-specific.
-        Returns None if no approval exists."""
+        Returns None if no approval exists.
+        """
         with self._conn() as conn:
             # Global first
             row = conn.execute(
@@ -435,6 +437,117 @@ class Persistence:
                 (template, agent_id),
             ).fetchone()
             return int(row[0]) if row is not None else None
+
+    def find_similar_approved_templates(
+        self,
+        template: str,
+        agent_id: str,
+        *,
+        limit: int = 3,
+        min_similarity: float = 0.5,
+    ) -> list[tuple[str, int, str | None, str | None]]:
+        """Return up to `limit` approved templates similar to `template`.
+
+        Similarity = verb-anchored Jaccard over whitespace-split tokens. The first
+        token (verb) must match exactly; if verbs differ, the candidate is excluded
+        regardless of overall overlap. Candidates are filtered by Jaccard >=
+        min_similarity, then sorted by Jaccard descending, then by approved_at
+        descending as a tiebreaker.
+
+        Looks at both global (agent_id IS NULL) approvals and approvals scoped to
+        the given `agent_id`. Excludes any approval whose template equals
+        `template` exactly (caller already handled that via get_template_approved_tier).
+
+        Returns: list of (template, approved_tier, category, example_raw_cmd) tuples.
+        `category` is pulled from the `templates` table if present (None if no row).
+        `example_raw_cmd` is the most recent raw_cmd from the `calls` table whose
+        normalized_template equals the approved template AND whose decision is
+        'executed' (None if no such call exists).
+        """
+
+        def _jaccard(a: set[str], b: set[str]) -> float:
+            union = a | b
+            if not union:
+                return 0.0
+            return len(a & b) / len(union)
+
+        query_tokens = template.split()
+        if not query_tokens:
+            return []
+        query_verb = query_tokens[0]
+        query_set = set(query_tokens)
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT template, approved_tier, approved_at,
+                       CASE WHEN agent_id IS NULL THEN 0 ELSE 1 END AS is_agent_scoped
+                FROM template_approvals
+                WHERE (agent_id IS NULL OR agent_id = ?)
+                  AND template != ?
+                ORDER BY approved_at DESC
+                """,
+                (agent_id, template),
+            ).fetchall()
+
+            # Deduplicate: for same template keep most permissive tier; tie → prefer global
+            best: dict[str, tuple[int, str, int]] = (
+                {}
+            )  # template → (tier, approved_at, is_agent_scoped)
+            for row in rows:
+                tmpl = row["template"]
+                tier = row["approved_tier"]
+                at = row["approved_at"]
+                scoped = row["is_agent_scoped"]
+                if tmpl not in best:
+                    best[tmpl] = (tier, at, scoped)
+                else:
+                    prev_tier, prev_at, prev_scoped = best[tmpl]
+                    if tier < prev_tier:  # lower tier = more permissive
+                        best[tmpl] = (tier, at, scoped)
+                    elif tier == prev_tier and scoped > prev_scoped:
+                        # same tier, prefer global (scoped=0) over agent (scoped=1)
+                        best[tmpl] = (prev_tier, prev_at, prev_scoped)
+
+            # Rank by Jaccard with verb filter
+            # Why: verb must match to avoid false positives across unrelated commands
+            ranked: list[tuple[float, str, str, int]] = []  # (sim, approved_at, tmpl, tier)
+            for tmpl, (tier, approved_at, _) in best.items():
+                cand_tokens = tmpl.split()
+                if not cand_tokens:
+                    continue
+                if cand_tokens[0] != query_verb:
+                    continue
+                sim = _jaccard(query_set, set(cand_tokens))
+                if sim >= min_similarity:
+                    ranked.append((sim, approved_at, tmpl, tier))
+
+            # Two-pass stable sort: secondary key first, then primary (Python sort is stable)
+            ranked.sort(key=lambda x: x[1], reverse=True)  # approved_at DESC
+            ranked.sort(
+                key=lambda x: -x[0]
+            )  # sim DESC — stable, preserves approved_at order for ties
+            top = ranked[:limit]
+
+            results: list[tuple[str, int, str | None, str | None]] = []
+            for _, _, tmpl, tier in top:
+                # category: templates table has no category column → always None
+                category: str | None = None
+
+                # example_raw_cmd: most recent 'executed' call for this template
+                call_row = conn.execute(
+                    """
+                    SELECT raw_cmd FROM shell_calls
+                    WHERE normalized_template = ? AND decision = 'executed'
+                    ORDER BY ts DESC LIMIT 1
+                    """,
+                    (tmpl,),
+                ).fetchone()
+                example_raw_cmd: str | None = call_row["raw_cmd"] if call_row is not None else None
+
+                results.append((tmpl, tier, category, example_raw_cmd))
+
+        return results
 
     def cleanup_expired_prompts(self) -> int:
         now = _now_utc()
@@ -500,14 +613,15 @@ class Persistence:
     def get_job(self, job_id: str) -> dict | None:
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+                "SELECT * FROM jobs WHERE job_id = ?",
+                (job_id,),
             ).fetchone()
         return dict(row) if row is not None else None
 
     def list_running_jobs(self) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM jobs WHERE status = 'running' ORDER BY started_at"
+                "SELECT * FROM jobs WHERE status = 'running' ORDER BY started_at",
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -573,7 +687,8 @@ class Persistence:
         since_24h = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
         with self._conn() as conn:
             total_row = conn.execute(
-                "SELECT COUNT(*) as cnt FROM shell_calls WHERE ts >= ?", (since_24h,)
+                "SELECT COUNT(*) as cnt FROM shell_calls WHERE ts >= ?",
+                (since_24h,),
             ).fetchone()
             total = total_row["cnt"] if total_row else 0
 
