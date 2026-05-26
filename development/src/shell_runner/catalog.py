@@ -244,6 +244,14 @@ T1_AUTO_LOG: list[Rule] = [
     ),
     Rule(r"^tee\s+/dev/null$", Tier.AUTO_LOG, "text-transform"),
     Rule(r"^xargs\s+\S+$", Tier.AUTO_LOG, "text-transform"),
+    # Pre-collapsed safe pipe filter (normalizer collapsed the segment to <safe_pipe>)
+    Rule(
+        r"^<safe_pipe>$",
+        Tier.AUTO_LOG,
+        "text-transform",
+        match_target="template",
+        reason="Pre-collapsed safelisted pipe filter (head/tail/grep/wc/awk/sed/cut/sort/uniq/jq/tr/less/more/cat) — read-only by construction",
+    ),
 ]
 
 # ---------------------------------------------------------------------------

