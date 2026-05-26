@@ -52,6 +52,35 @@ _EXEC_UNSAFE_VERBS: frozenset[str] = frozenset({"curl", "wget", "fetch"})
 # Destructive verbs for glob-in-destructive-position warning
 _DESTRUCTIVE_VERBS: frozenset[str] = frozenset({"rm", "mv", "cp", "chmod"})
 
+# Pipeline filter verbs whose entire pipe segment is safe to collapse to <safe_pipe>
+SAFE_PIPE_FILTERS: frozenset[str] = frozenset({
+    "head", "tail", "grep", "wc", "awk", "sed", "cut",
+    "sort", "uniq", "jq", "tr", "less", "more", "cat",
+})
+
+# Verbs whose flag tokens (matching ^-+[A-Za-z]) are stripped from templates
+SAFE_FLAG_STRIP_VERBS: frozenset[str] = frozenset({
+    "curl", "wget", "ls", "pgrep", "ps", "head", "tail",
+    "grep", "wc", "awk", "sed", "cut", "sort", "uniq",
+    "jq", "tr", "find", "cat",
+})
+
+# Per-verb flag preserve list. Even when verb is in SAFE_FLAG_STRIP_VERBS,
+# flags in this set are NEVER stripped — they carry security signal.
+FLAG_PRESERVE_FOR_VERB: dict[str, frozenset[str]] = {
+    "curl": frozenset({
+        "-X", "--request",
+        "-d", "--data", "--data-binary", "--data-raw", "--data-urlencode",
+        "-T", "--upload-file",
+        "-F", "--form",
+    }),
+    "wget": frozenset({
+        "--method",
+        "--post-data", "--post-file",
+        "--body-data", "--body-file",
+    }),
+}
+
 # Maximum subshell recursion depth before truncating
 _MAX_SUBSHELL_DEPTH = 3
 
@@ -588,6 +617,15 @@ def _normalize_segment(
             i += 1
             continue
 
+        # Strip flag tokens for safelisted verbs (B: flag-stripping),
+        # EXCEPT preserved security-relevant flags (e.g. curl -X carries HTTP method)
+        if verb in SAFE_FLAG_STRIP_VERBS and re.match(r"^-+[A-Za-z]", tok):
+            preserved = FLAG_PRESERVE_FOR_VERB.get(verb, frozenset())
+            if tok not in preserved:
+                i += 1
+                continue
+            # else fall through to keep this token
+
         # Classify remaining tokens
         classified = _classify_token(tok, cwd, env, safe_domains, state, depth)
 
@@ -852,9 +890,13 @@ def _normalize_internal(
 
     segments: list[Segment] = []
     segment_templates: list[str] = []
+    prev_op: str | None = None
 
     for seg_tokens, op in raw_segments:
         tmpl, verb, is_bg = _normalize_segment(seg_tokens, cwd, env, safe_domains, state, depth)
+        # A: collapse safe pipe-filter segments to <safe_pipe>
+        if prev_op == "|" and verb in SAFE_PIPE_FILTERS:
+            tmpl = "<safe_pipe>"
         seg = Segment(
             template=tmpl,
             verb=verb,
@@ -866,6 +908,7 @@ def _normalize_internal(
         segment_templates.append(tmpl)
         if op:
             segment_templates.append(f" {op} ")
+        prev_op = op
 
     # Build final template from segments
     final_template = "".join(segment_templates)
