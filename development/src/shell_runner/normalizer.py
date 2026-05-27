@@ -43,6 +43,12 @@ SAFE_DOMAINS_READ: frozenset[str] = frozenset(
         "docs.python.org",
         "peps.python.org",
         "modelcontextprotocol.io",
+        # CI-log artifact hosts
+        "*.blob.core.windows.net",        # Azure Blob Storage (GHA/conda-forge log artifacts)
+        "actions.githubusercontent.com",
+        "*.actions.githubusercontent.com", # GitHub Actions pipeline hosts
+        "objects.githubusercontent.com",   # GitHub artifact CDN
+        "pkgs.dev.azure.com",              # Azure DevOps package URLs
     }
 )
 
@@ -80,6 +86,23 @@ FLAG_PRESERVE_FOR_VERB: dict[str, frozenset[str]] = {
         "--body-data", "--body-file",
     }),
 }
+
+# Per-verb value-flags whose value should be replaced with <file_arg> in the
+# template (when the flag is in SAFE_FLAG_STRIP_VERBS and being stripped).
+# Example: `curl -o /tmp/x <url>` -> `curl <safe_url> <file_arg>`
+# NOTE: flags in FLAG_PRESERVE_FOR_VERB take priority; only stripped flags
+# are checked here.
+FLAG_VALUE_TO_FILE_ARG: dict[str, frozenset[str]] = {
+    "curl": frozenset({"-o", "--output"}),
+    "wget": frozenset({"-O", "--output-document"}),
+}
+
+# Verbs that take file paths as positional args read-only. Path-classified
+# tokens (anywhere in the segment) become <file_arg> for these verbs.
+READ_ONLY_FILE_VERBS: frozenset[str] = frozenset({
+    "head", "tail", "cat", "wc", "grep", "awk", "sed", "cut",
+    "sort", "uniq", "jq", "tr", "less", "more", "find", "file",
+})
 
 # Maximum subshell recursion depth before truncating
 _MAX_SUBSHELL_DEPTH = 3
@@ -521,19 +544,34 @@ def _split_segments(tokens: list[str]) -> list[tuple[list[str], str | None]]:
             paren_depth -= 1
             current.append(tok)
         elif paren_depth == 0:
-            # Check for two-character operators
-            if i + 1 < len(tokens):
+            # Check for two-character operators emitted as a SINGLE token by shlex
+            # (shlex punctuation_chars=True emits runs of punctuation as one token,
+            # so "&&" and "||" each arrive as a single "&&" / "||" token).
+            if tok in ("&&", "||"):
+                segments.append((current, tok))
+                current = []
+            # Legacy two-token fallback: in case some paths emit two single-char
+            # punctuation tokens ("&","&" or "|","|") rather than a single run.
+            elif i + 1 < len(tokens):
                 double = tok + tokens[i + 1]
                 if double in ("&&", "||"):
                     segments.append((current, double))
                     current = []
                     i += 2
                     continue
-            if tok == "|" and (i + 1 >= len(tokens) or tokens[i + 1] != "|"):
+                elif tok == "|" and tokens[i + 1] != "|":
+                    segments.append((current, "|"))
+                    current = []
+                elif tok == ";":
+                    if current:
+                        segments.append((current, ";"))
+                        current = []
+                else:
+                    current.append(tok)
+            elif tok == "|":
                 segments.append((current, "|"))
                 current = []
             elif tok == ";":
-                # Skip empty segments from trailing semicolons
                 if current:
                     segments.append((current, ";"))
                     current = []
@@ -622,6 +660,22 @@ def _normalize_segment(
         if verb in SAFE_FLAG_STRIP_VERBS and re.match(r"^-+[A-Za-z]", tok):
             preserved = FLAG_PRESERVE_FOR_VERB.get(verb, frozenset())
             if tok not in preserved:
+                # B1: if this flag consumes a following value token that is a
+                # file path, emit <file_arg> and advance past the value.
+                value_flags = FLAG_VALUE_TO_FILE_ARG.get(verb, frozenset())
+                if tok in value_flags and i + 1 < len(tokens):
+                    next_tok = tokens[i + 1]
+                    next_classified = _classify_token(
+                        next_tok, cwd, env, safe_domains, state, depth
+                    )
+                    _PATH_PLACEHOLDERS = frozenset({
+                        "<tmp_path>", "<cwd_path>", "<home_path>",
+                        "<system_path>", "<etc_path>", "<abs_path>",
+                    })
+                    if next_classified in _PATH_PLACEHOLDERS:
+                        normalized.append("<file_arg>")
+                        i += 2
+                        continue
                 i += 1
                 continue
             # else fall through to keep this token
@@ -635,6 +689,18 @@ def _normalize_segment(
 
         normalized.append(classified)
         i += 1
+
+    # B2: for read-only file verbs, rewrite any path placeholder to <file_arg>.
+    # This collapses e.g. `wc /tmp/x` and `wc ./x` to the same template `wc <file_arg>`.
+    if verb in READ_ONLY_FILE_VERBS:
+        _PATH_PLACEHOLDERS_RO = frozenset({
+            "<tmp_path>", "<cwd_path>", "<home_path>",
+            "<system_path>", "<etc_path>", "<abs_path>",
+        })
+        normalized = [
+            "<file_arg>" if t in _PATH_PLACEHOLDERS_RO else t
+            for t in normalized
+        ]
 
     template = " ".join(normalized)
     return (template, verb, is_background)
