@@ -668,11 +668,11 @@ def _normalize_segment(
                     next_classified = _classify_token(
                         next_tok, cwd, env, safe_domains, state, depth
                     )
-                    _PATH_PLACEHOLDERS = frozenset({
+                    path_placeholders = frozenset({
                         "<tmp_path>", "<cwd_path>", "<home_path>",
                         "<system_path>", "<etc_path>", "<abs_path>",
                     })
-                    if next_classified in _PATH_PLACEHOLDERS:
+                    if next_classified in path_placeholders:
                         normalized.append("<file_arg>")
                         i += 2
                         continue
@@ -693,12 +693,12 @@ def _normalize_segment(
     # B2: for read-only file verbs, rewrite any path placeholder to <file_arg>.
     # This collapses e.g. `wc /tmp/x` and `wc ./x` to the same template `wc <file_arg>`.
     if verb in READ_ONLY_FILE_VERBS:
-        _PATH_PLACEHOLDERS_RO = frozenset({
+        path_placeholders_ro = frozenset({
             "<tmp_path>", "<cwd_path>", "<home_path>",
             "<system_path>", "<etc_path>", "<abs_path>",
         })
         normalized = [
-            "<file_arg>" if t in _PATH_PLACEHOLDERS_RO else t
+            "<file_arg>" if t in path_placeholders_ro else t
             for t in normalized
         ]
 
