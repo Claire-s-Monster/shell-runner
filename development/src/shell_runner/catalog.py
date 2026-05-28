@@ -150,29 +150,31 @@ T0_DENY: list[Rule] = [
 
 T1_AUTO_LOG: list[Rule] = [
     # FS-read
+    # <_path> group matches any path placeholder produced by normalizer, including
+    # <file_arg> which is emitted by READ_ONLY_FILE_VERBS post-pass.
     Rule(
         r"^ls(\s+-[a-zA-Z]+)?(\s+<(cwd|tmp)_path>)*$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
-    Rule(r"^cat(\s+<(cwd|tmp)_path>)+$", Tier.AUTO_LOG, "fs-read"),
+    Rule(r"^cat(\s+(<(cwd|tmp)_path>|<file_arg>))+$", Tier.AUTO_LOG, "fs-read"),
     Rule(
-        r"^head(\s+-n\s+<n>)?(\s+<(cwd|tmp)_path>)+$",
+        r"^head(\s+-n\s+<n>|\s+<n>)?(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
     Rule(
-        r"^tail(\s+-[nf]+\s+<n>)?(\s+<(cwd|tmp)_path>)+$",
+        r"^tail(\s+-[nf]+\s+<n>)?(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
     Rule(
-        r"^wc(\s+-[lwc]+)?(\s+<(cwd|tmp)_path>)+$",
+        r"^wc(\s+-[lwc]+)?(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
     Rule(r"^stat(\s+<(cwd|tmp)_path>)+$", Tier.AUTO_LOG, "fs-read"),
-    Rule(r"^file(\s+<(cwd|tmp)_path>)+$", Tier.AUTO_LOG, "fs-read"),
+    Rule(r"^file(\s+(<(cwd|tmp)_path>|<file_arg>))+$", Tier.AUTO_LOG, "fs-read"),
     Rule(
         r"^du(\s+-[sh]+)?(\s+<(cwd|tmp)_path>)?$",
         Tier.AUTO_LOG,
@@ -181,12 +183,12 @@ T1_AUTO_LOG: list[Rule] = [
     Rule(r"^df(\s+-h)?$", Tier.AUTO_LOG, "fs-read"),
     # FS-search
     Rule(
-        r"^find\s+<(cwd|tmp)_path>(\s+-(name|type|iname|maxdepth)\s+(<arg>|<n>|\w+))*$",
+        r"^find\s+(<(cwd|tmp)_path>|<file_arg>)(\s+-(name|type|iname|maxdepth)\s+(<arg>|<n>|\w+))*$",
         Tier.AUTO_LOG,
         "fs-search",
     ),
     Rule(
-        r"^grep(\s+-[a-zA-Z]+)?\s+<arg>(\s+<(cwd|tmp)_path>)+$",
+        r"^grep(\s+-[a-zA-Z]+)?\s+<arg>(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
         Tier.AUTO_LOG,
         "fs-search",
     ),
@@ -211,34 +213,34 @@ T1_AUTO_LOG: list[Rule] = [
     Rule(r"^printenv(\s+\w+)?$", Tier.AUTO_LOG, "system-info"),
     # Pure pipeline (no fs-write — sed -i is T2)
     Rule(
-        r"^awk\s+<arg>(\s+<(cwd|tmp)_path>)?$",
+        r"^awk\s+<arg>(\s+(<(cwd|tmp)_path>|<file_arg>))?$",
         Tier.AUTO_LOG,
         "text-transform",
     ),
     Rule(
-        r"^sed(\s+-e\s+<arg>)+(\s+<(cwd|tmp)_path>)?$",
+        r"^sed(\s+-e\s+<arg>)+(\s+(<(cwd|tmp)_path>|<file_arg>))?$",
         Tier.AUTO_LOG,
         "text-transform",
     ),
     Rule(
-        r"^sed\s+<arg>(\s+<(cwd|tmp)_path>)?$",
+        r"^sed\s+<arg>(\s+(<(cwd|tmp)_path>|<file_arg>))?$",
         Tier.AUTO_LOG,
         "text-transform",
     ),
     Rule(
-        r"^sort(\s+-[krnu]+)?(\s+<(cwd|tmp)_path>)?$",
+        r"^sort(\s+-[krnu]+)?(\s+(<(cwd|tmp)_path>|<file_arg>))?$",
         Tier.AUTO_LOG,
         "text-transform",
     ),
     Rule(r"^uniq(\s+-c)?$", Tier.AUTO_LOG, "text-transform"),
     Rule(
-        r"^cut\s+-[df]\s+\S+(\s+<(cwd|tmp)_path>)?$",
+        r"^cut\s+-[df]\s+\S+(\s+(<(cwd|tmp)_path>|<file_arg>))?$",
         Tier.AUTO_LOG,
         "text-transform",
     ),
     Rule(r"^tr\s+<arg>\s+<arg>$", Tier.AUTO_LOG, "text-transform"),
     Rule(
-        r"^jq\s+<arg>(\s+<(cwd|tmp)_path>)?$",
+        r"^jq\s+<arg>(\s+(<(cwd|tmp)_path>|<file_arg>))?$",
         Tier.AUTO_LOG,
         "text-transform",
     ),
@@ -318,7 +320,7 @@ T2_AUTO_CAPPED: list[Rule] = [
     # These are not strictly necessary if classifier evaluates segment-by-segment;
     # included as redundancy for common patterns.
     Rule(
-        r"^cat\s+<(cwd|tmp)_path>\s*\|\s*jq\s+<arg>$",
+        r"^cat\s+(<(cwd|tmp)_path>|<file_arg>)\s*\|\s*jq\s+<arg>$",
         Tier.AUTO_CAPPED,
         "fs-read",
     ),
