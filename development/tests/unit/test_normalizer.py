@@ -111,6 +111,18 @@ ENV = {"HOME": "/home/test"}
         ("head -c 100 /tmp/x", "head <n> <file_arg>"),
         # wc with flag — flag stripped, path still becomes <file_arg>
         ("wc -l /tmp/zig-ci-log.txt", "wc <file_arg>"),
+        # --- A: deferred value-flag placeholders — order-invariance ---
+        # -o BEFORE url: deferred <file_arg> lands at end after <safe_url>
+        ("curl -sS -o /tmp/x https://dev.azure.com/foo", "curl <safe_url> <file_arg>"),
+        # -o AFTER url: same result (existing behaviour, regression guard)
+        ("curl -sL https://dev.azure.com/foo -o /tmp/x", "curl <safe_url> <file_arg>"),
+        # --- B: safe-domain additions ---
+        ("curl -sL https://conda-forge.org/docs/maintainer/foo", "curl <safe_url>"),
+        ("curl -sL https://docs.conda-forge.org/foo", "curl <safe_url>"),
+        ("curl -sL https://pypi.org/project/numpy", "curl <safe_url>"),
+        ("curl -sL https://pypi.python.org/simple/numpy", "curl <safe_url>"),
+        ("curl -sL https://raw.githubusercontent.com/conda-forge/feedstock/main/recipe.yaml", "curl <safe_url>"),
+        ("curl -sL https://docs.pixi.sh/latest/", "curl <safe_url>"),
     ],
 )
 def test_normalize_template(raw: str, expected_template: str) -> None:
@@ -188,6 +200,47 @@ def test_wc_after_ls_chain() -> None:
     assert wc_seg.template == "wc <file_arg>", (
         f"Expected 'wc <file_arg>', got {wc_seg.template!r}"
     )
+
+
+def test_value_flag_order_invariance() -> None:
+    """curl -o before URL and curl -o after URL must produce the same template."""
+    flag_first = normalize("curl -sS -o /tmp/x https://dev.azure.com/foo", CWD, env=ENV)
+    flag_last = normalize("curl -sL https://dev.azure.com/foo -o /tmp/x", CWD, env=ENV)
+    assert flag_first.template == flag_last.template, (
+        f"Order-variant templates:\n  flag_first: {flag_first.template!r}\n"
+        f"  flag_last:  {flag_last.template!r}"
+    )
+    assert flag_first.template == "curl <safe_url> <file_arg>"
+
+
+def test_value_flag_order_invariance_with_wc() -> None:
+    """Combined curl+wc pipeline: both argv orderings produce the same template."""
+    flag_first = normalize(
+        "curl -sS -o /tmp/x https://dev.azure.com/foo && wc -l /tmp/x", CWD, env=ENV
+    )
+    flag_last = normalize(
+        "curl -sL https://dev.azure.com/foo -o /tmp/x && wc -l /tmp/x", CWD, env=ENV
+    )
+    assert flag_first.template == flag_last.template, (
+        f"Order-variant combined templates:\n  flag_first: {flag_first.template!r}\n"
+        f"  flag_last:  {flag_last.template!r}"
+    )
+    assert flag_first.template == "curl <safe_url> <file_arg> && wc <file_arg>"
+
+
+def test_multiple_value_flags_deferred_in_encounter_order() -> None:
+    """Multiple value-flags: both <file_arg> tokens appear at end, in encounter order."""
+    r = normalize("curl --output /tmp/x -o /tmp/y https://dev.azure.com/foo", CWD, env=ENV)
+    # template should end with two <file_arg> tokens, url before them
+    assert r.template == "curl <safe_url> <file_arg> <file_arg>", (
+        f"Unexpected template: {r.template!r}"
+    )
+
+
+def test_b2_positional_path_unaffected_by_deferral() -> None:
+    """wc /tmp/x — B2 positional path collapse still works; no deferral involved."""
+    r = normalize("wc /tmp/x", CWD, env=ENV)
+    assert r.template == "wc <file_arg>", f"Unexpected template: {r.template!r}"
 
 
 def test_combined_ci_log_fetch_and_count() -> None:

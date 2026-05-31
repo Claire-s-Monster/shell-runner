@@ -37,12 +37,18 @@ SAFE_DOMAINS_READ: frozenset[str] = frozenset(
         "*.conda.anaconda.org",
         "conda.anaconda.org",
         "pypi.org",
+        "pypi.python.org",
         "files.pythonhosted.org",
         "*.pypi.org",
         "registry.npmjs.org",
         "docs.python.org",
         "peps.python.org",
         "modelcontextprotocol.io",
+        # conda-forge documentation/web
+        "conda-forge.org",
+        "*.conda-forge.org",
+        # pixi tooling docs
+        "docs.pixi.sh",
         # CI-log artifact hosts
         "*.blob.core.windows.net",        # Azure Blob Storage (GHA/conda-forge log artifacts)
         "actions.githubusercontent.com",
@@ -613,6 +619,7 @@ def _normalize_segment(
 
     tokens = list(raw_tokens)
     normalized: list[str] = []
+    deferred: list[str] = []  # <file_arg> tokens from stripped value-flags, appended at end
     is_background = False
     verb: str = ""
     verb_found = False
@@ -673,7 +680,7 @@ def _normalize_segment(
                         "<system_path>", "<etc_path>", "<abs_path>",
                     })
                     if next_classified in path_placeholders:
-                        normalized.append("<file_arg>")
+                        deferred.append("<file_arg>")
                         i += 2
                         continue
                 i += 1
@@ -701,6 +708,11 @@ def _normalize_segment(
             "<file_arg>" if t in path_placeholders_ro else t
             for t in normalized
         ]
+
+    # Append deferred <file_arg> tokens (from stripped value-flags) after all other tokens.
+    # This ensures argv-ordering differences (e.g. curl -o /x URL vs curl URL -o /x)
+    # produce identical templates.
+    normalized.extend(deferred)
 
     template = " ".join(normalized)
     return (template, verb, is_background)
