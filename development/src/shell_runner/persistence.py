@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .seeds import SeedApproval
 
 DEFAULT_DB_PATH = Path.home() / ".local/share/shell-runner/telemetry.sqlite3"
 
@@ -409,6 +413,34 @@ class Persistence:
                 (template, agent_id, approved_tier, now, approved_via_prompt_id),
             )
             return int(cur.lastrowid)
+
+    def seed_approvals(self, seeds: Iterable[SeedApproval]) -> int:
+        """Idempotently insert seed approvals as global (agent_id IS NULL) rows.
+
+        Skips templates already present in template_approvals (regardless of
+        agent_id), so user-promoted approvals are never overwritten.
+
+        Returns the count of newly-inserted rows.
+        """
+        inserted = 0
+        with self._conn() as conn:
+            for seed in seeds:
+                existing = conn.execute(
+                    "SELECT 1 FROM template_approvals WHERE template = ? LIMIT 1",
+                    (seed.template,),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO template_approvals
+                        (template, agent_id, approved_tier, approved_at, approved_via_prompt_id)
+                    VALUES (?, NULL, ?, CURRENT_TIMESTAMP, NULL)
+                    """,
+                    (seed.template, int(seed.tier)),
+                )
+                inserted += 1
+        return inserted
 
     def get_template_approved_tier(self, template: str, agent_id: str) -> int | None:
         """Get the most permissive approved tier for a template.

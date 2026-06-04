@@ -50,6 +50,7 @@ from .models import (
     ShellStatusResponse,
 )
 from .persistence import DEFAULT_DB_PATH, Persistence
+from .seeds import DEFAULT_SEED_APPROVALS
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,11 @@ async def _lifespan(_application: FastAPI) -> AsyncGenerator[None, None]:
         loop.add_signal_handler(signal.SIGHUP, _on_sighup)
     except (NotImplementedError, AttributeError):
         logger.debug("SIGHUP not supported on this platform; skipping signal handler")
+
+    if os.environ.get("SHELL_RUNNER_LOAD_SEED_APPROVALS", "1") != "0":
+        n = db.seed_approvals(DEFAULT_SEED_APPROVALS)
+        if n > 0:
+            logger.info("Seeded %d approval template(s) into template_approvals", n)
 
     try:
         yield
