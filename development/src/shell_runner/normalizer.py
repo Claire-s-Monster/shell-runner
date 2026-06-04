@@ -565,7 +565,7 @@ def _split_segments(tokens: list[str]) -> list[tuple[list[str], str | None]]:
                     current = []
                     i += 2
                     continue
-                elif tok == "|" and tokens[i + 1] != "|":
+                if tok == "|" and tokens[i + 1] != "|":
                     segments.append((current, "|"))
                     current = []
                 elif tok == ";":
@@ -699,15 +699,29 @@ def _normalize_segment(
 
     # B2: for read-only file verbs, rewrite any path placeholder to <file_arg>.
     # This collapses e.g. `wc /tmp/x` and `wc ./x` to the same template `wc <file_arg>`.
+    path_placeholders_b2 = frozenset({
+        "<tmp_path>", "<cwd_path>", "<home_path>",
+        "<system_path>", "<etc_path>", "<abs_path>",
+    })
     if verb in READ_ONLY_FILE_VERBS:
-        path_placeholders_ro = frozenset({
-            "<tmp_path>", "<cwd_path>", "<home_path>",
-            "<system_path>", "<etc_path>", "<abs_path>",
-        })
         normalized = [
-            "<file_arg>" if t in path_placeholders_ro else t
+            "<file_arg>" if t in path_placeholders_b2 else t
             for t in normalized
         ]
+
+    # B3: redirect-destination collapse.
+    # Any path placeholder immediately following a `>` or `>>` operator becomes
+    # `<file_arg>`, regardless of path category or verb.  This makes
+    # `cmd > /tmp/x` and `cmd > ./x` produce the same template.
+    # fd-redirects like `2>&1` are safe: `&1` is not in path_placeholders_b2.
+    redirect_out_ops = frozenset({">", ">>"})
+    j = 0
+    while j < len(normalized) - 1:
+        if normalized[j] in redirect_out_ops and normalized[j + 1] in path_placeholders_b2:
+            normalized[j + 1] = "<file_arg>"
+            j += 2
+            continue
+        j += 1
 
     # Append deferred <file_arg> tokens (from stripped value-flags) after all other tokens.
     # This ensures argv-ordering differences (e.g. curl -o /x URL vs curl URL -o /x)
