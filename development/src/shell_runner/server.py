@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import time
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -49,7 +50,7 @@ from .models import (
     ShellStatusRequest,
     ShellStatusResponse,
 )
-from .persistence import DEFAULT_DB_PATH, Persistence
+from .persistence import DEFAULT_DB_PATH, Persistence, TelemetryWriter
 from .seeds import DEFAULT_SEED_APPROVALS
 
 logger = logging.getLogger(__name__)
@@ -170,7 +171,7 @@ def _on_sighup() -> None:
 
 
 @asynccontextmanager
-async def _lifespan(_application: FastAPI) -> AsyncGenerator[None, None]:
+async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     global _cleanup_task
     _cleanup_task = asyncio.create_task(_periodic_cleanup())
 
@@ -186,9 +187,15 @@ async def _lifespan(_application: FastAPI) -> AsyncGenerator[None, None]:
         if n > 0:
             logger.info("Seeded %d approval template(s) into template_approvals", n)
 
+    telemetry_writer = TelemetryWriter(db)
+    await telemetry_writer.start()
+    application.state.telemetry_writer = telemetry_writer
+
     try:
         yield
     finally:
+        await telemetry_writer.stop()
+
         _cleanup_task.cancel()
         try:
             await _cleanup_task
@@ -545,9 +552,10 @@ async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
 
 
 @app.post("/observe", response_model=ObserveResponse)
-async def observe_route(req: ObserveRequest) -> ObserveResponse:
+async def observe_route(request: Request, req: ObserveRequest) -> ObserveResponse:
     cls = classify(req.command, req.cwd, req.agent_id)
-    telemetry_id = db.record_call(
+    telemetry_id = str(uuid.uuid4())
+    await request.app.state.telemetry_writer.submit(
         agent_id=req.agent_id,
         cwd=req.cwd,
         raw_cmd=req.command,
