@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import sqlite3
 import uuid
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .seeds import SeedApproval
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path.home() / ".local/share/shell-runner/telemetry.sqlite3"
 
@@ -774,3 +778,71 @@ def _percentile(values: list[int], pct: int) -> int:
         return 0
     idx = max(0, int(len(values) * pct / 100) - 1)
     return values[idx]
+
+
+class TelemetryWriter:
+    """Non-blocking async wrapper around :meth:`Persistence.record_call`.
+
+    Telemetry writes are fire-and-forget: the request path enqueues a record
+    via :meth:`submit` (non-blocking) and returns immediately.  A background
+    drain task processes entries via :func:`asyncio.to_thread` so SQLite I/O
+    never stalls the event loop.
+
+    The queue is bounded (default 10 000 entries).  If the drain falls behind
+    and the queue fills, :meth:`submit` drops the incoming record and increments
+    :attr:`dropped_count` rather than blocking the caller.
+    """
+
+    def __init__(self, persistence: Persistence, queue_maxsize: int = 10_000) -> None:
+        self._persistence = persistence
+        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=queue_maxsize)
+        self._drain_task: asyncio.Task[None] | None = None
+        self._stopping = False
+        self.dropped_count: int = 0
+
+    async def start(self) -> None:
+        """Spawn the drain task.  Call once from the FastAPI lifespan."""
+        self._stopping = False
+        self._drain_task = asyncio.create_task(self._drain_loop(), name="telemetry-drain")
+
+    async def stop(self) -> None:
+        """Drain remaining queued records then cancel the task."""
+        self._stopping = True
+        # Wait for every queued item to be processed before cancelling.
+        await self._queue.join()
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            try:
+                await self._drain_task
+            except asyncio.CancelledError:
+                pass
+            self._drain_task = None
+
+    async def submit(self, **kwargs: Any) -> None:
+        """Enqueue a record for async writing.  Never blocks the caller.
+
+        If the queue is full the record is silently dropped and
+        :attr:`dropped_count` is incremented (telemetry is best-effort).
+        """
+        try:
+            self._queue.put_nowait(kwargs)
+        except asyncio.QueueFull:
+            self.dropped_count += 1
+            logger.warning(
+                "TelemetryWriter queue full — dropped telemetry record (total dropped: %d)",
+                self.dropped_count,
+            )
+
+    async def _drain_loop(self) -> None:
+        """Continuously drain the queue, writing each record to SQLite off-thread."""
+        while True:
+            try:
+                record = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                await asyncio.to_thread(self._persistence.record_call, **record)
+            except Exception:
+                logger.exception("TelemetryWriter: error writing telemetry record; dropping")
+            finally:
+                self._queue.task_done()
