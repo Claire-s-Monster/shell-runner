@@ -1,7 +1,7 @@
 """Shell-runner admin UI.
 
 Run: pixi run --environment ui ui
-URL: http://127.0.0.1:8501
+URL: http://127.0.0.1:8511
 """
 
 import streamlit as st
