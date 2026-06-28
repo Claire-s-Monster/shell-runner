@@ -95,11 +95,6 @@ async def test_queue_full_drops_record_and_increments_counter(
     slow_event = asyncio.Event()
 
     def slow_record_call(**_kwargs: Any) -> str:
-        # Block until we signal — keeps the drain task occupied
-        import threading
-
-        ready = threading.Event()
-        asyncio.get_event_loop().call_soon_threadsafe(ready.set)
         slow_event.wait(timeout=5)
         return "fake-id"
 

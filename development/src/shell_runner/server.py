@@ -250,7 +250,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
                 status_code=403, detail="approve_token does not match command/cwd/agent"
             )
         if req.run_in_background:
-            telemetry_id = db.record_call(
+            telemetry_id = await asyncio.to_thread(
+                db.record_call,
                 agent_id=req.agent_id,
                 cwd=req.cwd,
                 raw_cmd=req.command,
@@ -267,7 +268,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
                 decision_path=["approve_token consumed", "background"],
                 normalizer_warnings=[],
             )
-            db.upsert_template(
+            await asyncio.to_thread(
+                db.upsert_template,
                 template=prompt["normalized_template"],
                 agent_id=req.agent_id,
                 current_tier=prompt["command_tier"],
@@ -296,7 +298,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
             )
         exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
         duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = db.record_call(
+        telemetry_id = await asyncio.to_thread(
+            db.record_call,
             agent_id=req.agent_id,
             cwd=req.cwd,
             raw_cmd=req.command,
@@ -313,7 +316,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
             decision_path=["approve_token consumed"],
             normalizer_warnings=[],
         )
-        db.upsert_template(
+        await asyncio.to_thread(
+            db.upsert_template,
             template=prompt["normalized_template"],
             agent_id=req.agent_id,
             current_tier=prompt["command_tier"],
@@ -339,7 +343,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
     # DENY
     if cls.tier == Tier.DENY:
         duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = db.record_call(
+        telemetry_id = await asyncio.to_thread(
+            db.record_call,
             agent_id=req.agent_id,
             cwd=req.cwd,
             raw_cmd=req.command,
@@ -356,7 +361,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
             decision_path=list(cls.decision_path),
             normalizer_warnings=list(cls.normalizer_warnings),
         )
-        db.upsert_template(
+        await asyncio.to_thread(
+            db.upsert_template,
             template=cls.template,
             agent_id=req.agent_id,
             current_tier=int(cls.tier),
@@ -384,7 +390,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
     # T1/T2 — auto-execute
     if cls.tier in (Tier.AUTO_LOG, Tier.AUTO_CAPPED):
         if req.run_in_background:
-            telemetry_id = db.record_call(
+            telemetry_id = await asyncio.to_thread(
+                db.record_call,
                 agent_id=req.agent_id,
                 cwd=req.cwd,
                 raw_cmd=req.command,
@@ -401,7 +408,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
                 decision_path=list(cls.decision_path) + ["background"],
                 normalizer_warnings=list(cls.normalizer_warnings),
             )
-            db.upsert_template(
+            await asyncio.to_thread(
+                db.upsert_template,
                 template=cls.template,
                 agent_id=req.agent_id,
                 current_tier=int(cls.tier),
@@ -430,7 +438,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
             )
         exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
         duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = db.record_call(
+        telemetry_id = await asyncio.to_thread(
+            db.record_call,
             agent_id=req.agent_id,
             cwd=req.cwd,
             raw_cmd=req.command,
@@ -447,7 +456,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
             decision_path=list(cls.decision_path),
             normalizer_warnings=list(cls.normalizer_warnings),
         )
-        db.upsert_template(
+        await asyncio.to_thread(
+            db.upsert_template,
             template=cls.template,
             agent_id=req.agent_id,
             current_tier=int(cls.tier),
@@ -477,7 +487,8 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
         decision_path=list(cls.decision_path),
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
-    telemetry_id = db.record_call(
+    telemetry_id = await asyncio.to_thread(
+        db.record_call,
         agent_id=req.agent_id,
         cwd=req.cwd,
         raw_cmd=req.command,
@@ -555,24 +566,28 @@ async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
 async def observe_route(request: Request, req: ObserveRequest) -> ObserveResponse:
     cls = classify(req.command, req.cwd, req.agent_id)
     telemetry_id = str(uuid.uuid4())
-    await request.app.state.telemetry_writer.submit(
-        agent_id=req.agent_id,
-        cwd=req.cwd,
-        raw_cmd=req.command,
-        normalized_template=cls.template,
-        command_tier=int(cls.command_tier),
-        final_tier=int(cls.tier),
-        decision="observed_externally",
-        matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-        matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-        exit_code=req.exit_code,
-        stdout_bytes=0,
-        stderr_bytes=0,
-        duration_ms=req.duration_ms,
-        decision_path=["observe_endpoint"],
-        normalizer_warnings=list(cls.normalizer_warnings),
-    )
-    db.upsert_template(
+    telemetry_writer = getattr(request.app.state, "telemetry_writer", None)
+    if telemetry_writer is not None:
+        await telemetry_writer.submit(
+            call_id=telemetry_id,          # ← fixes UUID mismatch
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=cls.template,
+            command_tier=int(cls.command_tier),
+            final_tier=int(cls.tier),
+            decision="observed_externally",
+            matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+            matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+            exit_code=req.exit_code,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            duration_ms=req.duration_ms,
+            decision_path=["observe_endpoint"],
+            normalizer_warnings=list(cls.normalizer_warnings),
+        )
+    await asyncio.to_thread(            # ← fixes blocking upsert
+        db.upsert_template,
         template=cls.template,
         agent_id=req.agent_id,
         current_tier=int(cls.command_tier),
