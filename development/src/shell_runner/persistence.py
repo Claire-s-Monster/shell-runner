@@ -160,8 +160,9 @@ class Persistence:
         duration_ms: int,
         decision_path: list[str],
         normalizer_warnings: list[str],
+        call_id: str | None = None,
     ) -> str:
-        telemetry_id = str(uuid.uuid4())
+        telemetry_id = call_id if call_id is not None else str(uuid.uuid4())
         ts = _now_utc()
         with self._conn() as conn:
             conn.execute(
@@ -808,8 +809,12 @@ class TelemetryWriter:
     async def stop(self) -> None:
         """Drain remaining queued records then cancel the task."""
         self._stopping = True
-        # Wait for every queued item to be processed before cancelling.
-        await self._queue.join()
+        # Only join() if the drain task is still alive; if it died early, join() deadlocks.
+        if self._drain_task is not None and not self._drain_task.done():
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("TelemetryWriter.stop(): timed out waiting for queue drain")
         if self._drain_task is not None:
             self._drain_task.cancel()
             try:
@@ -817,6 +822,13 @@ class TelemetryWriter:
             except asyncio.CancelledError:
                 pass
             self._drain_task = None
+        # Discard any items the drain task never processed (drain died or timed out).
+        while True:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except asyncio.QueueEmpty:
+                break
 
     async def submit(self, **kwargs: Any) -> None:
         """Enqueue a record for async writing.  Never blocks the caller.
@@ -824,6 +836,13 @@ class TelemetryWriter:
         If the queue is full the record is silently dropped and
         :attr:`dropped_count` is incremented (telemetry is best-effort).
         """
+        if self._stopping:
+            self.dropped_count += 1
+            logger.warning(
+                "TelemetryWriter stopped — dropped telemetry record (total dropped: %d)",
+                self.dropped_count,
+            )
+            return
         try:
             self._queue.put_nowait(kwargs)
         except asyncio.QueueFull:
@@ -840,9 +859,15 @@ class TelemetryWriter:
                 record = await self._queue.get()
             except asyncio.CancelledError:
                 break
+            cancelled = False
             try:
                 await asyncio.to_thread(self._persistence.record_call, **record)
+            except asyncio.CancelledError:
+                cancelled = True
+                logger.warning("TelemetryWriter: drain interrupted by cancellation")
             except Exception:
                 logger.exception("TelemetryWriter: error writing telemetry record; dropping")
             finally:
                 self._queue.task_done()
+            if cancelled:
+                break
