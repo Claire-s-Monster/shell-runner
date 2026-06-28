@@ -233,8 +233,9 @@ def _compute_suggestions(template: str, agent_id: str) -> list[ExecuteSuggestion
 
 
 @app.post("/execute", response_model=ExecuteResponse)
-async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
+async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteResponse:
     t0 = time.monotonic()
+    telemetry_writer = getattr(request.app.state, "telemetry_writer", None)
 
     # Path A: approve_token provided — skip classification, validate token
     if req.approve_token:
@@ -250,23 +251,45 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
                 status_code=403, detail="approve_token does not match command/cwd/agent"
             )
         if req.run_in_background:
-            telemetry_id = db.record_call(
-                agent_id=req.agent_id,
-                cwd=req.cwd,
-                raw_cmd=req.command,
-                normalized_template=prompt["normalized_template"],
-                command_tier=prompt["command_tier"],
-                final_tier=prompt["command_tier"],
-                decision="running",
-                matched_rule_pattern=None,
-                matched_rule_category=prompt["matched_rule_category"],
-                exit_code=None,
-                stdout_bytes=0,
-                stderr_bytes=0,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                decision_path=["approve_token consumed", "background"],
-                normalizer_warnings=[],
-            )
+            telemetry_id = str(uuid.uuid4())
+            if telemetry_writer is not None:
+                await telemetry_writer.submit(
+                    call_id=telemetry_id,
+                    agent_id=req.agent_id,
+                    cwd=req.cwd,
+                    raw_cmd=req.command,
+                    normalized_template=prompt["normalized_template"],
+                    command_tier=prompt["command_tier"],
+                    final_tier=prompt["command_tier"],
+                    decision="running",
+                    matched_rule_pattern=None,
+                    matched_rule_category=prompt["matched_rule_category"],
+                    exit_code=None,
+                    stdout_bytes=0,
+                    stderr_bytes=0,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    decision_path=["approve_token consumed", "background"],
+                    normalizer_warnings=[],
+                )
+            else:
+                db.record_call(
+                    call_id=telemetry_id,
+                    agent_id=req.agent_id,
+                    cwd=req.cwd,
+                    raw_cmd=req.command,
+                    normalized_template=prompt["normalized_template"],
+                    command_tier=prompt["command_tier"],
+                    final_tier=prompt["command_tier"],
+                    decision="running",
+                    matched_rule_pattern=None,
+                    matched_rule_category=prompt["matched_rule_category"],
+                    exit_code=None,
+                    stdout_bytes=0,
+                    stderr_bytes=0,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    decision_path=["approve_token consumed", "background"],
+                    normalizer_warnings=[],
+                )
             db.upsert_template(
                 template=prompt["normalized_template"],
                 agent_id=req.agent_id,
@@ -296,23 +319,45 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
             )
         exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
         duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = db.record_call(
-            agent_id=req.agent_id,
-            cwd=req.cwd,
-            raw_cmd=req.command,
-            normalized_template=prompt["normalized_template"],
-            command_tier=prompt["command_tier"],
-            final_tier=prompt["command_tier"],
-            decision="executed",
-            matched_rule_pattern=None,
-            matched_rule_category=prompt["matched_rule_category"],
-            exit_code=exec_result.exit_code,
-            stdout_bytes=len(exec_result.stdout),
-            stderr_bytes=len(exec_result.stderr),
-            duration_ms=duration_ms,
-            decision_path=["approve_token consumed"],
-            normalizer_warnings=[],
-        )
+        telemetry_id = str(uuid.uuid4())
+        if telemetry_writer is not None:
+            await telemetry_writer.submit(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=prompt["normalized_template"],
+                command_tier=prompt["command_tier"],
+                final_tier=prompt["command_tier"],
+                decision="executed",
+                matched_rule_pattern=None,
+                matched_rule_category=prompt["matched_rule_category"],
+                exit_code=exec_result.exit_code,
+                stdout_bytes=len(exec_result.stdout),
+                stderr_bytes=len(exec_result.stderr),
+                duration_ms=duration_ms,
+                decision_path=["approve_token consumed"],
+                normalizer_warnings=[],
+            )
+        else:
+            db.record_call(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=prompt["normalized_template"],
+                command_tier=prompt["command_tier"],
+                final_tier=prompt["command_tier"],
+                decision="executed",
+                matched_rule_pattern=None,
+                matched_rule_category=prompt["matched_rule_category"],
+                exit_code=exec_result.exit_code,
+                stdout_bytes=len(exec_result.stdout),
+                stderr_bytes=len(exec_result.stderr),
+                duration_ms=duration_ms,
+                decision_path=["approve_token consumed"],
+                normalizer_warnings=[],
+            )
         db.upsert_template(
             template=prompt["normalized_template"],
             agent_id=req.agent_id,
@@ -339,23 +384,45 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
     # DENY
     if cls.tier == Tier.DENY:
         duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = db.record_call(
-            agent_id=req.agent_id,
-            cwd=req.cwd,
-            raw_cmd=req.command,
-            normalized_template=cls.template,
-            command_tier=int(cls.command_tier),
-            final_tier=int(cls.tier),
-            decision="denied",
-            matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-            matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-            exit_code=None,
-            stdout_bytes=0,
-            stderr_bytes=0,
-            duration_ms=duration_ms,
-            decision_path=list(cls.decision_path),
-            normalizer_warnings=list(cls.normalizer_warnings),
-        )
+        telemetry_id = str(uuid.uuid4())
+        if telemetry_writer is not None:
+            await telemetry_writer.submit(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                decision="denied",
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=duration_ms,
+                decision_path=list(cls.decision_path),
+                normalizer_warnings=list(cls.normalizer_warnings),
+            )
+        else:
+            db.record_call(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                decision="denied",
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=duration_ms,
+                decision_path=list(cls.decision_path),
+                normalizer_warnings=list(cls.normalizer_warnings),
+            )
         db.upsert_template(
             template=cls.template,
             agent_id=req.agent_id,
@@ -384,23 +451,45 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
     # T1/T2 — auto-execute
     if cls.tier in (Tier.AUTO_LOG, Tier.AUTO_CAPPED):
         if req.run_in_background:
-            telemetry_id = db.record_call(
-                agent_id=req.agent_id,
-                cwd=req.cwd,
-                raw_cmd=req.command,
-                normalized_template=cls.template,
-                command_tier=int(cls.command_tier),
-                final_tier=int(cls.tier),
-                decision="running",
-                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-                exit_code=None,
-                stdout_bytes=0,
-                stderr_bytes=0,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                decision_path=list(cls.decision_path) + ["background"],
-                normalizer_warnings=list(cls.normalizer_warnings),
-            )
+            telemetry_id = str(uuid.uuid4())
+            if telemetry_writer is not None:
+                await telemetry_writer.submit(
+                    call_id=telemetry_id,
+                    agent_id=req.agent_id,
+                    cwd=req.cwd,
+                    raw_cmd=req.command,
+                    normalized_template=cls.template,
+                    command_tier=int(cls.command_tier),
+                    final_tier=int(cls.tier),
+                    decision="running",
+                    matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                    matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                    exit_code=None,
+                    stdout_bytes=0,
+                    stderr_bytes=0,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    decision_path=list(cls.decision_path) + ["background"],
+                    normalizer_warnings=list(cls.normalizer_warnings),
+                )
+            else:
+                db.record_call(
+                    call_id=telemetry_id,
+                    agent_id=req.agent_id,
+                    cwd=req.cwd,
+                    raw_cmd=req.command,
+                    normalized_template=cls.template,
+                    command_tier=int(cls.command_tier),
+                    final_tier=int(cls.tier),
+                    decision="running",
+                    matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                    matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                    exit_code=None,
+                    stdout_bytes=0,
+                    stderr_bytes=0,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    decision_path=list(cls.decision_path) + ["background"],
+                    normalizer_warnings=list(cls.normalizer_warnings),
+                )
             db.upsert_template(
                 template=cls.template,
                 agent_id=req.agent_id,
@@ -430,23 +519,45 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
             )
         exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
         duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = db.record_call(
-            agent_id=req.agent_id,
-            cwd=req.cwd,
-            raw_cmd=req.command,
-            normalized_template=cls.template,
-            command_tier=int(cls.command_tier),
-            final_tier=int(cls.tier),
-            decision="executed",
-            matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-            matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-            exit_code=exec_result.exit_code,
-            stdout_bytes=len(exec_result.stdout),
-            stderr_bytes=len(exec_result.stderr),
-            duration_ms=duration_ms,
-            decision_path=list(cls.decision_path),
-            normalizer_warnings=list(cls.normalizer_warnings),
-        )
+        telemetry_id = str(uuid.uuid4())
+        if telemetry_writer is not None:
+            await telemetry_writer.submit(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                decision="executed",
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                exit_code=exec_result.exit_code,
+                stdout_bytes=len(exec_result.stdout),
+                stderr_bytes=len(exec_result.stderr),
+                duration_ms=duration_ms,
+                decision_path=list(cls.decision_path),
+                normalizer_warnings=list(cls.normalizer_warnings),
+            )
+        else:
+            db.record_call(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                decision="executed",
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                exit_code=exec_result.exit_code,
+                stdout_bytes=len(exec_result.stdout),
+                stderr_bytes=len(exec_result.stderr),
+                duration_ms=duration_ms,
+                decision_path=list(cls.decision_path),
+                normalizer_warnings=list(cls.normalizer_warnings),
+            )
         db.upsert_template(
             template=cls.template,
             agent_id=req.agent_id,
@@ -477,23 +588,45 @@ async def execute_route(req: ExecuteRequest) -> ExecuteResponse:
         decision_path=list(cls.decision_path),
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
-    telemetry_id = db.record_call(
-        agent_id=req.agent_id,
-        cwd=req.cwd,
-        raw_cmd=req.command,
-        normalized_template=cls.template,
-        command_tier=int(cls.command_tier),
-        final_tier=int(cls.tier),
-        decision="prompt_required",
-        matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-        matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-        exit_code=None,
-        stdout_bytes=0,
-        stderr_bytes=0,
-        duration_ms=duration_ms,
-        decision_path=list(cls.decision_path),
-        normalizer_warnings=list(cls.normalizer_warnings),
-    )
+    telemetry_id = str(uuid.uuid4())
+    if telemetry_writer is not None:
+        await telemetry_writer.submit(
+            call_id=telemetry_id,
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=cls.template,
+            command_tier=int(cls.command_tier),
+            final_tier=int(cls.tier),
+            decision="prompt_required",
+            matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+            matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+            exit_code=None,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            duration_ms=duration_ms,
+            decision_path=list(cls.decision_path),
+            normalizer_warnings=list(cls.normalizer_warnings),
+        )
+    else:
+        db.record_call(
+            call_id=telemetry_id,
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=cls.template,
+            command_tier=int(cls.command_tier),
+            final_tier=int(cls.tier),
+            decision="prompt_required",
+            matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+            matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+            exit_code=None,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            duration_ms=duration_ms,
+            decision_path=list(cls.decision_path),
+            normalizer_warnings=list(cls.normalizer_warnings),
+        )
     why = (
         f"command tier={cls.command_tier.name} after agent_cap={cls.agent_cap.name}"
         f" → {cls.tier.name}; requires user approval"
@@ -555,24 +688,28 @@ async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
 async def observe_route(request: Request, req: ObserveRequest) -> ObserveResponse:
     cls = classify(req.command, req.cwd, req.agent_id)
     telemetry_id = str(uuid.uuid4())
-    await request.app.state.telemetry_writer.submit(
-        agent_id=req.agent_id,
-        cwd=req.cwd,
-        raw_cmd=req.command,
-        normalized_template=cls.template,
-        command_tier=int(cls.command_tier),
-        final_tier=int(cls.tier),
-        decision="observed_externally",
-        matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-        matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-        exit_code=req.exit_code,
-        stdout_bytes=0,
-        stderr_bytes=0,
-        duration_ms=req.duration_ms,
-        decision_path=["observe_endpoint"],
-        normalizer_warnings=list(cls.normalizer_warnings),
-    )
-    db.upsert_template(
+    telemetry_writer = getattr(request.app.state, "telemetry_writer", None)
+    if telemetry_writer is not None:
+        await telemetry_writer.submit(
+            call_id=telemetry_id,          # ← fixes UUID mismatch
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=cls.template,
+            command_tier=int(cls.command_tier),
+            final_tier=int(cls.tier),
+            decision="observed_externally",
+            matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+            matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+            exit_code=req.exit_code,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            duration_ms=req.duration_ms,
+            decision_path=["observe_endpoint"],
+            normalizer_warnings=list(cls.normalizer_warnings),
+        )
+    await asyncio.to_thread(            # ← fixes blocking upsert
+        db.upsert_template,
         template=cls.template,
         agent_id=req.agent_id,
         current_tier=int(cls.command_tier),
@@ -746,7 +883,7 @@ async def handle_mcp_post(request: Request) -> JSONResponse:
         )
 
     if method == "tools/call":
-        result = await _dispatch_tool_call(params)
+        result = await _dispatch_tool_call(request, params)
         return JSONResponse(
             content={
                 "jsonrpc": "2.0",
@@ -827,7 +964,7 @@ async def handle_mcp_sse(request: Request) -> StreamingResponse:
     )
 
 
-async def _dispatch_tool_call(params: dict[str, Any]) -> dict[str, Any]:
+async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[str, Any]:
     """Dispatch a tools/call request to the appropriate internal handler."""
     tool_name = params.get("name")
     arguments = params.get("arguments", {})
@@ -838,7 +975,7 @@ async def _dispatch_tool_call(params: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             logger.exception("Invalid arguments for shell_execute")
             return {"error": "invalid arguments"}
-        return (await execute_route(exec_req)).model_dump()
+        return (await execute_route(request, exec_req)).model_dump()
 
     if tool_name == "shell_classify":
         try:
