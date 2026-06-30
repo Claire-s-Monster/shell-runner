@@ -1,1 +1,256 @@
-development/pyproject.toml
+[project]
+name = "shell-runner"
+version = "0.1.0"
+description = "Sandboxed shell execution MCP server with telemetry and adaptive allowlist learning"
+authors = [
+    {name = "Claire-s-Monster", email = "w3m3nt0.w0ri@gmail.com"},
+]
+dependencies = []
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/Claire-s-Monster/shell-runner"
+Repository = "https://github.com/Claire-s-Monster/shell-runner"
+Issues = "https://github.com/Claire-s-Monster/shell-runner/issues"
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+    "pre-commit>=3.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = ">=3.11"
+pydantic = ">=2.0.0"
+aiofiles = ">=23.0.0"
+# HTTP transport dependencies
+fastapi = ">=0.109.0"
+uvicorn = ">=0.27.0"
+
+[tool.pixi.pypi-dependencies]
+shell-runner = { path = ".", editable = true }
+typing-extensions = ">=4.0.0"
+# HTTP transport dependencies
+sse-starlette = ">=2.0.0"
+# MCP wrapper HTTP client
+httpx = ">=0.27"
+# Resilience
+tenacity = ">=8.2.0"
+# Dead code detection
+vulture = ">=2.10"
+
+[tool.pixi.tasks]
+# HTTP transport server
+http-server = { cmd = "python src/shell_runner/server.py", env = { PYTHONPATH = "src" } }
+# Daemon management
+start-daemon = { cmd = "scripts/shell-runner-daemon.sh start", env = { PYTHONPATH = "src" } }
+stop-daemon = { cmd = "scripts/shell-runner-daemon.sh stop" }
+daemon-status = { cmd = "scripts/shell-runner-daemon.sh status" }
+install-systemd = { cmd = "scripts/install-systemd.sh" }
+setup-scripts = { cmd = "python -c \"import os,stat; [os.chmod(f, os.stat(f).st_mode | 0o111) for f in ['scripts/shell-runner-daemon.sh','scripts/install-systemd.sh','scripts/cwd-roots.sh']]; print('scripts are executable')\"" }
+check-scripts = { cmd = "bash -n scripts/shell-runner-daemon.sh && bash -n scripts/install-systemd.sh && bash -n scripts/cwd-roots.sh && echo 'bash syntax OK'" }
+# Quality tasks
+test = "pytest tests/ -v --ignore=tests/live --ignore=tests/debug"
+test-unit = "pytest tests/unit -v"
+test-integration = "pytest tests/integration -v"
+test-debug = "pytest tests/debug -v"
+test-live = "pytest tests/live -v"
+test-all = "pytest tests/ -v"
+test-cov = "pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=html"
+lint = "ruff check src/ --fix"
+format = "black src/ tests/"
+type-check = "mypy src/"
+dead-code = "vulture src/ --min-confidence 80"
+quality = { depends-on = ["lint", "type-check-lenient"] }
+type-check-lenient = "mypy src/ || echo 'mypy: warnings found (non-blocking)'"
+check-all = { depends-on = ["test", "quality"] }
+build = "python -m build"
+verify-mcp-mount = "python scripts/verify_mcp_mount.py"
+
+[tool.pixi.feature.quality.dependencies]
+pytest = ">=8.0.0"
+pytest-asyncio = ">=0.21.0,<1.0.0"
+pytest-cov = ">=6.0.0"
+ruff = ">=0.8.4"
+mypy = ">=1.14.0"
+bandit = ">=1.8.0"
+pre-commit = ">=4.0.0"
+
+[tool.pixi.feature.quality.pypi-dependencies]
+black = ">=23.0.0"
+build = ">=1.0.0"
+httpx = ">=0.27"
+pytest-timeout = ">=2.1.0"
+
+[tool.pixi.feature.quality.tasks]
+lint-fix = "ruff check --fix ."
+format-check = "ruff format --check ."
+type-check = "mypy src/"
+security = "bandit -c pyproject.toml -r src/"
+pre-commit-install = "pre-commit install"
+pre-commit-run = "pre-commit run --all-files"
+test-unit = "pytest tests/unit -v"
+test-integration = "pytest tests/integration -v"
+
+[tool.pixi.feature.quality-extended.dependencies]
+bandit = ">=1.7.0"
+
+[tool.pixi.feature.ui.dependencies]
+streamlit = ">=1.30.0"
+pandas = ">=2.0.0"
+
+[tool.pixi.feature.ui.pypi-dependencies]
+httpx = ">=0.27"
+
+[tool.pixi.feature.ui.tasks]
+ui = "streamlit run $PIXI_PROJECT_ROOT/ui/app.py --server.address 127.0.0.1 --server.port 8511 --browser.gatherUsageStats false"
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+ci = { features = ["quality"], solve-group = "default" }
+quality-ci = { features = ["quality"], solve-group = "default" }
+quality-extended = { features = ["quality", "quality-extended"], solve-group = "default" }
+ui = { features = ["ui"], solve-group = "default" }
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "N",  # pep8-naming
+    "UP", # pyupgrade
+    "B",  # flake8-bugbear
+    "A",  # flake8-builtins
+    "C4", # flake8-comprehensions
+    "PT", # flake8-pytest-style
+    "SIM", # flake8-simplify
+    "RET", # flake8-return
+]
+ignore = ["E501", "SIM105"]
+
+[tool.black]
+target-version = ["py311"]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_configs = true
+check_untyped_defs = true
+disallow_any_generics = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+warn_redundant_casts = true
+warn_unused_ignores = false
+warn_return_any = false
+no_implicit_reexport = false
+
+# ============================================================================
+# Pytest Configuration
+# ============================================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests", "."]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+timeout = 60
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--timeout=60",
+    "--ignore=.pixi",
+    "--ignore=scripts",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: integration tests requiring full setup",
+    "live: live server tests (manual execution only)",
+    "debug: debug/diagnostic tests",
+    "unit: unit tests for isolated components",
+    "asyncio: async tests",
+    "regression: regression tests for previously fixed bugs",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# ============================================================================
+# Coverage Configuration
+# ============================================================================
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+parallel = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/site-packages/*",
+    "src/shell_runner/server.py",
+]
+
+[tool.coverage.paths]
+source = ["src"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "@abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B101"]
