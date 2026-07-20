@@ -290,7 +290,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     decision_path=["approve_token consumed", "background"],
                     normalizer_warnings=[],
                 )
-            db.upsert_template(
+            await asyncio.to_thread(
+                db.upsert_template,
                 template=prompt["normalized_template"],
                 agent_id=req.agent_id,
                 current_tier=prompt["command_tier"],
@@ -317,7 +318,9 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 telemetry_id=telemetry_id,
                 job_id=job_id,
             )
-        exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
+        exec_result = await asyncio.to_thread(
+            execute, command=req.command, cwd=req.cwd, timeout_s=req.timeout_s
+        )
         duration_ms = int((time.monotonic() - t0) * 1000)
         telemetry_id = str(uuid.uuid4())
         if telemetry_writer is not None:
@@ -358,7 +361,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 decision_path=["approve_token consumed"],
                 normalizer_warnings=[],
             )
-        db.upsert_template(
+        await asyncio.to_thread(
+            db.upsert_template,
             template=prompt["normalized_template"],
             agent_id=req.agent_id,
             current_tier=prompt["command_tier"],
@@ -423,7 +427,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 decision_path=list(cls.decision_path),
                 normalizer_warnings=list(cls.normalizer_warnings),
             )
-        db.upsert_template(
+        await asyncio.to_thread(
+            db.upsert_template,
             template=cls.template,
             agent_id=req.agent_id,
             current_tier=int(cls.tier),
@@ -490,7 +495,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     decision_path=list(cls.decision_path) + ["background"],
                     normalizer_warnings=list(cls.normalizer_warnings),
                 )
-            db.upsert_template(
+            await asyncio.to_thread(
+                db.upsert_template,
                 template=cls.template,
                 agent_id=req.agent_id,
                 current_tier=int(cls.tier),
@@ -517,7 +523,9 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 telemetry_id=telemetry_id,
                 job_id=job_id,
             )
-        exec_result = execute(command=req.command, cwd=req.cwd, timeout_s=req.timeout_s)
+        exec_result = await asyncio.to_thread(
+            execute, command=req.command, cwd=req.cwd, timeout_s=req.timeout_s
+        )
         duration_ms = int((time.monotonic() - t0) * 1000)
         telemetry_id = str(uuid.uuid4())
         if telemetry_writer is not None:
@@ -558,7 +566,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 decision_path=list(cls.decision_path),
                 normalizer_warnings=list(cls.normalizer_warnings),
             )
-        db.upsert_template(
+        await asyncio.to_thread(
+            db.upsert_template,
             template=cls.template,
             agent_id=req.agent_id,
             current_tier=int(cls.tier),
@@ -975,7 +984,13 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
         except Exception:
             logger.exception("Invalid arguments for shell_execute")
             return {"error": "invalid arguments"}
-        return (await execute_route(request, exec_req)).model_dump()
+        try:
+            return (await execute_route(request, exec_req)).model_dump()
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("shell_execute failed")
+            return {"error": f"execution failed: {exc}"}
 
     if tool_name == "shell_classify":
         try:

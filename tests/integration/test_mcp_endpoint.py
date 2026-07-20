@@ -122,6 +122,38 @@ def test_tools_call_shell_execute_safe_cmd(client: TestClient, tmp_path: Path) -
     assert "hello" in payload["stdout"]
 
 
+def test_tools_call_shell_execute_returns_structured_error_on_exception(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unhandled exception in execute_route must not surface as a bare 500.
+
+    _dispatch_tool_call should catch it and return a structured error dict
+    (issue #26 fix).
+    """
+
+    def _boom(request, exec_req):  # noqa: ANN001, ARG001
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("shell_runner.server.execute_route", _boom)
+
+    resp = _post(
+        client,
+        "tools/call",
+        params={
+            "name": "shell_execute",
+            "arguments": {
+                "command": "echo hello",
+                "cwd": str(tmp_path),
+                "agent_id": "focused-ghc-ci-analyzer",
+            },
+        },
+        req_id=4,
+    )
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert "error" in payload
+    assert "boom" in payload["error"]
+
+
 def test_tools_call_shell_execute_denied(client: TestClient) -> None:
     resp = _post(
         client,
