@@ -23,6 +23,13 @@ def _allow_all_cwd_roots(monkeypatch: pytest.MonkeyPatch):
     importlib.reload(shell_runner.executor)
 
 
+def test_executor_max_timeout_matches_models() -> None:
+    """executor.MAX_TIMEOUT_S must be sourced from models, not hardcoded (issue #26 P1)."""
+    import shell_runner.models
+
+    assert shell_runner.executor.MAX_TIMEOUT_S == shell_runner.models.MAX_TIMEOUT_S
+
+
 def test_execute_echo_returns_zero_and_stdout(tmp_path: Path) -> None:
     result = execute(command="echo hello", cwd=str(tmp_path))
     assert result.exit_code == 0

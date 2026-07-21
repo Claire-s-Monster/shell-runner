@@ -9,6 +9,7 @@ between awaits, which is not possible with the synchronous TestClient.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,79 @@ async def test_background_execute_uses_shell_semantics(job_dir: Path) -> None:
     stdout_contents = stdout_path.read_text()
     assert "one" in stdout_contents
     assert "two" in stdout_contents
+
+
+async def test_output_mode_file_returns_running(job_dir: Path) -> None:
+    """output_mode='file' alone (no run_in_background) must route to the
+    background path, returning decision=running + job_id instead of running
+    inline and blocking until the MCP client's ~26s SIGTERM (issue #26 P1).
+    """
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "echo hi",
+                "cwd": "/tmp",
+                "agent_id": "focused-ghc-ci-analyzer",
+                "output_mode": "file",
+            },
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["decision"] == "running"
+    assert data["job_id"] is not None
+
+
+async def test_output_mode_file_completes_with_output_in_file(job_dir: Path) -> None:
+    """Poll shell_status until completed; verify the output file contains stdout."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "echo hi",
+                "cwd": "/tmp",
+                "agent_id": "focused-ghc-ci-analyzer",
+                "output_mode": "file",
+            },
+        )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        status = await _wait_for_status(
+            client, job_id, terminal={"completed", "failed", "timed_out"}
+        )
+
+    assert status["status"] == "completed"
+    stdout_path = Path(status["stdout_full_path"])
+    assert "hi" in stdout_path.read_text()
+
+
+async def test_background_job_is_session_leader(job_dir: Path) -> None:
+    """execute_background spawns with start_new_session=True (issue #26 P1) so the
+    child survives the caller's lifecycle. Uses a short sleep so the process is
+    still alive at check time (checked immediately after spawn to avoid a race
+    against fast process exit).
+    """
+    import shell_runner.server as server_module
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "sleep 2",
+                "cwd": "/tmp",
+                "agent_id": "focused-ghc-ci-analyzer",
+                "run_in_background": True,
+            },
+        )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        job = server_module.db.get_job(job_id)
+        pid = job["pid"]
+        assert os.getpgid(pid) == pid
+
+        await _wait_for_status(client, job_id, terminal={"completed", "failed", "timed_out"})
 
 
 async def test_shell_status_404_for_unknown_job() -> None:

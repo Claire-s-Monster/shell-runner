@@ -250,7 +250,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             raise HTTPException(
                 status_code=403, detail="approve_token does not match command/cwd/agent"
             )
-        if req.run_in_background:
+        if req.run_in_background or req.output_mode == "file":
             telemetry_id = str(uuid.uuid4())
             if telemetry_writer is not None:
                 await telemetry_writer.submit(
@@ -455,7 +455,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 
     # T1/T2 — auto-execute
     if cls.tier in (Tier.AUTO_LOG, Tier.AUTO_CAPPED):
-        if req.run_in_background:
+        if req.run_in_background or req.output_mode == "file":
             telemetry_id = str(uuid.uuid4())
             if telemetry_writer is not None:
                 await telemetry_writer.submit(
