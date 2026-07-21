@@ -89,7 +89,9 @@ class ClassifyResponse(BaseModel):
 
 class ApproveRequest(BaseModel):
     prompt_id: str
-    decision: Literal["approve_once", "approve_template", "approve_template_global", "deny"]
+    decision: Literal[
+        "approve_once", "approve_template", "approve_template_global", "approve_verb", "deny"
+    ]
     promote_to_tier: int | None = None
     reason: str | None = None
 
@@ -99,6 +101,8 @@ class ApproveResponse(BaseModel):
     approve_token: str | None
     template_promoted: bool
     catalog_entry_id: str | None
+    verb_promoted: bool = False
+    promoted_tier: int | None = None
 
 
 class HealthResponse(BaseModel):

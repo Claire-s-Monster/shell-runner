@@ -93,15 +93,51 @@ def _compute_duration_ms(job: dict) -> int | None:
         return None
 
 
-def _apply_template_approval(cls: ClassificationResult, agent_id: str) -> ClassificationResult:
-    """Override classification tier if a persisted template approval exists.
+def _apply_template_approval(
+    cls: ClassificationResult, agent_id: str, cwd: str
+) -> ClassificationResult:
+    """Override classification tier via persisted approvals (template or verb+cwd).
 
-    Global approvals take precedence over agent-specific ones (handled by
-    get_template_approved_tier). The override only applies when the approved
-    tier is strictly more permissive than the classified command_tier.
-    The agent cap is re-applied after the override so the cap still constrains.
+    PRECEDENCE (issue #26 P2 Part C) — evaluated in this exact order:
+      1. DENY (T0) always wins. If cls.command_tier is DENY, no promotion of
+         any kind may ever be applied — this is a security invariant enforced
+         unconditionally below, before any DB lookup. Neither exact-template
+         nor verb+cwd promotion may ever elevate a denied command.
+      2. Exact-template promotion (db.get_template_approved_tier) is checked
+         first. Global approvals take precedence over agent-specific ones
+         (handled inside get_template_approved_tier).
+      3. Verb + cwd-prefix promotion (db.get_verb_approved_tier) is checked
+         ONLY when the exact-template lookup misses. This collapses
+         command-variant re-escalation: once a verb is approved for a cwd
+         subtree, later argument variants of that verb no longer re-prompt
+         just because their exact normalized template differs from the one
+         that was originally approved.
+      4. Catalog rule (the base classification cls already carries) applies
+         when neither promotion hits.
+      5. Whichever promotion applies (if any), the agent_cap PERMISSIVENESS
+         cap-min formula (same as classify()'s step 6 / _cap_permissiveness)
+         is re-applied so a promotion can never exceed what the calling agent
+         is trusted for — this is why an AUTO_CAPPED agent can still only get
+         APPROVE_ONCE for a command whose promoted tier exceeds its cap.
+
+    The override only applies when the approved tier is strictly more
+    permissive than the classified command_tier.
     """
+    # 1. DENY always wins — never consult or apply any promotion.
+    if cls.command_tier == Tier.DENY:
+        return cls
+
+    # 2. Exact-template promotion first.
     approved_int = db.get_template_approved_tier(cls.template, agent_id)
+    promotion_label = "approved_template"
+
+    # 3. Verb + cwd-prefix promotion only when exact-template misses.
+    if approved_int is None:
+        verb = cls.segments[0].segment.verb if cls.segments else ""
+        if verb:
+            approved_int = db.get_verb_approved_tier(verb, cwd, agent_id)
+            promotion_label = "approved_verb"
+
     if approved_int is None:
         return cls
 
@@ -110,13 +146,13 @@ def _apply_template_approval(cls: ClassificationResult, agent_id: str) -> Classi
     if PERMISSIVENESS.get(approved_tier, 0) <= PERMISSIVENESS.get(cls.command_tier, 0):
         return cls
 
-    # Re-apply agent cap with the new command_tier (same formula as classifier.py)
+    # 5. Re-apply agent cap with the new command_tier (same formula as classifier.py)
     new_cmd_perm = PERMISSIVENESS[approved_tier]
     cap_perm = _cap_permissiveness(cls.agent_cap)
     new_final_tier = approved_tier if new_cmd_perm <= cap_perm else cls.agent_cap
 
     new_path = list(cls.decision_path) + [
-        f"approved_template_T{approved_int}: {cls.command_tier.name} -> {approved_tier.name}"
+        f"{promotion_label}_T{approved_int}: {cls.command_tier.name} -> {approved_tier.name}"
     ]
     if new_final_tier != approved_tier:
         new_path.append(f"agent cap applied: {approved_tier.name} -> {new_final_tier.name}")
@@ -212,6 +248,234 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="shell-runner", version="0.1.0", lifespan=_lifespan)
 
 
+async def _execute_approved_command(
+    req: ExecuteRequest,
+    prompt: dict,
+    telemetry_writer: TelemetryWriter | None,
+    t0: float,
+    consumed_via: str,
+) -> ExecuteResponse:
+    """Execute a command whose approval has already been validated & consumed.
+
+    Shared by execute_route's Path A (approve_token) and the token-less
+    approve_once durability path (issue #26 P2 Part B): both have already
+    atomically consumed a pending_prompts row via the DB and just need to run
+    the command and record telemetry identically.
+
+    Security hardening (issue #26 P2): an approval may have been consumed up
+    to APPROVE_ONCE_DURABLE_TTL_S seconds after the prompt was created. If the
+    catalog has since been updated to hard-DENY this command, the stale tier
+    captured at prompt-creation must not be trusted -- re-classify against the
+    CURRENT catalog and refuse execution on a hard DENY.
+    """
+    recheck_cls = classify(req.command, req.cwd, req.agent_id)
+    if recheck_cls.command_tier == Tier.DENY:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        telemetry_id = str(uuid.uuid4())
+        deny_reason = (
+            f"DENIED by {recheck_cls.matched_rule.pattern!r}: {recheck_cls.matched_rule.reason}"
+            if recheck_cls.matched_rule
+            else "DENIED: agent has DENY cap"
+        )
+        if telemetry_writer is not None:
+            await telemetry_writer.submit(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=recheck_cls.template,
+                command_tier=int(recheck_cls.command_tier),
+                final_tier=int(recheck_cls.tier),
+                decision="denied",
+                matched_rule_pattern=(
+                    recheck_cls.matched_rule.pattern if recheck_cls.matched_rule else None
+                ),
+                matched_rule_category=(
+                    recheck_cls.matched_rule.category if recheck_cls.matched_rule else None
+                ),
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=duration_ms,
+                decision_path=[consumed_via, "execution_recheck_deny"],
+                normalizer_warnings=list(recheck_cls.normalizer_warnings),
+            )
+        else:
+            db.record_call(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=recheck_cls.template,
+                command_tier=int(recheck_cls.command_tier),
+                final_tier=int(recheck_cls.tier),
+                decision="denied",
+                matched_rule_pattern=(
+                    recheck_cls.matched_rule.pattern if recheck_cls.matched_rule else None
+                ),
+                matched_rule_category=(
+                    recheck_cls.matched_rule.category if recheck_cls.matched_rule else None
+                ),
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=duration_ms,
+                decision_path=[consumed_via, "execution_recheck_deny"],
+                normalizer_warnings=list(recheck_cls.normalizer_warnings),
+            )
+        await asyncio.to_thread(
+            db.upsert_template,
+            template=recheck_cls.template,
+            agent_id=req.agent_id,
+            current_tier=int(recheck_cls.tier),
+            was_denied=True,
+        )
+        return ExecuteResponse(
+            decision="denied",
+            tier=int(recheck_cls.tier),
+            matched_rule=recheck_cls.matched_rule.pattern if recheck_cls.matched_rule else None,
+            exit_code=None,
+            stdout="",
+            stderr=deny_reason,
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=duration_ms,
+            telemetry_id=telemetry_id,
+            suggestions=_compute_suggestions(recheck_cls.template, req.agent_id),
+        )
+
+    if req.run_in_background or req.output_mode == "file":
+        telemetry_id = str(uuid.uuid4())
+        if telemetry_writer is not None:
+            await telemetry_writer.submit(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=prompt["normalized_template"],
+                command_tier=prompt["command_tier"],
+                final_tier=prompt["command_tier"],
+                decision="running",
+                matched_rule_pattern=None,
+                matched_rule_category=prompt["matched_rule_category"],
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                decision_path=[consumed_via, "background"],
+                normalizer_warnings=[],
+            )
+        else:
+            db.record_call(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=prompt["normalized_template"],
+                command_tier=prompt["command_tier"],
+                final_tier=prompt["command_tier"],
+                decision="running",
+                matched_rule_pattern=None,
+                matched_rule_category=prompt["matched_rule_category"],
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                decision_path=[consumed_via, "background"],
+                normalizer_warnings=[],
+            )
+        await asyncio.to_thread(
+            db.upsert_template,
+            template=prompt["normalized_template"],
+            agent_id=req.agent_id,
+            current_tier=prompt["command_tier"],
+            was_denied=False,
+        )
+        job_id = await execute_background(
+            command=req.command,
+            cwd=req.cwd,
+            timeout_s=req.timeout_s,
+            telemetry_id=telemetry_id,
+            agent_id=req.agent_id,
+            persistence=db,
+        )
+        return ExecuteResponse(
+            decision="running",
+            tier=prompt["command_tier"],
+            matched_rule=None,
+            exit_code=None,
+            stdout="",
+            stderr="",
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            telemetry_id=telemetry_id,
+            job_id=job_id,
+        )
+    exec_result = await asyncio.to_thread(
+        execute, command=req.command, cwd=req.cwd, timeout_s=req.timeout_s
+    )
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    telemetry_id = str(uuid.uuid4())
+    if telemetry_writer is not None:
+        await telemetry_writer.submit(
+            call_id=telemetry_id,
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=prompt["normalized_template"],
+            command_tier=prompt["command_tier"],
+            final_tier=prompt["command_tier"],
+            decision="executed",
+            matched_rule_pattern=None,
+            matched_rule_category=prompt["matched_rule_category"],
+            exit_code=exec_result.exit_code,
+            stdout_bytes=len(exec_result.stdout),
+            stderr_bytes=len(exec_result.stderr),
+            duration_ms=duration_ms,
+            decision_path=[consumed_via],
+            normalizer_warnings=[],
+        )
+    else:
+        db.record_call(
+            call_id=telemetry_id,
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=prompt["normalized_template"],
+            command_tier=prompt["command_tier"],
+            final_tier=prompt["command_tier"],
+            decision="executed",
+            matched_rule_pattern=None,
+            matched_rule_category=prompt["matched_rule_category"],
+            exit_code=exec_result.exit_code,
+            stdout_bytes=len(exec_result.stdout),
+            stderr_bytes=len(exec_result.stderr),
+            duration_ms=duration_ms,
+            decision_path=[consumed_via],
+            normalizer_warnings=[],
+        )
+    await asyncio.to_thread(
+        db.upsert_template,
+        template=prompt["normalized_template"],
+        agent_id=req.agent_id,
+        current_tier=prompt["command_tier"],
+        was_denied=False,
+    )
+    return ExecuteResponse(
+        decision="executed",
+        tier=prompt["command_tier"],
+        matched_rule=None,
+        exit_code=exec_result.exit_code,
+        stdout=exec_result.stdout,
+        stderr=exec_result.stderr,
+        stdout_full_path=exec_result.stdout_full_path,
+        stderr_full_path=exec_result.stderr_full_path,
+        duration_ms=duration_ms,
+        telemetry_id=telemetry_id,
+    )
+
+
 def _compute_suggestions(template: str, agent_id: str) -> list[ExecuteSuggestion] | None:
     min_sim_env = os.environ.get("SHELL_RUNNER_SUGGESTION_MIN_SIMILARITY")
     try:
@@ -250,140 +514,13 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             raise HTTPException(
                 status_code=403, detail="approve_token does not match command/cwd/agent"
             )
-        if req.run_in_background or req.output_mode == "file":
-            telemetry_id = str(uuid.uuid4())
-            if telemetry_writer is not None:
-                await telemetry_writer.submit(
-                    call_id=telemetry_id,
-                    agent_id=req.agent_id,
-                    cwd=req.cwd,
-                    raw_cmd=req.command,
-                    normalized_template=prompt["normalized_template"],
-                    command_tier=prompt["command_tier"],
-                    final_tier=prompt["command_tier"],
-                    decision="running",
-                    matched_rule_pattern=None,
-                    matched_rule_category=prompt["matched_rule_category"],
-                    exit_code=None,
-                    stdout_bytes=0,
-                    stderr_bytes=0,
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                    decision_path=["approve_token consumed", "background"],
-                    normalizer_warnings=[],
-                )
-            else:
-                db.record_call(
-                    call_id=telemetry_id,
-                    agent_id=req.agent_id,
-                    cwd=req.cwd,
-                    raw_cmd=req.command,
-                    normalized_template=prompt["normalized_template"],
-                    command_tier=prompt["command_tier"],
-                    final_tier=prompt["command_tier"],
-                    decision="running",
-                    matched_rule_pattern=None,
-                    matched_rule_category=prompt["matched_rule_category"],
-                    exit_code=None,
-                    stdout_bytes=0,
-                    stderr_bytes=0,
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                    decision_path=["approve_token consumed", "background"],
-                    normalizer_warnings=[],
-                )
-            await asyncio.to_thread(
-                db.upsert_template,
-                template=prompt["normalized_template"],
-                agent_id=req.agent_id,
-                current_tier=prompt["command_tier"],
-                was_denied=False,
-            )
-            job_id = await execute_background(
-                command=req.command,
-                cwd=req.cwd,
-                timeout_s=req.timeout_s,
-                telemetry_id=telemetry_id,
-                agent_id=req.agent_id,
-                persistence=db,
-            )
-            return ExecuteResponse(
-                decision="running",
-                tier=prompt["command_tier"],
-                matched_rule=None,
-                exit_code=None,
-                stdout="",
-                stderr="",
-                stdout_full_path=None,
-                stderr_full_path=None,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                telemetry_id=telemetry_id,
-                job_id=job_id,
-            )
-        exec_result = await asyncio.to_thread(
-            execute, command=req.command, cwd=req.cwd, timeout_s=req.timeout_s
-        )
-        duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = str(uuid.uuid4())
-        if telemetry_writer is not None:
-            await telemetry_writer.submit(
-                call_id=telemetry_id,
-                agent_id=req.agent_id,
-                cwd=req.cwd,
-                raw_cmd=req.command,
-                normalized_template=prompt["normalized_template"],
-                command_tier=prompt["command_tier"],
-                final_tier=prompt["command_tier"],
-                decision="executed",
-                matched_rule_pattern=None,
-                matched_rule_category=prompt["matched_rule_category"],
-                exit_code=exec_result.exit_code,
-                stdout_bytes=len(exec_result.stdout),
-                stderr_bytes=len(exec_result.stderr),
-                duration_ms=duration_ms,
-                decision_path=["approve_token consumed"],
-                normalizer_warnings=[],
-            )
-        else:
-            db.record_call(
-                call_id=telemetry_id,
-                agent_id=req.agent_id,
-                cwd=req.cwd,
-                raw_cmd=req.command,
-                normalized_template=prompt["normalized_template"],
-                command_tier=prompt["command_tier"],
-                final_tier=prompt["command_tier"],
-                decision="executed",
-                matched_rule_pattern=None,
-                matched_rule_category=prompt["matched_rule_category"],
-                exit_code=exec_result.exit_code,
-                stdout_bytes=len(exec_result.stdout),
-                stderr_bytes=len(exec_result.stderr),
-                duration_ms=duration_ms,
-                decision_path=["approve_token consumed"],
-                normalizer_warnings=[],
-            )
-        await asyncio.to_thread(
-            db.upsert_template,
-            template=prompt["normalized_template"],
-            agent_id=req.agent_id,
-            current_tier=prompt["command_tier"],
-            was_denied=False,
-        )
-        return ExecuteResponse(
-            decision="executed",
-            tier=prompt["command_tier"],
-            matched_rule=None,
-            exit_code=exec_result.exit_code,
-            stdout=exec_result.stdout,
-            stderr=exec_result.stderr,
-            stdout_full_path=exec_result.stdout_full_path,
-            stderr_full_path=exec_result.stderr_full_path,
-            duration_ms=duration_ms,
-            telemetry_id=telemetry_id,
+        return await _execute_approved_command(
+            req, prompt, telemetry_writer, t0, "approve_token consumed"
         )
 
     # Path B: no token — classify first
     cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id)
+    cls = _apply_template_approval(cls, req.agent_id, req.cwd)
 
     # DENY
     if cls.tier == Tier.DENY:
@@ -586,6 +723,20 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             telemetry_id=telemetry_id,
         )
 
+    # Durability (issue #26 P2 Part B): a prior approve_once approval survives
+    # the subagent that generated the original prompt (extended TTL — see
+    # Persistence.APPROVE_ONCE_DURABLE_TTL_S). A token-less re-submit matching
+    # (raw_cmd, cwd, agent_id) consumes it once instead of re-prompting.
+    # Single-use + TTL-bounded + exact (cmd, cwd, agent) match = same trust
+    # boundary as consuming an approve_token, just without requiring the token.
+    consumed = db.consume_approval_by_command(
+        raw_cmd=req.command, cwd=req.cwd, agent_id=req.agent_id
+    )
+    if consumed is not None:
+        return await _execute_approved_command(
+            req, consumed, telemetry_writer, t0, "approve_once consumed (token-less)"
+        )
+
     # T3/T4 — create pending prompt, return prompt_required
     prompt_id = db.create_pending_prompt(
         agent_id=req.agent_id,
@@ -666,7 +817,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
     cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id)
+    cls = _apply_template_approval(cls, req.agent_id, req.cwd)
     _preview_map: dict[Tier, str] = {
         Tier.DENY: "would_deny",
         Tier.AUTO_LOG: "would_execute",
@@ -731,6 +882,40 @@ async def observe_route(request: Request, req: ObserveRequest) -> ObserveRespons
     )
 
 
+def _validate_promotion_tier(promote_to_tier: int | None, original_tier: int) -> int:
+    """Resolve and validate a promotion tier against the prompt's original command_tier.
+
+    Defaults to T2 (AUTO_CAPPED) when not supplied. Raises HTTPException(400) if
+    the tier is not a real promotion (not strictly more permissive), is DENY, or
+    exceeds the AUTO_CAPPED permissiveness floor (issue #26 P2 hardening: no
+    promotion -- verb or template -- may reach AUTO_LOG, the most permissive tier).
+    Shared by the approve_template(_global) and approve_verb branches below.
+    """
+    promoted_tier = promote_to_tier if promote_to_tier is not None else int(Tier.AUTO_CAPPED)
+    if promoted_tier >= original_tier:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"promote_to_tier={promoted_tier} is not more permissive than "
+                f"original command_tier={original_tier}; promotions must lower the tier"
+            ),
+        )
+    if promoted_tier <= int(Tier.DENY):
+        raise HTTPException(
+            status_code=400,
+            detail=f"promote_to_tier={promoted_tier} (DENY) is invalid for approval",
+        )
+    if PERMISSIVENESS[Tier(promoted_tier)] > PERMISSIVENESS[Tier.AUTO_CAPPED]:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"promote_to_tier={promoted_tier} is too permissive: "
+                "promotion may not exceed AUTO_CAPPED (tier 2)"
+            ),
+        )
+    return promoted_tier
+
+
 @app.post("/approve_pending", response_model=ApproveResponse)
 async def approve_route(req: ApproveRequest) -> ApproveResponse:
     token = db.approve_prompt(prompt_id=req.prompt_id, decision=req.decision)
@@ -738,33 +923,16 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
 
     template_promoted = False
+    verb_promoted = False
     catalog_entry_id: str | None = None
+    promoted_tier_out: int | None = None
 
     if req.decision in ("approve_template", "approve_template_global"):
         prompt = db.get_pending_prompt(req.prompt_id)
         if prompt is None:
             raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
 
-        # Default to T2 (AUTO_CAPPED) — auto-execute but still logged
-        promoted_tier = (
-            req.promote_to_tier if req.promote_to_tier is not None else int(Tier.AUTO_CAPPED)
-        )
-
-        # Must be a real promotion (more permissive than original)
-        original_tier = int(prompt["command_tier"])
-        if promoted_tier >= original_tier:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"promote_to_tier={promoted_tier} is not more permissive than "
-                    f"original command_tier={original_tier}; promotions must lower the tier"
-                ),
-            )
-        if promoted_tier <= int(Tier.DENY):
-            raise HTTPException(
-                status_code=400,
-                detail=f"promote_to_tier={promoted_tier} (DENY) is invalid for approval",
-            )
+        promoted_tier = _validate_promotion_tier(req.promote_to_tier, int(prompt["command_tier"]))
 
         agent_scope = None if req.decision == "approve_template_global" else prompt["agent_id"]
         entry_id = db.create_template_approval(
@@ -774,6 +942,30 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             approved_via_prompt_id=req.prompt_id,
         )
         template_promoted = True
+        promoted_tier_out = promoted_tier
+        catalog_entry_id = str(entry_id)
+
+    elif req.decision == "approve_verb":
+        prompt = db.get_pending_prompt(req.prompt_id)
+        if prompt is None:
+            raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
+
+        promoted_tier = _validate_promotion_tier(req.promote_to_tier, int(prompt["command_tier"]))
+
+        # Reuse the existing normalizer/classify path to extract the verb of
+        # the pending prompt's raw command (first pipeline segment's verb).
+        prompt_cls = classify(prompt["raw_cmd"], prompt["cwd"], prompt["agent_id"])
+        verb = prompt_cls.segments[0].segment.verb if prompt_cls.segments else ""
+        cwd_prefix = os.path.realpath(prompt["cwd"])
+        entry_id = db.create_verb_approval(
+            verb=verb,
+            cwd_prefix=cwd_prefix,
+            agent_id=prompt["agent_id"],
+            approved_tier=promoted_tier,
+            approved_via_prompt_id=req.prompt_id,
+        )
+        verb_promoted = True
+        promoted_tier_out = promoted_tier
         catalog_entry_id = str(entry_id)
 
     return ApproveResponse(
@@ -781,6 +973,8 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         approve_token=token,
         template_promoted=template_promoted,
         catalog_entry_id=catalog_entry_id,
+        verb_promoted=verb_promoted,
+        promoted_tier=promoted_tier_out,
     )
 
 

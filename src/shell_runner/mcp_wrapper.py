@@ -94,8 +94,14 @@ TOOLS: dict[str, dict[str, Any]] = {
                         "approve_once",
                         "approve_template",
                         "approve_template_global",
+                        "approve_verb",
                         "deny",
                     ],
+                    "description": (
+                        "approve_verb promotes the command's VERB for the current cwd "
+                        "subtree + agent to the given tier (poll-free auto-exec for later "
+                        "variants of that verb in that directory)."
+                    ),
                 },
                 "promote_to_tier": {"type": ["integer", "null"]},
                 "reason": {"type": ["string", "null"]},

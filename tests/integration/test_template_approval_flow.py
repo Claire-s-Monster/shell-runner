@@ -185,6 +185,32 @@ def test_approve_template_with_non_promoting_tier_returns_400(client: TestClient
 
 
 # ---------------------------------------------------------------------------
+# SECURITY (issue #26 P2 hardening): no promotion may exceed AUTO_CAPPED.
+# ---------------------------------------------------------------------------
+
+
+def test_approve_template_promote_to_auto_log_rejected(client: TestClient) -> None:
+    data = _execute(client, _T3_CMD, _AGENT_A)
+    assert data["decision"] == "prompt_required"
+    prompt_id = data["prompt"]["id"]
+
+    # AUTO_LOG (tier 1) exceeds the promotion ceiling.
+    resp = _approve(client, prompt_id, "approve_template", promote_to_tier=1)
+    assert resp.status_code == 400
+    assert "AUTO_CAPPED" in resp.json()["detail"]
+
+
+def test_approve_template_promote_to_auto_capped_still_succeeds(client: TestClient) -> None:
+    data = _execute(client, _T3_CMD, _AGENT_A)
+    assert data["decision"] == "prompt_required"
+    prompt_id = data["prompt"]["id"]
+
+    resp = _approve(client, prompt_id, "approve_template", promote_to_tier=2)
+    assert resp.status_code == 200
+    assert resp.json()["template_promoted"] is True
+
+
+# ---------------------------------------------------------------------------
 # /classify reflects template approval (dry-run)
 # ---------------------------------------------------------------------------
 
