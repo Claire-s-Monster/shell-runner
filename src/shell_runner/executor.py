@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shlex
 import subprocess
 import threading
 import tomllib
@@ -299,7 +298,9 @@ async def execute_background(
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            *shlex.split(command),
+            "/bin/bash",
+            "-c",
+            command,
             cwd=str(resolved),
             stdout=stdout_file,
             stderr=stderr_file,

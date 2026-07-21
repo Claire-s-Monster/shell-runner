@@ -107,6 +107,38 @@ async def test_background_execute_completes_with_output(job_dir: Path) -> None:
     assert status["stderr_tail"] == ""
 
 
+async def test_background_execute_uses_shell_semantics(job_dir: Path) -> None:
+    """execute_background must run via /bin/bash -c, not raw exec (issue #26 fix).
+
+    `echo one && echo two` requires shell operator handling; under the old
+    shlex.split(command) + create_subprocess_exec path this would fail
+    (`&&` is not a valid argv token for a raw exec call).
+    """
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "echo one && echo two",
+                "cwd": "/tmp",
+                "agent_id": "focused-ghc-ci-analyzer",
+                "run_in_background": True,
+            },
+        )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        status = await _wait_for_status(
+            client, job_id, terminal={"completed", "failed", "timed_out"}
+        )
+
+    assert status["status"] == "completed"
+    assert status["exit_code"] == 0
+    stdout_path = Path(status["stdout_full_path"])
+    stdout_contents = stdout_path.read_text()
+    assert "one" in stdout_contents
+    assert "two" in stdout_contents
+
+
 async def test_shell_status_404_for_unknown_job() -> None:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
