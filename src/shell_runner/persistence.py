@@ -813,7 +813,7 @@ class TelemetryWriter:
         if self._drain_task is not None and not self._drain_task.done():
             try:
                 await asyncio.wait_for(self._queue.join(), timeout=30.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("TelemetryWriter.stop(): timed out waiting for queue drain")
         if self._drain_task is not None:
             self._drain_task.cancel()

@@ -21,13 +21,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .models import MAX_TIMEOUT_S
+
 if TYPE_CHECKING:
     from .persistence import Persistence
 
 OUTPUT_HEAD_BYTES = 4096
 OUTPUT_TAIL_BYTES = 4096
 DEFAULT_TIMEOUT_S = 30
-MAX_TIMEOUT_S = 600
 
 DEFAULT_ENV_PASSTHROUGH = ["HOME", "USER", "PATH", "LANG", "TERM"]
 
@@ -260,7 +261,7 @@ async def execute_background(
     timeout_s: int = DEFAULT_TIMEOUT_S,
     telemetry_id: str,
     agent_id: str,
-    persistence: "Persistence",
+    persistence: Persistence,
     env_passthrough: list[str] | None = None,
 ) -> str:
     """Spawn command in background, persist a jobs row, return job_id immediately.
@@ -305,6 +306,7 @@ async def execute_background(
             stdout=stdout_file,
             stderr=stderr_file,
             env=env,
+            start_new_session=True,
         )
     except Exception:
         stdout_file.close()
@@ -337,7 +339,7 @@ async def execute_background(
                 exit_code=rc,
                 finished_at=_now_iso(),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 proc.kill()
             except ProcessLookupError:

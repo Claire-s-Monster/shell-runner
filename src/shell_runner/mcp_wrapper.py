@@ -34,7 +34,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "integer",
                     "default": 30,
                     "minimum": 1,
-                    "maximum": 600,
+                    "maximum": 3600,
                 },
                 "approve_token": {
                     "type": ["string", "null"],
@@ -46,6 +46,10 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "enum": ["inline", "file", "summarize"],
                     "default": "inline",
+                    "description": (
+                        "'file' runs the command detached and returns a job_id "
+                        "(poll via shell_status); use for long-running commands."
+                    ),
                 },
                 "run_in_background": {
                     "type": "boolean",
