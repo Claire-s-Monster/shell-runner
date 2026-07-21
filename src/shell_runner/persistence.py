@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import uuid
 from collections.abc import Generator, Iterable
@@ -111,7 +112,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_template_approvals_unique
     ON template_approvals(template, COALESCE(agent_id, ''));
 
 CREATE INDEX IF NOT EXISTS idx_template_approvals_template ON template_approvals(template);
+
+CREATE TABLE IF NOT EXISTS verb_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    verb TEXT NOT NULL,
+    cwd_prefix TEXT NOT NULL,
+    agent_id TEXT,
+    approved_tier INTEGER NOT NULL,
+    approved_at TEXT NOT NULL,
+    approved_via_prompt_id TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_verb_approvals_unique
+    ON verb_approvals(verb, cwd_prefix, COALESCE(agent_id, ''));
+
+CREATE INDEX IF NOT EXISTS idx_verb_approvals_verb ON verb_approvals(verb);
 """
+
+# approve_once durability TTL (issue #26 P2 Part B): an approve_once approval
+# must survive the subagent that generated the pending prompt so a token-less
+# re-submit matching (raw_cmd, cwd, agent_id) can still consume it. This is far
+# longer than the default pending-prompt TTL (300s) used at prompt creation.
+APPROVE_ONCE_DURABLE_TTL_S = 3600
 
 
 def _now_utc() -> str:
@@ -304,8 +326,14 @@ class Persistence:
         return prompt_id
 
     def approve_prompt(self, *, prompt_id: str, decision: str) -> str | None:
-        now = _now_utc()
-        is_approved = decision in ("approve_once", "approve_template", "approve_template_global")
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
+        is_approved = decision in (
+            "approve_once",
+            "approve_template",
+            "approve_template_global",
+            "approve_verb",
+        )
         token = str(uuid.uuid4()) if is_approved else None
         with self._conn() as conn:
             row = conn.execute(
@@ -314,17 +342,38 @@ class Persistence:
             ).fetchone()
             if row is None:
                 return None
-            # Allow approving even expired prompts (expiry only gates token consumption)
-            conn.execute(
-                """
-                UPDATE pending_prompts SET
-                    approve_token = ?,
-                    approve_decision = ?,
-                    approved_at = ?
-                WHERE id = ?
-                """,
-                (token, decision, now, prompt_id),
-            )
+            if decision == "approve_once":
+                # Durability (issue #26 P2 Part B): extend the TTL well past the
+                # default pending-prompt window so a token-less re-submit
+                # matching (raw_cmd, cwd, agent_id) can still consume this
+                # approval via consume_approval_by_command, even after the
+                # subagent that generated the prompt has exited.
+                new_expires_at = (
+                    now_dt + timedelta(seconds=APPROVE_ONCE_DURABLE_TTL_S)
+                ).isoformat()
+                conn.execute(
+                    """
+                    UPDATE pending_prompts SET
+                        approve_token = ?,
+                        approve_decision = ?,
+                        approved_at = ?,
+                        expires_at = ?
+                    WHERE id = ?
+                    """,
+                    (token, decision, now, new_expires_at, prompt_id),
+                )
+            else:
+                # Allow approving even expired prompts (expiry only gates token consumption)
+                conn.execute(
+                    """
+                    UPDATE pending_prompts SET
+                        approve_token = ?,
+                        approve_decision = ?,
+                        approved_at = ?
+                    WHERE id = ?
+                    """,
+                    (token, decision, now, prompt_id),
+                )
         return token
 
     def consume_approve_token(self, *, token: str) -> dict | None:
@@ -360,6 +409,54 @@ class Persistence:
             conn.execute(
                 "UPDATE pending_prompts SET consumed_at = ? WHERE approve_token = ?",
                 (now, token),
+            )
+            conn.execute("COMMIT")
+            return {
+                "id": row["id"],
+                "raw_cmd": row["raw_cmd"],
+                "agent_id": row["agent_id"],
+                "cwd": row["cwd"],
+                "normalized_template": row["normalized_template"],
+                "command_tier": row["command_tier"],
+                "matched_rule_category": row["matched_rule_category"],
+            }
+
+    def consume_approval_by_command(
+        self, *, raw_cmd: str, cwd: str, agent_id: str
+    ) -> dict | None:
+        """Atomically find and consume a durable approve_once approval by command.
+
+        Mirrors consume_approve_token (same BEGIN IMMEDIATE serialisation and
+        single-use guarantee) but matches on (raw_cmd, cwd, agent_id) instead
+        of a token. Only rows that are approved (approved_at IS NOT NULL),
+        unconsumed (consumed_at IS NULL), and unexpired are eligible. Since
+        approve_once extends expires_at to APPROVE_ONCE_DURABLE_TTL_S, this
+        lets a token-less re-submit consume the approval once even after the
+        subagent that generated the pending prompt has exited.
+        """
+        now = _now_utc()
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT id, raw_cmd, agent_id, cwd, normalized_template,
+                       command_tier, matched_rule_category, expires_at, consumed_at
+                FROM pending_prompts
+                WHERE raw_cmd = ? AND cwd = ? AND agent_id = ?
+                  AND approved_at IS NOT NULL AND consumed_at IS NULL
+                ORDER BY approved_at DESC LIMIT 1
+                """,
+                (raw_cmd, cwd, agent_id),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            if row["expires_at"] < now:
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute(
+                "UPDATE pending_prompts SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+                (now, row["id"]),
             )
             conn.execute("COMMIT")
             return {
@@ -474,6 +571,83 @@ class Persistence:
                 (template, agent_id),
             ).fetchone()
             return int(row[0]) if row is not None else None
+
+    def create_verb_approval(
+        self,
+        *,
+        verb: str,
+        cwd_prefix: str,
+        agent_id: str | None,
+        approved_tier: int,
+        approved_via_prompt_id: str | None = None,
+    ) -> int:
+        """Persist a verb-level approval scoped to a cwd subtree.
+
+        Replaces any prior approval for the same (verb, cwd_prefix, agent_id)
+        triple (UPSERT semantics), race-safe via BEGIN IMMEDIATE — same pattern
+        as create_template_approval. agent_id=None means the approval applies
+        to any agent operating under cwd_prefix. Returns the row id.
+        """
+        now = _now_utc()
+        scope_key = agent_id if agent_id is not None else ""
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                DELETE FROM verb_approvals
+                WHERE verb = ? AND cwd_prefix = ? AND COALESCE(agent_id, '') = ?
+                """,
+                (verb, cwd_prefix, scope_key),
+            )
+            cur = conn.execute(
+                """
+                INSERT INTO verb_approvals
+                    (verb, cwd_prefix, agent_id, approved_tier, approved_at, approved_via_prompt_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (verb, cwd_prefix, agent_id, approved_tier, now, approved_via_prompt_id),
+            )
+            conn.execute("COMMIT")
+            return int(cur.lastrowid)
+
+    def get_verb_approved_tier(self, verb: str, cwd: str, agent_id: str) -> int | None:
+        """Get the most restrictive approved tier among verb+cwd-prefix approvals
+        whose cwd_prefix contains `cwd`.
+
+        Candidate rows are fetched for `verb` where agent_id matches the caller
+        or is NULL (applies to any agent under that cwd_prefix). Containment is
+        checked in PYTHON using realpath + Path.is_relative_to — the same safe
+        pattern executor.py uses for cwd-root validation — rather than a SQL
+        string-prefix match, to avoid path-traversal / sibling-directory
+        false positives (e.g. "/home/user2" is not contained by "/home/user").
+
+        Returns the MAX approved_tier among matching rows (the most
+        conservative one wins when multiple cwd_prefix/agent scopes overlap),
+        or None if no row's cwd_prefix contains cwd.
+        """
+        resolved_cwd = Path(os.path.realpath(cwd))
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT cwd_prefix, approved_tier FROM verb_approvals
+                WHERE verb = ? AND (agent_id = ? OR agent_id IS NULL)
+                """,
+                (verb, agent_id),
+            ).fetchall()
+
+        best: int | None = None
+        for row in rows:
+            prefix = Path(os.path.realpath(row["cwd_prefix"]))
+            try:
+                within = resolved_cwd == prefix or resolved_cwd.is_relative_to(prefix)
+            except ValueError:
+                within = False
+            if not within:
+                continue
+            tier = int(row["approved_tier"])
+            if best is None or tier > best:
+                best = tier
+        return best
 
     def find_similar_approved_templates(
         self,

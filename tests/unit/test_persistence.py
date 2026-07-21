@@ -183,11 +183,48 @@ def test_consume_approve_token_after_expiry_returns_none(tmp_path: Path) -> None
     with db._conn() as conn:
         conn.execute("UPDATE pending_prompts SET expires_at = ? WHERE id = ?", (past, pid))
 
-    token = db.approve_prompt(prompt_id=pid, decision="approve_once")
+    # NOTE: decision="approve_template" (not "approve_once") — approve_once
+    # deliberately extends expires_at for durability (issue #26 P2 Part B; see
+    # test_approve_once_extends_expiry_for_durability below), so it no longer
+    # exercises this "approving an already-expired prompt doesn't resurrect
+    # the token" invariant. approve_template still leaves expires_at untouched.
+    token = db.approve_prompt(prompt_id=pid, decision="approve_template")
     assert token is not None
 
     result = db.consume_approve_token(token=token)
     assert result is None
+
+
+def test_approve_once_extends_expiry_for_durability(tmp_path: Path) -> None:
+    """approve_once extends expires_at well past the original TTL (issue #26 P2
+    Part B) so a token-less re-submit can still find the approval later via
+    consume_approval_by_command, even after the original pending-prompt TTL
+    (300s) would otherwise have elapsed."""
+    db = _make_db(tmp_path)
+    pid = db.create_pending_prompt(
+        agent_id="agent",
+        cwd="/tmp",
+        raw_cmd="pip install x",
+        normalized_template="pip install <pkg>",
+        command_tier=4,
+        matched_rule_category=None,
+        decision_path=[],
+        ttl_seconds=300,
+    )
+    prompt_before = db.get_pending_prompt(pid)
+    assert prompt_before is not None
+    original_expires_at = prompt_before["expires_at"]
+
+    token = db.approve_prompt(prompt_id=pid, decision="approve_once")
+    assert token is not None
+
+    prompt_after = db.get_pending_prompt(pid)
+    assert prompt_after is not None
+    assert prompt_after["expires_at"] > original_expires_at
+
+    # The durable expiry is well beyond the immediate future (still valid).
+    soon = (datetime.now(timezone.utc) + timedelta(seconds=310)).isoformat()
+    assert prompt_after["expires_at"] > soon
 
 
 def test_cleanup_expired_prompts_deletes_only_expired(tmp_path: Path) -> None:
