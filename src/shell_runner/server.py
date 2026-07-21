@@ -30,7 +30,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import executor
 from .catalog import Tier, all_rules
-from .classifier import PERMISSIVENESS, ClassificationResult, _cap_permissiveness, classify
+from .classifier import (
+    PERMISSIVENESS,
+    ClassificationResult,
+    _cap_permissiveness,
+    classify,
+    lookup_agent_cap,
+)
 from .executor import OUTPUT_TAIL_BYTES, execute, execute_background
 from .mcp_wrapper import TOOLS
 from .models import (
@@ -918,6 +924,41 @@ def _validate_promotion_tier(promote_to_tier: int | None, original_tier: int) ->
 
 @app.post("/approve_pending", response_model=ApproveResponse)
 async def approve_route(req: ApproveRequest) -> ApproveResponse:
+    # Fetch the pending prompt (if any) before applying the decision, so the
+    # approver-identity guard below can inspect the executing agent's id.
+    prompt_for_guard = db.get_pending_prompt(req.prompt_id)
+    if prompt_for_guard is None and req.decision != "deny":
+        raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
+
+    # --- Layer-1 defense-in-depth approver guard (issue #29) ---------------
+    # NOTE: agent_id / approver_agent_id are self-asserted by the caller, not
+    # cryptographically authenticated. This is a MITIGATION, not a hard
+    # security boundary — it raises the bar against accidental or careless
+    # self-approval, but a malicious caller can still lie about its identity.
+    # Full authenticated-identity enforcement is tracked in issue #29.
+    if req.approver_agent_id:
+        executor_agent_id = prompt_for_guard["agent_id"] if prompt_for_guard else None
+        if req.approver_agent_id == executor_agent_id:
+            raise HTTPException(
+                status_code=403,
+                detail="self-approval not allowed: approver must differ from the executing agent",
+            )
+        if lookup_agent_cap(req.approver_agent_id) != Tier.DENY:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "approver lacks approval capability "
+                    "(a DENY-capability/primary identity is required)"
+                ),
+            )
+    else:
+        logger.warning(
+            "approve_pending: prompt %s approved without an authenticated approver "
+            "identity (approver_agent_id not supplied) — self-approval and capability "
+            "checks were skipped; see issue #29",
+            req.prompt_id,
+        )
+
     token = db.approve_prompt(prompt_id=req.prompt_id, decision=req.decision)
     if token is None and req.decision != "deny":
         raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")

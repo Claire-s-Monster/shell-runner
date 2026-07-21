@@ -195,6 +195,122 @@ def test_approve_pending_deny_returns_no_token(client: TestClient, fresh_db: Pat
 
 
 # ---------------------------------------------------------------------------
+# /approve_pending approver-identity guard (issue #29, Layer-1)
+# ---------------------------------------------------------------------------
+
+
+def test_approve_pending_self_approval_rejected(client: TestClient, fresh_db: Path) -> None:
+    """approver_agent_id equal to the prompt's executing agent_id -> 403."""
+    import shell_runner.server as srv
+
+    db_inst: Persistence = srv.db
+    pid = db_inst.create_pending_prompt(
+        agent_id="test-agent",
+        cwd="/tmp",
+        raw_cmd="pip install x",
+        normalized_template="pip install <pkg>",
+        command_tier=4,
+        matched_rule_category="package",
+        decision_path=["T4 match"],
+    )
+
+    resp = client.post(
+        "/approve_pending",
+        json={
+            "prompt_id": pid,
+            "decision": "approve_once",
+            "approver_agent_id": "test-agent",
+        },
+    )
+    assert resp.status_code == 403
+    assert "self-approval" in resp.json()["detail"]
+
+
+def test_approve_pending_non_deny_approver_rejected(client: TestClient, fresh_db: Path) -> None:
+    """approver_agent_id without DENY capability -> 403."""
+    import shell_runner.server as srv
+
+    db_inst: Persistence = srv.db
+    pid = db_inst.create_pending_prompt(
+        agent_id="test-agent",
+        cwd="/tmp",
+        raw_cmd="pip install x",
+        normalized_template="pip install <pkg>",
+        command_tier=4,
+        matched_rule_category="package",
+        decision_path=["T4 match"],
+    )
+
+    resp = client.post(
+        "/approve_pending",
+        json={
+            "prompt_id": pid,
+            "decision": "approve_once",
+            # Distinct from the executor, but not a DENY-cap identity.
+            "approver_agent_id": "focused-shell-runner",
+        },
+    )
+    assert resp.status_code == 403
+    assert "approval capability" in resp.json()["detail"]
+
+
+def test_approve_pending_primary_approver_succeeds(client: TestClient, fresh_db: Path) -> None:
+    """approver_agent_id = 'primary' (DENY cap), distinct from executor -> succeeds."""
+    import shell_runner.server as srv
+
+    db_inst: Persistence = srv.db
+    pid = db_inst.create_pending_prompt(
+        agent_id="test-agent",
+        cwd="/tmp",
+        raw_cmd="pip install x",
+        normalized_template="pip install <pkg>",
+        command_tier=4,
+        matched_rule_category="package",
+        decision_path=["T4 match"],
+    )
+
+    resp = client.post(
+        "/approve_pending",
+        json={
+            "prompt_id": pid,
+            "decision": "approve_once",
+            "approver_agent_id": "primary",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["applied"] is True
+    assert data["approve_token"] is not None
+
+
+def test_approve_pending_omitted_approver_still_succeeds(
+    client: TestClient, fresh_db: Path
+) -> None:
+    """approver_agent_id omitted -> approval still succeeds (backward compat)."""
+    import shell_runner.server as srv
+
+    db_inst: Persistence = srv.db
+    pid = db_inst.create_pending_prompt(
+        agent_id="test-agent",
+        cwd="/tmp",
+        raw_cmd="pip install x",
+        normalized_template="pip install <pkg>",
+        command_tier=4,
+        matched_rule_category="package",
+        decision_path=["T4 match"],
+    )
+
+    resp = client.post(
+        "/approve_pending",
+        json={"prompt_id": pid, "decision": "approve_once"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["applied"] is True
+    assert data["approve_token"] is not None
+
+
+# ---------------------------------------------------------------------------
 # Full approve_token flow
 # ---------------------------------------------------------------------------
 

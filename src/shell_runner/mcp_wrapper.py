@@ -81,7 +81,10 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Approve or deny a pending shell command prompt. On approval, returns "
             "approve_token to pass back to shell_execute. "
-            "PRIMARY SESSION ONLY — agents cannot call this themselves."
+            "PRIMARY SESSION ONLY — agents cannot call this themselves. When "
+            "approver_agent_id is supplied, the server partially enforces this "
+            "(rejects self-approval and non-primary approvers); when omitted, the "
+            "check is skipped for backward compatibility."
         ),
         "schema": {
             "type": "object",
@@ -105,6 +108,16 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "promote_to_tier": {"type": ["integer", "null"]},
                 "reason": {"type": ["string", "null"]},
+                "approver_agent_id": {
+                    "type": "string",
+                    "description": (
+                        "Identity of the approver (should be the primary/DENY-capability "
+                        "session, distinct from the command's executing agent). When "
+                        "supplied, the server rejects self-approval and non-primary "
+                        "approvers. NOTE: agent_id is self-asserted — this is a "
+                        "mitigation; authenticated identity is tracked in issue #29."
+                    ),
+                },
             },
         },
     },

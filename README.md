@@ -64,6 +64,14 @@ This means an `AUTO_CAPPED`-capped agent can still only receive
 its cap — promotion raises the *command's* tier, but the agent's own trust
 ceiling is never bypassed.
 
+`/approve_pending` (`shell_approve_pending`) accepts an optional
+`approver_agent_id`. When supplied, the server checks it as defense-in-depth:
+self-approval (approver == the prompt's executing agent) and non-primary
+(non-`DENY`-cap) approvers are rejected with 403. This is a mitigation only —
+`approver_agent_id` is self-asserted, not cryptographically authenticated.
+Full authenticated-identity enforcement of "primary session only" is a known
+limitation tracked in [#29](https://github.com/Claire-s-Monster/shell-runner/issues/29).
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
