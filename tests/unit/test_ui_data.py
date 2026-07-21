@@ -159,3 +159,27 @@ def test_approve_prompt_sends_global_decision() -> None:
         body = mock_post.call_args.kwargs["json"]
         assert body["decision"] == "approve_template_global"
         assert body["promote_to_tier"] == 1
+
+
+def test_approve_prompt_sends_approver_agent_id_primary_by_default() -> None:
+    from ui.data import approve_prompt
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"applied": True}
+    mock_resp.raise_for_status = MagicMock()
+    with patch("ui.data.httpx.post", return_value=mock_resp) as mock_post:
+        approve_prompt("pid-x", "approve_once")
+        # UI is the human/primary approval surface: it must send
+        # approver_agent_id="primary" so the server's Layer-1 guard engages (issue #29).
+        assert mock_post.call_args.kwargs["json"]["approver_agent_id"] == "primary"
+
+
+def test_approve_prompt_forwards_custom_approver_agent_id() -> None:
+    from ui.data import approve_prompt
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"applied": True}
+    mock_resp.raise_for_status = MagicMock()
+    with patch("ui.data.httpx.post", return_value=mock_resp) as mock_post:
+        approve_prompt("pid-x", "deny", approver_agent_id="reviewer-1")
+        assert mock_post.call_args.kwargs["json"]["approver_agent_id"] == "reviewer-1"

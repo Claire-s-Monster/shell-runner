@@ -17,7 +17,8 @@ Schema notes (from src/shell_runner/persistence.py):
    AND expires_at > now)
 
 Approve endpoint: POST /approve_pending
-  Body: {"prompt_id": str, "decision": str, "reason": str | None}
+  Body: {"prompt_id": str, "decision": str, "reason": str | None,
+         "approver_agent_id": str}
 Health endpoint:  GET /health
 """
 
@@ -91,6 +92,7 @@ def approve_prompt(
     decision: str,
     reason: str = "",
     promote_to_tier: int | None = None,
+    approver_agent_id: str = "primary",
     api_url: str = DEFAULT_API_URL,
     timeout: float = 5.0,
 ) -> dict[str, Any]:
@@ -99,12 +101,19 @@ def approve_prompt(
     decision is one of: approve_once, approve_template, approve_template_global, deny.
     promote_to_tier is forwarded to the server when provided (T1 or T2); applies only
     to template decisions. Server defaults to T2 when omitted.
+
+    approver_agent_id identifies who is approving. It defaults to "primary" because
+    this admin UI is the human/primary approval surface — sending it engages the
+    server's Layer-1 approver-identity guard (issue #29), which resolves "primary"
+    to DENY capability and rejects self-approval. Omitting it makes the server skip
+    the guard entirely, so the UI always sends it.
     Returns the JSON response. Raises on HTTP error.
     """
     body: dict[str, Any] = {
         "prompt_id": prompt_id,
         "decision": decision,
         "reason": reason if reason else None,
+        "approver_agent_id": approver_agent_id,
     }
     if promote_to_tier is not None:
         body["promote_to_tier"] = promote_to_tier
