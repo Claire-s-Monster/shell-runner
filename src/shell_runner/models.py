@@ -94,6 +94,7 @@ class ApproveRequest(BaseModel):
     ]
     promote_to_tier: int | None = None
     reason: str | None = None
+    approver_agent_id: str | None = None
 
 
 class ApproveResponse(BaseModel):
