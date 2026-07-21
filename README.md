@@ -38,6 +38,30 @@ pixi run check-all
 | `check-all` | Run test + quality |
 | `build` | Build distribution package |
 | `http-server` | Start the HTTP MCP server |
+| `ui` | Launch the Streamlit approval/admin UI (pixi env `ui`) |
+
+## Admin / Approval UI
+
+`shell-runner` ships a Streamlit-based admin UI (`ui/app.py`) for reviewing
+telemetry and acting on pending T3/T4 approval prompts. It lives in the `ui`
+pixi environment.
+
+```bash
+# Launch the UI (binds 127.0.0.1:8511)
+pixi run -e ui ui
+```
+
+Pages:
+- **Dashboard** — recent shell calls read directly from the telemetry DB.
+- **Pending Prompts** — non-expired, unapproved prompts; approve
+  (`approve_once` / `approve_template` / `approve_template_global`) or deny.
+
+Approvals from this UI POST to the server's `/approve_pending` endpoint with
+`approver_agent_id="primary"`, which engages the Layer-1 approver-identity guard
+(see [#29](https://github.com/Claire-s-Monster/shell-runner/issues/29)):
+`"primary"` resolves to DENY capability and self-approval is rejected. The UI
+reads the telemetry DB read-only and talks to the server at
+`$SHELL_RUNNER_API_URL` (default `http://127.0.0.1:4111`).
 
 ## Approval precedence & agent_cap
 
