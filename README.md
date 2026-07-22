@@ -56,6 +56,36 @@ Pages:
 - **Pending Prompts** — non-expired, unapproved prompts; approve
   (`approve_once` / `approve_template` / `approve_template_global`) or deny.
 
+### Rule refinement (Pending Prompts page)
+
+Each pending prompt shows **why** it needs approval and lets you propose a
+classifier-rule improvement as a GitHub issue — nothing is applied live.
+
+- **Why this needs approval** — the classifier's decision path and matched rule
+  category (from stored telemetry; no external calls).
+- **Similar past approvals** — previously-approved templates that resemble this
+  command (verb-anchored similarity). Example commands are shown redacted.
+- **🔍 Propose rule enhancement** — runs a strictly **read-only** Claude session
+  in the repo (Read/Grep/Glob only; it cannot edit files, run shell, or call any
+  MCP write tool, and the repo's `.mcp.json` is not loaded). It explains why the
+  command missed the auto-execute rules and returns a proposed catalog rule or an
+  existing-lever recommendation. You review the **redacted** command and proposal,
+  then **File GitHub issue** files it under the `rule-enhancement` label for local
+  review and a follow-up PR to `src/shell_runner/catalog.py`.
+
+Secrets in the command are redacted before anything is sent to Claude or written
+into an issue.
+
+**Configuration (environment variables):**
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `SHELL_RUNNER_CLAUDE_BIN` | `claude` | Claude CLI used for analysis |
+| `SHELL_RUNNER_ANALYSIS_TIMEOUT_S` | `180` | Analysis subprocess timeout (seconds) |
+| `SHELL_RUNNER_GH_REPO` | `Claire-s-Monster/shell-runner` | Repo issues are filed against |
+| `SHELL_RUNNER_GH_TOKEN` | falls back to `GITHUB_TOKEN` | Token with `issues:write`; if unset, filing is disabled |
+| `SHELL_RUNNER_REPO_DIR` | UI repo root | Directory the read-only Claude session runs in |
+
 Approvals from this UI POST to the server's `/approve_pending` endpoint with
 `approver_agent_id="primary"`, which engages the Layer-1 approver-identity guard
 (see [#29](https://github.com/Claire-s-Monster/shell-runner/issues/29)):
