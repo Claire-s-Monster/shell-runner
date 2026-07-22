@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from ui.data import get_health, get_pending_prompts, get_recent_calls
+from ui.data import get_health, get_pending_prompts, get_recent_calls, parse_decision_path
 
 
 def _make_db(tmp_path: Path) -> Path:
@@ -183,3 +183,23 @@ def test_approve_prompt_forwards_custom_approver_agent_id() -> None:
     with patch("ui.data.httpx.post", return_value=mock_resp) as mock_post:
         approve_prompt("pid-x", "deny", approver_agent_id="reviewer-1")
         assert mock_post.call_args.kwargs["json"]["approver_agent_id"] == "reviewer-1"
+
+
+# ---------------------------------------------------------------------------
+# parse_decision_path
+# ---------------------------------------------------------------------------
+
+
+def test_parse_decision_path_valid_json_list():
+    raw = '["normalized: curl <safe_url>", "segment \'curl\': T4 -> ALWAYS_APPROVE"]'
+    assert parse_decision_path(raw) == [
+        "normalized: curl <safe_url>",
+        "segment 'curl': T4 -> ALWAYS_APPROVE",
+    ]
+
+
+def test_parse_decision_path_handles_none_and_garbage():
+    assert parse_decision_path(None) == []
+    assert parse_decision_path("") == []
+    assert parse_decision_path("not json") == []
+    assert parse_decision_path('{"not": "a list"}') == []

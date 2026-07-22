@@ -24,6 +24,7 @@ Health endpoint:  GET /health
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import closing
@@ -120,3 +121,16 @@ def approve_prompt(
     r = httpx.post(f"{api_url}/approve_pending", json=body, timeout=timeout)
     r.raise_for_status()
     return r.json()
+
+
+def parse_decision_path(decision_path_json: str | None) -> list[str]:
+    """Decode the stored decision_path JSON list; return [] on any problem."""
+    if not decision_path_json:
+        return []
+    try:
+        value = json.loads(decision_path_json)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(step) for step in value]
