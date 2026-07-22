@@ -7,7 +7,11 @@ analysis subprocess or written into a GitHub issue must pass through redact().
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+from pathlib import Path
 
 REDACTED = "‹REDACTED›"
 
@@ -150,3 +154,89 @@ Similar past approvals (for reference):
 Explain why `normalized_template` did not match an auto-execute rule. Prefer recommending an EXISTING lever (approve_verb, or approve_template_global) when one would generalise this safely; only propose a NEW catalog Rule if no lever fits.
 
 Emit ONLY a single JSON object (no prose, no markdown fences) as your final message, with exactly these keys: {_SCHEMA_KEYS}. Use existing_lever="none" and a non-null proposed_rule when proposing a rule; set proposed_rule=null and existing_lever to the lever name when recommending a lever. tier must be "T1" or "T2"; match_target "template" or "raw"; confidence a number 0..1; dedupe_key a stable slug for this command family."""
+
+
+class AnalysisError(RuntimeError):
+    """Raised when the read-only Claude analysis subprocess fails or returns unusable output."""
+
+
+READONLY_SETTINGS = json.dumps({
+    "permissions": {
+        "allow": ["Read", "Grep", "Glob"],
+        "deny": ["Bash", "Edit", "Write", "NotebookEdit", "mcp__*"],
+        "defaultMode": "dontAsk",
+    }
+})
+
+_SECRET_ENV_KEYS = ("SHELL_RUNNER_GH_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Child env with issue-filing tokens removed so the analysis session cannot read them."""
+    env = dict(os.environ)
+    for k in _SECRET_ENV_KEYS:
+        env.pop(k, None)
+    return env
+
+
+def _build_argv(claude_bin: str, prompt: str) -> list[str]:
+    """Construct the deny-by-default read-only claude invocation."""
+    return [
+        claude_bin, "-p", prompt,
+        "--output-format", "json",
+        "--permission-mode", "dontAsk",
+        "--allowedTools", "Read,Grep,Glob",
+        "--disallowedTools", "Bash,Edit,Write,NotebookEdit,mcp__*",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--settings", READONLY_SETTINGS,
+    ]
+
+
+def _extract_json_object(text: str) -> dict:
+    """Pull the first {...last} JSON object out of a possibly fenced text blob."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise AnalysisError("no JSON object found in analysis output")
+    return json.loads(text[start:end + 1])
+
+
+def run_claude_analysis(
+    prompt: str,
+    repo_dir: Path | str,
+    *,
+    claude_bin: str = "claude",
+    timeout_s: int = 180,
+) -> dict:
+    """Run a read-only headless Claude analysis and return the validated proposal dict.
+
+    Raises AnalysisError on: timeout, non-zero exit, is_error envelope, unparseable
+    envelope/proposal, or schema-validation failure.
+    """
+    argv = _build_argv(claude_bin, prompt)
+    try:
+        proc = subprocess.run(
+            argv, cwd=str(repo_dir), capture_output=True, text=True,
+            timeout=timeout_s, check=False, env=_scrubbed_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AnalysisError(f"analysis timed out after {timeout_s}s") from exc
+    if proc.returncode != 0:
+        raise AnalysisError(f"claude exited {proc.returncode}: {proc.stderr[:200]}")
+    try:
+        envelope = json.loads(proc.stdout)
+    except (ValueError, TypeError) as exc:
+        raise AnalysisError("unparseable --output-format json envelope") from exc
+    if envelope.get("is_error"):
+        raise AnalysisError(f"claude reported is_error: {str(envelope.get('result'))[:200]}")
+    text = envelope.get("result")
+    if not isinstance(text, str):
+        raise AnalysisError("envelope missing 'result' text")
+    try:
+        obj = _extract_json_object(text)
+    except (ValueError, TypeError) as exc:
+        raise AnalysisError("unparseable proposal JSON in analysis output") from exc
+    try:
+        return validate_proposal(obj)
+    except ValueError as exc:
+        raise AnalysisError(f"proposal failed validation: {exc}") from exc

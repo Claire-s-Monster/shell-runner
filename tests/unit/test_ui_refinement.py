@@ -112,3 +112,63 @@ def test_build_analysis_prompt_contains_context_and_schema():
     for key in ["missed_reason", "existing_lever", "proposed_rule", "catalog_section",
                 "confidence", "dedupe_key", "issue_title", "risk_notes"]:
         assert key in p
+
+
+import json as _json
+import sys
+
+from ui.refinement import AnalysisError, _build_argv, _scrubbed_env, run_claude_analysis
+
+
+def _write_fake_claude(tmp_path, envelope, exit_code=0):
+    script = tmp_path / "fakeclaude.py"
+    script.write_text(
+        "import json, sys\n"
+        f"sys.stdout.write(json.dumps({envelope!r}))\n"
+        f"sys.exit({exit_code})\n"
+    )
+    launcher = tmp_path / "fakeclaude"
+    launcher.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n")
+    launcher.chmod(0o755)
+    return str(launcher)
+
+
+def _proposal_text():
+    return "```json\n" + _json.dumps(_valid_proposal()) + "\n```"
+
+
+def test_run_claude_analysis_parses_valid_envelope(tmp_path):
+    fake = _write_fake_claude(tmp_path, {"type": "result", "result": _proposal_text(), "is_error": False})
+    out = run_claude_analysis("p", tmp_path, claude_bin=fake, timeout_s=30)
+    assert out["dedupe_key"] == "curl-fam"
+    assert out["proposed_rule"]["tier"] == "T2"
+
+
+def test_run_claude_analysis_is_error_raises(tmp_path):
+    fake = _write_fake_claude(tmp_path, {"type": "result", "result": "boom", "is_error": True})
+    with pytest.raises(AnalysisError):
+        run_claude_analysis("p", tmp_path, claude_bin=fake, timeout_s=30)
+
+
+def test_run_claude_analysis_nonzero_exit_raises(tmp_path):
+    fake = _write_fake_claude(tmp_path, {"type": "result", "result": _proposal_text(), "is_error": False}, exit_code=1)
+    with pytest.raises(AnalysisError):
+        run_claude_analysis("p", tmp_path, claude_bin=fake, timeout_s=30)
+
+
+def test_build_argv_enforces_readonly():
+    argv = _build_argv("claude", "the-prompt")
+    assert "the-prompt" in argv
+    assert "--strict-mcp-config" in argv
+    di = argv[argv.index("--disallowedTools") + 1]
+    assert "mcp__*" in di and "Bash" in di
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+
+
+def test_scrubbed_env_removes_tokens(monkeypatch):
+    monkeypatch.setenv("SHELL_RUNNER_GH_TOKEN", "secrettoken")
+    monkeypatch.setenv("GITHUB_TOKEN", "secrettoken2")
+    env = _scrubbed_env()
+    assert "SHELL_RUNNER_GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "GH_TOKEN" not in env
