@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from ui.data import get_health, get_pending_prompts, get_recent_calls, parse_decision_path
+from ui.data import get_health, get_pending_prompts, get_recent_calls, get_similar_approvals, parse_decision_path
 
 
 def _make_db(tmp_path: Path) -> Path:
@@ -203,3 +203,47 @@ def test_parse_decision_path_handles_none_and_garbage():
     assert parse_decision_path("") == []
     assert parse_decision_path("not json") == []
     assert parse_decision_path('{"not": "a list"}') == []
+
+
+# ---------------------------------------------------------------------------
+# get_similar_approvals
+# ---------------------------------------------------------------------------
+
+
+def _seed_similar(tmp_path):
+    db = tmp_path / "t.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE template_approvals (id INTEGER PRIMARY KEY, template TEXT,
+            agent_id TEXT, approved_tier INTEGER, approved_at TEXT);
+        CREATE TABLE shell_calls (id TEXT, ts TEXT, normalized_template TEXT,
+            decision TEXT, raw_cmd TEXT);
+        INSERT INTO template_approvals VALUES
+            (1,'curl <safe_url> <arg>', NULL, 2, '2026-07-01T00:00:00'),
+            (2,'curl <safe_url>',        NULL, 2, '2026-07-02T00:00:00'),
+            (3,'wget <safe_url>',        NULL, 2, '2026-07-03T00:00:00');
+        INSERT INTO shell_calls VALUES
+            ('a','2026-07-02T00:00:00','curl <safe_url>','executed','curl https://x');
+        """
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_get_similar_approvals_ranks_and_filters(tmp_path):
+    db = _seed_similar(tmp_path)
+    out = get_similar_approvals("curl <safe_url> extra", agent_id="primary",
+                                db_path=db, limit=3, min_similarity=0.3)
+    templates = [row["template"] for row in out]
+    assert "wget <safe_url>" not in templates
+    assert "curl <safe_url> extra" not in templates
+    assert templates and templates[0].startswith("curl")
+    top = out[0]
+    assert set(top) >= {"template", "approved_tier", "example_raw_cmd", "similarity"}
+
+
+def test_get_similar_approvals_missing_db_returns_empty(tmp_path):
+    assert get_similar_approvals("curl <safe_url>", "primary",
+                                 db_path=tmp_path / "nope.sqlite3") == []
