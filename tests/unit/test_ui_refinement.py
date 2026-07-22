@@ -239,3 +239,32 @@ def test_file_github_issue_dedupes_without_posting():
     assert out["status"] == "duplicate"
     assert out["url"] == "https://gh/issues/9"
     assert calls["post"] == 0
+
+
+def test_redact_url_userinfo():
+    out = redact("curl https://user:s3cr3tPASS@host.example/x")
+    assert "s3cr3tPASS" not in out
+    assert "host.example" in out
+    assert R in out
+
+
+def test_redact_json_body_flag():
+    out = redact('curl --json \'{"token":"SECRETJSONVAL"}\' https://api.x')
+    assert "SECRETJSONVAL" not in out
+    assert R in out
+
+
+def test_build_issue_body_neutralizes_fence_injection():
+    p = _valid_proposal()
+    p["proposed_rule"] = None
+    p["existing_lever"] = "approve_verb"
+    p["risk_notes"] = "safe ``` breakout ``` attempt"
+    p["missed_reason"] = "``` also here"
+    _, body, _ = build_issue_body(p, "curl https://x", "curl <safe_url>")
+    assert "```" not in body
+
+
+def test_build_analysis_prompt_frames_untrusted():
+    prompt = build_analysis_prompt("ls", "ls", 3, None, [], [])
+    assert "UNTRUSTED" in prompt
+    assert "Do NOT" in prompt or "do not" in prompt.lower()
