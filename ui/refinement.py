@@ -13,6 +13,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import httpx
+
 REDACTED = "‹REDACTED›"
 
 # Rule 6 — known secret token shapes, redacted anywhere they appear.
@@ -240,3 +242,84 @@ def run_claude_analysis(
         return validate_proposal(obj)
     except ValueError as exc:
         raise AnalysisError(f"proposal failed validation: {exc}") from exc
+
+
+_GH_API = "https://api.github.com"
+_ISSUE_LABELS = ["classifier", "rule-enhancement", "ai-proposed", "needs-review"]
+_TIER_ENUM = {"T1": "AUTO_LOG", "T2": "AUTO_CAPPED"}
+
+
+def build_issue_body(
+    proposal: dict, redacted_cmd: str, normalized_template: str
+) -> tuple[str, str, list[str]]:
+    """Return (title, body, labels) for a GitHub issue. Re-redacts the command defensively."""
+    safe_cmd = redact(redacted_cmd)
+    rule = proposal.get("proposed_rule")
+    if rule is None:
+        change = f"**Use existing lever:** `{proposal['existing_lever']}`"
+    else:
+        change = (
+            f"Add to `{proposal['catalog_section']}` in `src/shell_runner/catalog.py`:\n\n"
+            "```python\n"
+            "Rule(\n"
+            f"    pattern={rule['pattern']!r},\n"
+            f"    tier=Tier.{_TIER_ENUM[rule['tier']]},\n"
+            f"    category={rule['category']!r},\n"
+            f"    match_target={rule['match_target']!r},\n"
+            f"    reason={rule['reason']!r},\n"
+            ")\n"
+            "```"
+        )
+    title = proposal["issue_title"]
+    body = (
+        "_Proposed by a read-only Claude analysis of a pending approval. Review before applying._\n\n"
+        f"**Redacted command:**\n\n```\n{safe_cmd}\n```\n\n"
+        f"**Normalized template:** `{normalized_template}`\n\n"
+        f"**Why it missed:** {proposal['missed_reason']}\n\n"
+        f"**Proposed change:**\n\n{change}\n\n"
+        f"**Confidence:** {proposal['confidence']}\n\n"
+        f"**Risk notes:** {proposal['risk_notes']}\n\n"
+        f"<!-- dedupe:{proposal['dedupe_key']} -->\n"
+    )
+    return title, body, list(_ISSUE_LABELS)
+
+
+def _gh_client(token: str, transport=None) -> httpx.Client:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    return httpx.Client(base_url=_GH_API, headers=headers, transport=transport, timeout=10.0)
+
+
+def find_open_issue(dedupe_key: str, repo: str, token: str, *, transport=None) -> str | None:
+    """Return the html_url of an open issue already carrying this dedupe key, or None."""
+    q = f'repo:{repo} is:issue is:open "dedupe:{dedupe_key}"'
+    with _gh_client(token, transport) as client:
+        r = client.get("/search/issues", params={"q": q})
+        r.raise_for_status()
+        items = r.json().get("items", [])
+    return items[0]["html_url"] if items else None
+
+
+def file_github_issue(
+    proposal: dict,
+    redacted_cmd: str,
+    normalized_template: str,
+    repo: str,
+    token: str,
+    *,
+    transport=None,
+) -> dict:
+    """File (or dedupe) a GitHub issue for a proposal. Returns {'status', 'url'}."""
+    existing = find_open_issue(proposal["dedupe_key"], repo, token, transport=transport)
+    if existing:
+        return {"status": "duplicate", "url": existing}
+    title, body, labels = build_issue_body(proposal, redacted_cmd, normalized_template)
+    with _gh_client(token, transport) as client:
+        r = client.post(
+            f"/repos/{repo}/issues", json={"title": title, "body": body, "labels": labels}
+        )
+        r.raise_for_status()
+        return {"status": "created", "url": r.json()["html_url"]}

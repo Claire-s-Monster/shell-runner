@@ -172,3 +172,70 @@ def test_scrubbed_env_removes_tokens(monkeypatch):
     assert "SHELL_RUNNER_GH_TOKEN" not in env
     assert "GITHUB_TOKEN" not in env
     assert "GH_TOKEN" not in env
+
+
+import httpx as _httpx
+
+from ui.refinement import build_issue_body, file_github_issue, find_open_issue
+
+
+def test_build_issue_body_has_marker_and_labels():
+    title, body, labels = build_issue_body(_valid_proposal(), "curl https://x", "curl <safe_url>")
+    assert "<!-- dedupe:curl-fam -->" in body
+    assert labels == ["classifier", "rule-enhancement", "ai-proposed", "needs-review"]
+    assert "curl <safe_url>" in body
+    assert title == "t"
+
+
+def test_build_issue_body_redacts_defensively():
+    _, body, _ = build_issue_body(_valid_proposal(), "curl -u me:PASSWORDX https://x", "curl <safe_url>")
+    assert "PASSWORDX" not in body
+    assert "‹REDACTED›" in body
+
+
+def test_find_open_issue_hit_and_miss():
+    def handler(request):
+        assert request.url.path == "/search/issues"
+        if "hitkey" in request.url.params["q"]:
+            return _httpx.Response(200, json={"items": [{"html_url": "https://gh/issues/1"}]})
+        return _httpx.Response(200, json={"items": []})
+
+    t = _httpx.MockTransport(handler)
+    assert find_open_issue("hitkey", "o/r", "tok", transport=t) == "https://gh/issues/1"
+    assert find_open_issue("misskey", "o/r", "tok", transport=t) is None
+
+
+def test_file_github_issue_creates_when_no_duplicate():
+    posted = {}
+
+    def handler(request):
+        if request.url.path == "/search/issues":
+            return _httpx.Response(200, json={"items": []})
+        if request.method == "POST" and request.url.path == "/repos/o/r/issues":
+            posted["auth"] = request.headers.get("authorization")
+            posted["body"] = _json.loads(request.content)
+            return _httpx.Response(201, json={"html_url": "https://gh/issues/2"})
+        return _httpx.Response(404)
+
+    t = _httpx.MockTransport(handler)
+    out = file_github_issue(_valid_proposal(), "curl https://x", "curl <safe_url>", "o/r", "tok", transport=t)
+    assert out == {"status": "created", "url": "https://gh/issues/2"}
+    assert posted["auth"] == "Bearer tok"
+    assert posted["body"]["labels"] == ["classifier", "rule-enhancement", "ai-proposed", "needs-review"]
+
+
+def test_file_github_issue_dedupes_without_posting():
+    calls = {"post": 0}
+
+    def handler(request):
+        if request.url.path == "/search/issues":
+            return _httpx.Response(200, json={"items": [{"html_url": "https://gh/issues/9"}]})
+        if request.method == "POST":
+            calls["post"] += 1
+        return _httpx.Response(201, json={"html_url": "https://gh/nope"})
+
+    t = _httpx.MockTransport(handler)
+    out = file_github_issue(_valid_proposal(), "curl https://x", "curl <safe_url>", "o/r", "tok", transport=t)
+    assert out["status"] == "duplicate"
+    assert out["url"] == "https://gh/issues/9"
+    assert calls["post"] == 0
