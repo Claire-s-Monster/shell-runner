@@ -56,7 +56,7 @@ from .models import (
     ShellStatusRequest,
     ShellStatusResponse,
 )
-from .persistence import DEFAULT_DB_PATH, Persistence, TelemetryWriter
+from .persistence import DEFAULT_DB_PATH, CatalogWriter, Persistence, TelemetryWriter
 from .seeds import DEFAULT_SEED_APPROVALS
 
 logger = logging.getLogger(__name__)
@@ -233,10 +233,15 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     await telemetry_writer.start()
     application.state.telemetry_writer = telemetry_writer
 
+    catalog_writer = CatalogWriter(db)
+    await catalog_writer.start()
+    application.state.catalog_writer = catalog_writer
+
     try:
         yield
     finally:
         await telemetry_writer.stop()
+        await catalog_writer.stop()
 
         _cleanup_task.cancel()
         try:
@@ -258,6 +263,7 @@ async def _execute_approved_command(
     req: ExecuteRequest,
     prompt: dict,
     telemetry_writer: TelemetryWriter | None,
+    catalog_writer: CatalogWriter | None,
     t0: float,
     consumed_via: str,
 ) -> ExecuteResponse:
@@ -329,13 +335,21 @@ async def _execute_approved_command(
                 decision_path=[consumed_via, "execution_recheck_deny"],
                 normalizer_warnings=list(recheck_cls.normalizer_warnings),
             )
-        await asyncio.to_thread(
-            db.upsert_template,
-            template=recheck_cls.template,
-            agent_id=req.agent_id,
-            current_tier=int(recheck_cls.tier),
-            was_denied=True,
-        )
+        if catalog_writer is not None:
+            await catalog_writer.submit(
+                template=recheck_cls.template,
+                agent_id=req.agent_id,
+                current_tier=int(recheck_cls.tier),
+                was_denied=True,
+            )
+        else:
+            await asyncio.to_thread(
+                db.upsert_template,
+                template=recheck_cls.template,
+                agent_id=req.agent_id,
+                current_tier=int(recheck_cls.tier),
+                was_denied=True,
+            )
         return ExecuteResponse(
             decision="denied",
             tier=int(recheck_cls.tier),
@@ -390,13 +404,21 @@ async def _execute_approved_command(
                 decision_path=[consumed_via, "background"],
                 normalizer_warnings=[],
             )
-        await asyncio.to_thread(
-            db.upsert_template,
-            template=prompt["normalized_template"],
-            agent_id=req.agent_id,
-            current_tier=prompt["command_tier"],
-            was_denied=False,
-        )
+        if catalog_writer is not None:
+            await catalog_writer.submit(
+                template=prompt["normalized_template"],
+                agent_id=req.agent_id,
+                current_tier=prompt["command_tier"],
+                was_denied=False,
+            )
+        else:
+            await asyncio.to_thread(
+                db.upsert_template,
+                template=prompt["normalized_template"],
+                agent_id=req.agent_id,
+                current_tier=prompt["command_tier"],
+                was_denied=False,
+            )
         job_id = await execute_background(
             command=req.command,
             cwd=req.cwd,
@@ -461,13 +483,21 @@ async def _execute_approved_command(
             decision_path=[consumed_via],
             normalizer_warnings=[],
         )
-    await asyncio.to_thread(
-        db.upsert_template,
-        template=prompt["normalized_template"],
-        agent_id=req.agent_id,
-        current_tier=prompt["command_tier"],
-        was_denied=False,
-    )
+    if catalog_writer is not None:
+        await catalog_writer.submit(
+            template=prompt["normalized_template"],
+            agent_id=req.agent_id,
+            current_tier=prompt["command_tier"],
+            was_denied=False,
+        )
+    else:
+        await asyncio.to_thread(
+            db.upsert_template,
+            template=prompt["normalized_template"],
+            agent_id=req.agent_id,
+            current_tier=prompt["command_tier"],
+            was_denied=False,
+        )
     return ExecuteResponse(
         decision="executed",
         tier=prompt["command_tier"],
@@ -506,6 +536,7 @@ def _compute_suggestions(template: str, agent_id: str) -> list[ExecuteSuggestion
 async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteResponse:
     t0 = time.monotonic()
     telemetry_writer = getattr(request.app.state, "telemetry_writer", None)
+    catalog_writer = getattr(request.app.state, "catalog_writer", None)
 
     # Path A: approve_token provided — skip classification, validate token
     if req.approve_token:
@@ -521,7 +552,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 status_code=403, detail="approve_token does not match command/cwd/agent"
             )
         return await _execute_approved_command(
-            req, prompt, telemetry_writer, t0, "approve_token consumed"
+            req, prompt, telemetry_writer, catalog_writer, t0, "approve_token consumed"
         )
 
     # Path B: no token — classify first
@@ -570,13 +601,21 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 decision_path=list(cls.decision_path),
                 normalizer_warnings=list(cls.normalizer_warnings),
             )
-        await asyncio.to_thread(
-            db.upsert_template,
-            template=cls.template,
-            agent_id=req.agent_id,
-            current_tier=int(cls.tier),
-            was_denied=True,
-        )
+        if catalog_writer is not None:
+            await catalog_writer.submit(
+                template=cls.template,
+                agent_id=req.agent_id,
+                current_tier=int(cls.tier),
+                was_denied=True,
+            )
+        else:
+            await asyncio.to_thread(
+                db.upsert_template,
+                template=cls.template,
+                agent_id=req.agent_id,
+                current_tier=int(cls.tier),
+                was_denied=True,
+            )
         deny_reason = (
             f"DENIED by {cls.matched_rule.pattern!r}: {cls.matched_rule.reason}"
             if cls.matched_rule
@@ -638,13 +677,21 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     decision_path=list(cls.decision_path) + ["background"],
                     normalizer_warnings=list(cls.normalizer_warnings),
                 )
-            await asyncio.to_thread(
-                db.upsert_template,
-                template=cls.template,
-                agent_id=req.agent_id,
-                current_tier=int(cls.tier),
-                was_denied=False,
-            )
+            if catalog_writer is not None:
+                await catalog_writer.submit(
+                    template=cls.template,
+                    agent_id=req.agent_id,
+                    current_tier=int(cls.tier),
+                    was_denied=False,
+                )
+            else:
+                await asyncio.to_thread(
+                    db.upsert_template,
+                    template=cls.template,
+                    agent_id=req.agent_id,
+                    current_tier=int(cls.tier),
+                    was_denied=False,
+                )
             job_id = await execute_background(
                 command=req.command,
                 cwd=req.cwd,
@@ -709,13 +756,21 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 decision_path=list(cls.decision_path),
                 normalizer_warnings=list(cls.normalizer_warnings),
             )
-        await asyncio.to_thread(
-            db.upsert_template,
-            template=cls.template,
-            agent_id=req.agent_id,
-            current_tier=int(cls.tier),
-            was_denied=False,
-        )
+        if catalog_writer is not None:
+            await catalog_writer.submit(
+                template=cls.template,
+                agent_id=req.agent_id,
+                current_tier=int(cls.tier),
+                was_denied=False,
+            )
+        else:
+            await asyncio.to_thread(
+                db.upsert_template,
+                template=cls.template,
+                agent_id=req.agent_id,
+                current_tier=int(cls.tier),
+                was_denied=False,
+            )
         return ExecuteResponse(
             decision="executed",
             tier=int(cls.tier),
@@ -740,7 +795,12 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
     )
     if consumed is not None:
         return await _execute_approved_command(
-            req, consumed, telemetry_writer, t0, "approve_once consumed (token-less)"
+            req,
+            consumed,
+            telemetry_writer,
+            catalog_writer,
+            t0,
+            "approve_once consumed (token-less)",
         )
 
     # T3/T4 — create pending prompt, return prompt_required
@@ -855,6 +915,7 @@ async def observe_route(request: Request, req: ObserveRequest) -> ObserveRespons
     cls = classify(req.command, req.cwd, req.agent_id)
     telemetry_id = str(uuid.uuid4())
     telemetry_writer = getattr(request.app.state, "telemetry_writer", None)
+    catalog_writer = getattr(request.app.state, "catalog_writer", None)
     if telemetry_writer is not None:
         await telemetry_writer.submit(
             call_id=telemetry_id,          # ← fixes UUID mismatch
@@ -874,13 +935,21 @@ async def observe_route(request: Request, req: ObserveRequest) -> ObserveRespons
             decision_path=["observe_endpoint"],
             normalizer_warnings=list(cls.normalizer_warnings),
         )
-    await asyncio.to_thread(            # ← fixes blocking upsert
-        db.upsert_template,
-        template=cls.template,
-        agent_id=req.agent_id,
-        current_tier=int(cls.command_tier),
-        was_denied=False,
-    )
+    if catalog_writer is not None:
+        await catalog_writer.submit(
+            template=cls.template,
+            agent_id=req.agent_id,
+            current_tier=int(cls.command_tier),
+            was_denied=False,
+        )
+    else:
+        await asyncio.to_thread(
+            db.upsert_template,
+            template=cls.template,
+            agent_id=req.agent_id,
+            current_tier=int(cls.command_tier),
+            was_denied=False,
+        )
     return ObserveResponse(
         telemetry_id=telemetry_id,
         classified_tier=int(cls.command_tier),
