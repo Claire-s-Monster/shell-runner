@@ -658,6 +658,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     duration_ms=int((time.monotonic() - t0) * 1000),
                     decision_path=list(cls.decision_path) + ["background"],
                     normalizer_warnings=list(cls.normalizer_warnings),
+                    wait=True,
                 )
             else:
                 db.record_call(
