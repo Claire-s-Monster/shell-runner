@@ -384,6 +384,7 @@ async def _execute_approved_command(
                 duration_ms=int((time.monotonic() - t0) * 1000),
                 decision_path=[consumed_via, "background"],
                 normalizer_warnings=[],
+                wait=True,
             )
         else:
             db.record_call(

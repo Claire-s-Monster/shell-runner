@@ -316,17 +316,33 @@ async def execute_background(
     stdout_file.close()
     stderr_file.close()
 
-    persistence.create_job(
-        job_id=job_id,
-        telemetry_id=telemetry_id,
-        raw_cmd=command,
-        cwd=cwd,
-        agent_id=agent_id,
-        timeout_s=timeout_s,
-        stdout_path=str(stdout_path),
-        stderr_path=str(stderr_path),
-        pid=proc.pid,
-    )
+    try:
+        persistence.create_job(
+            job_id=job_id,
+            telemetry_id=telemetry_id,
+            raw_cmd=command,
+            cwd=cwd,
+            agent_id=agent_id,
+            timeout_s=timeout_s,
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            pid=proc.pid,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to persist job row for job %s; killing orphaned process (pid %d)",
+            job_id,
+            proc.pid,
+        )
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            logger.exception("Error reaping killed process for job %s", job_id)
+        raise
 
     async def _watch() -> None:
         try:

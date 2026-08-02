@@ -1004,11 +1004,17 @@ class TelemetryWriter:
             except asyncio.QueueEmpty:
                 break
 
-    async def submit(self, **kwargs: Any) -> None:
-        """Enqueue a record for async writing.  Never blocks the caller.
+    async def submit(self, *, wait: bool = False, **kwargs: Any) -> None:
+        """Enqueue a record for async writing.  Never blocks the caller by default.
 
         If the queue is full the record is silently dropped and
         :attr:`dropped_count` is incremented (telemetry is best-effort).
+
+        If ``wait`` is True, blocks until this specific record has been
+        processed by the single drain task — write ordering/serialization is
+        still preserved (all records go through the same queue), only this
+        caller waits. Required when the caller's next statement depends on
+        the row already being visible, e.g. an FK-dependent insert.
         """
         if self._stopping:
             self.dropped_count += 1
@@ -1017,6 +1023,10 @@ class TelemetryWriter:
                 self.dropped_count,
             )
             return
+        done: asyncio.Future[None] | None = None
+        if wait:
+            done = asyncio.get_running_loop().create_future()
+            kwargs["_done_future"] = done
         try:
             self._queue.put_nowait(kwargs)
         except asyncio.QueueFull:
@@ -1025,6 +1035,9 @@ class TelemetryWriter:
                 "TelemetryWriter queue full — dropped telemetry record (total dropped: %d)",
                 self.dropped_count,
             )
+            return
+        if done is not None:
+            await done
 
     async def _drain_loop(self) -> None:
         """Continuously drain the queue, writing each record to SQLite off-thread."""
@@ -1033,16 +1046,25 @@ class TelemetryWriter:
                 record = await self._queue.get()
             except asyncio.CancelledError:
                 break
+            done_future = record.pop("_done_future", None)
             cancelled = False
+            write_exc: BaseException | None = None
             try:
                 await asyncio.to_thread(self._persistence.record_call, **record)
             except asyncio.CancelledError:
                 cancelled = True
+                write_exc = asyncio.CancelledError()
                 logger.warning("TelemetryWriter: drain interrupted by cancellation")
-            except Exception:
+            except Exception as exc:
+                write_exc = exc
                 logger.exception("TelemetryWriter: error writing telemetry record; dropping")
             finally:
                 self._queue.task_done()
+                if done_future is not None and not done_future.done():
+                    if write_exc is not None:
+                        done_future.set_exception(write_exc)
+                    else:
+                        done_future.set_result(None)
             if cancelled:
                 break
 
