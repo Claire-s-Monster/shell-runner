@@ -5,6 +5,7 @@ Routes:
     POST /classify        — dry-run classification only
     POST /observe         — record an externally-executed command for T3 promotion review
     POST /approve_pending — approve or deny a pending prompt
+    POST /pending         — read-only inspection of pending prompts
     GET  /health          — service health stats
     POST /mcp             — MCP JSON-RPC 2.0 endpoint (Claude Code "type": "http" transport)
     GET  /mcp             — SSE keepalive stream for MCP server-push notifications
@@ -35,9 +36,9 @@ from .classifier import (
     ClassificationResult,
     _cap_permissiveness,
     classify,
-    lookup_agent_cap,
+    is_primary_identity,
 )
-from .executor import OUTPUT_TAIL_BYTES, execute, execute_background
+from .executor import OUTPUT_TAIL_BYTES, execute, execute_background, validate_cwd
 from .mcp_wrapper import TOOLS
 from .models import (
     ApproveRequest,
@@ -48,14 +49,18 @@ from .models import (
     ExecuteRequest,
     ExecuteResponse,
     ExecuteSuggestion,
+    GetPendingRequest,
+    GetPendingResponse,
     HealthResponse,
     ObserveRequest,
     ObserveResponse,
+    PendingPromptDetail,
     ShellKillRequest,
     ShellKillResponse,
     ShellStatusRequest,
     ShellStatusResponse,
 )
+from .normalizer import describe_template_scope
 from .persistence import DEFAULT_DB_PATH, CatalogWriter, Persistence, TelemetryWriter
 from .seeds import DEFAULT_SEED_APPROVALS
 
@@ -541,16 +546,42 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 
     # Path A: approve_token provided — skip classification, validate token
     if req.approve_token:
+        # Peek (non-consuming) and validate the token's binding BEFORE
+        # consuming it: consuming first meant a caller who retried with a
+        # corrected cwd had already burned the approval (issue #36,
+        # secondary observation 1).
+        peek = db.peek_approve_token(token=req.approve_token)
+        if peek is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "invalid or expired approve_token (tokens are single-use, are bound "
+                    "to the exact command/cwd/agent of the original prompt, and expire; "
+                    "request a fresh prompt)"
+                ),
+            )
+        mismatches: list[str] = []
+        if peek["raw_cmd"] != req.command:
+            mismatches.append(
+                f"command is bound to {peek['raw_cmd'][:200]!r} but request used "
+                f"{req.command[:200]!r}"
+            )
+        if peek["cwd"] != req.cwd:
+            mismatches.append(f"cwd is bound to '{peek['cwd']}' but request used '{req.cwd}'")
+        if peek["agent_id"] != req.agent_id:
+            mismatches.append(
+                f"agent_id is bound to '{peek['agent_id']}' but request used '{req.agent_id}'"
+            )
+        if mismatches:
+            raise HTTPException(
+                status_code=403,
+                detail="approve_token does not match: " + "; ".join(mismatches),
+            )
         prompt = db.consume_approve_token(token=req.approve_token)
         if prompt is None:
-            raise HTTPException(status_code=403, detail="invalid or expired approve_token")
-        if (
-            prompt["raw_cmd"] != req.command
-            or prompt["cwd"] != req.cwd
-            or prompt["agent_id"] != req.agent_id
-        ):
             raise HTTPException(
-                status_code=403, detail="approve_token does not match command/cwd/agent"
+                status_code=403,
+                detail="approve_token was already consumed or expired",
             )
         return await _execute_approved_command(
             req, prompt, telemetry_writer, catalog_writer, t0, "approve_token consumed"
@@ -805,6 +836,64 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             "approve_once consumed (token-less)",
         )
 
+    # T3/T4 — reject an unusable cwd before creating a pending prompt: this
+    # prevents an approval from being spent on a command whose cwd can never
+    # be honoured (issue #36, secondary observation 2).
+    cwd_error = validate_cwd(req.cwd)
+    if cwd_error is not None:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        telemetry_id = str(uuid.uuid4())
+        if telemetry_writer is not None:
+            await telemetry_writer.submit(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                decision="denied",
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=duration_ms,
+                decision_path=list(cls.decision_path) + ["invalid_cwd"],
+                normalizer_warnings=list(cls.normalizer_warnings),
+            )
+        else:
+            db.record_call(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                decision="denied",
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                exit_code=None,
+                stdout_bytes=0,
+                stderr_bytes=0,
+                duration_ms=duration_ms,
+                decision_path=list(cls.decision_path) + ["invalid_cwd"],
+                normalizer_warnings=list(cls.normalizer_warnings),
+            )
+        return ExecuteResponse(
+            decision="denied",
+            tier=int(cls.tier),
+            matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
+            exit_code=None,
+            stdout="",
+            stderr=cwd_error,
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=duration_ms,
+            telemetry_id=telemetry_id,
+        )
+
     # T3/T4 — create pending prompt, return prompt_required
     prompt_id = db.create_pending_prompt(
         agent_id=req.agent_id,
@@ -993,6 +1082,32 @@ def _validate_promotion_tier(promote_to_tier: int | None, original_tier: int) ->
     return promoted_tier
 
 
+def _prompt_detail(row: dict) -> PendingPromptDetail:
+    """Build a PendingPromptDetail from a pending_prompts row dict, so an
+    approver can see what they are deciding on before and after approving
+    (issue #37).
+
+    Uses `row.get` for the optional columns because not every query against
+    pending_prompts selects every column (e.g. get_pending_prompt does not
+    select created_at, but list_pending_prompts does).
+    """
+    return PendingPromptDetail(
+        id=row["id"],
+        agent_id=row["agent_id"],
+        cwd=row["cwd"],
+        raw_cmd=row["raw_cmd"],
+        normalized_template=row["normalized_template"],
+        command_tier=row["command_tier"],
+        matched_rule_category=row.get("matched_rule_category"),
+        created_at=row.get("created_at"),
+        expires_at=row.get("expires_at"),
+        approve_decision=row.get("approve_decision"),
+        approved_at=row.get("approved_at"),
+        consumed_at=row.get("consumed_at"),
+        scope_warning=describe_template_scope(row["normalized_template"]),
+    )
+
+
 @app.post("/approve_pending", response_model=ApproveResponse)
 async def approve_route(req: ApproveRequest) -> ApproveResponse:
     # Fetch the pending prompt (if any) before applying the decision, so the
@@ -1007,27 +1122,47 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     # security boundary — it raises the bar against accidental or careless
     # self-approval, but a malicious caller can still lie about its identity.
     # Full authenticated-identity enforcement is tracked in issue #29.
-    if req.approver_agent_id:
-        executor_agent_id = prompt_for_guard["agent_id"] if prompt_for_guard else None
-        if req.approver_agent_id == executor_agent_id:
-            raise HTTPException(
-                status_code=403,
-                detail="self-approval not allowed: approver must differ from the executing agent",
-            )
-        if lookup_agent_cap(req.approver_agent_id) != Tier.DENY:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "approver lacks approval capability "
-                    "(a DENY-capability/primary identity is required)"
-                ),
-            )
-    else:
-        logger.warning(
-            "approve_pending: prompt %s approved without an authenticated approver "
-            "identity (approver_agent_id not supplied) — self-approval and capability "
-            "checks were skipped; see issue #29",
-            req.prompt_id,
+    #
+    # approver_agent_id is now REQUIRED (issue #36): omitting it used to only
+    # log a warning and skip the self-approval and capability checks below
+    # entirely, making the omitted path strictly more permissive than
+    # supplying one.
+    if not req.approver_agent_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "approver_agent_id is required: supply the primary session's identity "
+                "(e.g. 'primary' or 'primary-session-<id>'). Approving without an "
+                "approver identity is no longer permitted — the omitted path previously "
+                "skipped the self-approval and capability checks entirely, making it "
+                "strictly more permissive than supplying one (issue #36)."
+            ),
+        )
+
+    executor_agent_id = prompt_for_guard["agent_id"] if prompt_for_guard else None
+    if req.approver_agent_id == executor_agent_id:
+        raise HTTPException(
+            status_code=403,
+            detail="self-approval not allowed: approver must differ from the executing agent",
+        )
+    # Defense in depth: unreachable in normal operation because primary
+    # identities now carry a DENY execute cap and cannot create prompts at
+    # all — it exists so the guard does not depend on that invariant holding.
+    if is_primary_identity(req.approver_agent_id) and is_primary_identity(executor_agent_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "self-approval not allowed: a primary identity may not approve a prompt "
+                "created by another primary identity"
+            ),
+        )
+    if not is_primary_identity(req.approver_agent_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "approver lacks approval capability "
+                "(a DENY-capability/primary identity is required)"
+            ),
         )
 
     token = db.approve_prompt(prompt_id=req.prompt_id, decision=req.decision)
@@ -1080,6 +1215,11 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         promoted_tier_out = promoted_tier
         catalog_entry_id = str(entry_id)
 
+    # issue #37 — echo back the post-approval state of the prompt so the
+    # caller can verify what was actually acted on.
+    row = db.get_pending_prompt(req.prompt_id)
+    detail = _prompt_detail(row) if row is not None else None
+
     return ApproveResponse(
         applied=True,
         approve_token=token,
@@ -1087,7 +1227,26 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         catalog_entry_id=catalog_entry_id,
         verb_promoted=verb_promoted,
         promoted_tier=promoted_tier_out,
+        approved=detail,
+        scope_warning=detail.scope_warning if detail is not None else None,
     )
+
+
+@app.post("/pending", response_model=GetPendingResponse)
+async def get_pending_route(body: GetPendingRequest) -> GetPendingResponse:
+    """Inspect pending prompts without mutating them.
+
+    Exists so the approver is not deciding blind (issue #37): it lets a
+    caller see the full detail of a specific pending prompt, or list all
+    outstanding (or resolved) ones, before calling /approve_pending.
+    """
+    if body.prompt_id is not None:
+        row = db.get_pending_prompt(body.prompt_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"prompt {body.prompt_id} not found")
+        return GetPendingResponse(prompts=[_prompt_detail(row)])
+    rows = db.list_pending_prompts(include_resolved=body.include_resolved)
+    return GetPendingResponse(prompts=[_prompt_detail(r) for r in rows])
 
 
 @app.post("/tools/shell_status", response_model=ShellStatusResponse)
@@ -1313,6 +1472,14 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
             logger.exception("Invalid arguments for shell_approve_pending")
             return {"error": "invalid arguments"}
         return (await approve_route(approve_req)).model_dump()
+
+    if tool_name == "shell_get_pending":
+        try:
+            pending_req = GetPendingRequest(**arguments)
+        except Exception:
+            logger.exception("Invalid arguments for shell_get_pending")
+            return {"error": "invalid arguments"}
+        return (await get_pending_route(pending_req)).model_dump()
 
     if tool_name == "shell_health":
         return (await health_route()).model_dump()

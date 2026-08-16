@@ -135,6 +135,27 @@ def _truncate_output(
     return truncated, str(overflow_path) if overflow_path is not None else None
 
 
+def validate_cwd(cwd: str) -> str | None:
+    """Return a human-readable error message if cwd is unusable, else None.
+
+    Shared by execute(), execute_background(), and the T3/T4 prompt-creation
+    path in server.py so that a command whose cwd can never be honoured is
+    rejected at classify/prompt time rather than after an approval token has
+    already been spent on it (issue #36).
+    """
+    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+    with _cwd_roots_lock:
+        current_roots = list(_CWD_ROOTS)
+    if not any(resolved.is_relative_to(r) for r in current_roots):
+        sorted_roots = sorted(str(r) for r in current_roots)
+        return f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"
+    if not resolved.exists():
+        return f"cwd does not exist: {cwd}"
+    if not resolved.is_dir():
+        return f"cwd is not a directory: {cwd}"
+    return None
+
+
 def execute(
     *,
     command: str,
@@ -147,36 +168,12 @@ def execute(
     """Run command via /bin/bash with cwd jail, env stripping, timeout, output truncation."""
     import time
 
-    # Validate cwd — resolve symlinks and enforce containment under any configured root.
-    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
-    with _cwd_roots_lock:
-        current_roots = list(_CWD_ROOTS)
-    if not any(resolved.is_relative_to(r) for r in current_roots):
-        sorted_roots = sorted(str(r) for r in current_roots)
+    cwd_error = validate_cwd(cwd)
+    if cwd_error is not None:
         return ExecutionResult(
             exit_code=-3,
             stdout="",
-            stderr=f"cwd escapes allowed root(s) {sorted_roots}: {cwd}",
-            stdout_full_path=None,
-            stderr_full_path=None,
-            duration_ms=0,
-            timed_out=False,
-        )
-    if not resolved.exists():
-        return ExecutionResult(
-            exit_code=-3,
-            stdout="",
-            stderr=f"cwd does not exist: {cwd}",
-            stdout_full_path=None,
-            stderr_full_path=None,
-            duration_ms=0,
-            timed_out=False,
-        )
-    if not resolved.is_dir():
-        return ExecutionResult(
-            exit_code=-3,
-            stdout="",
-            stderr=f"cwd is not a directory: {cwd}",
+            stderr=cwd_error,
             stdout_full_path=None,
             stderr_full_path=None,
             duration_ms=0,
@@ -270,17 +267,9 @@ async def execute_background(
     Foreground execution path is completely unchanged.
     """
     # Validate cwd — same logic as foreground execute()
-    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
-    with _cwd_roots_lock:
-        current_roots = list(_CWD_ROOTS)
-    if not any(resolved.is_relative_to(r) for r in current_roots):
-        sorted_roots = sorted(str(r) for r in current_roots)
-        msg = f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"
-        raise ValueError(msg)
-    if not resolved.exists():
-        raise ValueError(f"cwd does not exist: {cwd}")
-    if not resolved.is_dir():
-        raise ValueError(f"cwd is not a directory: {cwd}")
+    cwd_error = validate_cwd(cwd)
+    if cwd_error is not None:
+        raise ValueError(cwd_error)
 
     job_id = str(uuid.uuid4())
     job_dir = _job_dir_base() / job_id

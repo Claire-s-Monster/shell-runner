@@ -87,6 +87,32 @@ class ClassifyResponse(BaseModel):
     segments: list[dict]
 
 
+class PendingPromptDetail(BaseModel):
+    """Full detail of a pending prompt, so an approver can see what they are
+    deciding on before and after approving (issue #37).
+
+    `normalized_template` is the form that approve_template /
+    approve_template_global / approve_verb actually promote — it may be
+    materially broader than `raw_cmd`, because the normalizer collapses
+    absolute paths into placeholders. `scope_warning` is set when that
+    widening is present.
+    """
+
+    id: str
+    agent_id: str
+    cwd: str
+    raw_cmd: str
+    normalized_template: str
+    command_tier: int
+    matched_rule_category: str | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
+    approve_decision: str | None = None
+    approved_at: str | None = None
+    consumed_at: str | None = None
+    scope_warning: str | None = None
+
+
 class ApproveRequest(BaseModel):
     prompt_id: str
     decision: Literal[
@@ -104,6 +130,22 @@ class ApproveResponse(BaseModel):
     catalog_entry_id: str | None
     verb_promoted: bool = False
     promoted_tier: int | None = None
+    # issue #37 — echo back what this approval actually acted on, so a wrong
+    # approval (e.g. an agent silently rewrote the command before submitting)
+    # is at least detectable after the fact.
+    approved: PendingPromptDetail | None = None
+    scope_warning: str | None = None
+
+
+class GetPendingRequest(BaseModel):
+    """Inspect pending prompts. Omit prompt_id to list all outstanding ones."""
+
+    prompt_id: str | None = None
+    include_resolved: bool = False
+
+
+class GetPendingResponse(BaseModel):
+    prompts: list[PendingPromptDetail]
 
 
 class HealthResponse(BaseModel):
