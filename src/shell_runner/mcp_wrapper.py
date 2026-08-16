@@ -142,15 +142,12 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "prompt_id": {
                     "type": ["string", "null"],
-                    "description": (
-                        "Specific prompt to inspect; omit to list all outstanding."
-                    ),
+                    "description": ("Specific prompt to inspect; omit to list all outstanding."),
                 },
                 "include_resolved": {
                     "type": "boolean",
                     "description": (
-                        "Also include prompts already approved/denied/consumed. "
-                        "Default false."
+                        "Also include prompts already approved/denied/consumed. " "Default false."
                     ),
                 },
             },

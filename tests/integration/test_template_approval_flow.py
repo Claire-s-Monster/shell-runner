@@ -62,7 +62,11 @@ def _approve(
     decision: str,
     promote_to_tier: int | None = None,
 ) -> dict:
-    body: dict = {"prompt_id": prompt_id, "decision": decision}
+    body: dict = {
+        "prompt_id": prompt_id,
+        "decision": decision,
+        "approver_agent_id": "primary",
+    }
     if promote_to_tier is not None:
         body["promote_to_tier"] = promote_to_tier
     resp = client.post("/approve_pending", json=body)

@@ -419,3 +419,31 @@ def test_execute_cwd_outside_allowed_roots_denied_creates_no_prompt(
         # later tests (and this fixture's own teardown) see consistent state.
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/")
         importlib.reload(shell_runner.executor)
+
+
+def test_execute_nonexistent_cwd_denied_creates_no_prompt(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """issue #36 secondary obs. 2, other branch: a T3/T4 command whose cwd
+    does not exist on disk (validate_cwd's `not resolved.exists()` check) is
+    denied at prompt-creation time, same as a cwd outside the allowed roots,
+    and no pending prompt is created for it."""
+    nonexistent_cwd = str(tmp_path / "does-not-exist")
+
+    resp = client.post(
+        "/execute",
+        json={
+            "command": "pip install requests",
+            "cwd": nonexistent_cwd,
+            "agent_id": "focused-ghc-ci-analyzer",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["decision"] == "denied"
+    assert "does not exist" in data["stderr"]
+
+    pending_resp = client.post("/pending", json={})
+    assert pending_resp.status_code == 200
+    raw_cmds = {p["raw_cmd"] for p in pending_resp.json()["prompts"]}
+    assert "pip install requests" not in raw_cmds

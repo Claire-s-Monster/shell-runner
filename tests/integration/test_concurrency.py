@@ -79,7 +79,11 @@ def test_concurrent_approve_token_consume(
     # Approve it to get a token
     r2 = client.post(
         "/approve_pending",
-        json={"prompt_id": prompt_id, "decision": "approve_once"},
+        json={
+            "prompt_id": prompt_id,
+            "decision": "approve_once",
+            "approver_agent_id": "primary",
+        },
     )
     assert r2.status_code == 200
     token = r2.json()["approve_token"]

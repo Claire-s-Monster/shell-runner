@@ -161,7 +161,7 @@ def test_approve_pending_approve_once_returns_token(client: TestClient, fresh_db
 
     resp = client.post(
         "/approve_pending",
-        json={"prompt_id": pid, "decision": "approve_once"},
+        json={"prompt_id": pid, "decision": "approve_once", "approver_agent_id": "primary"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -186,7 +186,7 @@ def test_approve_pending_deny_returns_no_token(client: TestClient, fresh_db: Pat
 
     resp = client.post(
         "/approve_pending",
-        json={"prompt_id": pid, "decision": "deny"},
+        json={"prompt_id": pid, "decision": "deny", "approver_agent_id": "primary"},
     )
     assert resp.status_code == 200
     data = resp.json()
@@ -283,10 +283,16 @@ def test_approve_pending_primary_approver_succeeds(client: TestClient, fresh_db:
     assert data["approve_token"] is not None
 
 
-def test_approve_pending_omitted_approver_still_succeeds(
+def test_approve_pending_omitted_approver_is_rejected(
     client: TestClient, fresh_db: Path
 ) -> None:
-    """approver_agent_id omitted -> approval still succeeds (backward compat)."""
+    """approver_agent_id omitted -> 403 (issue #36).
+
+    This test previously asserted the omitted path SUCCEEDED; #36 made that
+    path 403 because it skipped the self-approval and capability checks
+    entirely, making omission strictly more permissive than supplying an
+    identity.
+    """
     import shell_runner.server as srv
 
     db_inst: Persistence = srv.db
@@ -304,10 +310,9 @@ def test_approve_pending_omitted_approver_still_succeeds(
         "/approve_pending",
         json={"prompt_id": pid, "decision": "approve_once"},
     )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["applied"] is True
-    assert data["approve_token"] is not None
+    assert resp.status_code == 403
+    assert "approver_agent_id" in resp.json()["detail"]
+    assert "required" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
