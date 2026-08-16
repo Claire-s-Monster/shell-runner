@@ -180,6 +180,10 @@ def execute(
             timed_out=False,
         )
 
+    # validate_cwd() has already confirmed containment/existence; re-derive
+    # the resolved path here for use by subprocess.run below.
+    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+
     # Build restricted environment
     allowed = env_passthrough if env_passthrough is not None else DEFAULT_ENV_PASSTHROUGH
     env = {k: v for k, v in os.environ.items() if k in allowed}
@@ -270,6 +274,10 @@ async def execute_background(
     cwd_error = validate_cwd(cwd)
     if cwd_error is not None:
         raise ValueError(cwd_error)
+
+    # validate_cwd() has already confirmed containment/existence; re-derive
+    # the resolved path here for use by asyncio.create_subprocess_exec below.
+    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
 
     job_id = str(uuid.uuid4())
     job_dir = _job_dir_base() / job_id
