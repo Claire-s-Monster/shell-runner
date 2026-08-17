@@ -80,15 +80,17 @@ TOOLS: dict[str, dict[str, Any]] = {
     "shell_approve_pending": {
         "description": (
             "Approve or deny a pending shell command prompt. On approval, returns "
-            "approve_token to pass back to shell_execute. "
-            "PRIMARY SESSION ONLY — agents cannot call this themselves. When "
-            "approver_agent_id is supplied, the server partially enforces this "
-            "(rejects self-approval and non-primary approvers); when omitted, the "
-            "check is skipped for backward compatibility."
+            "approve_token to pass back to shell_execute, plus an echo of the "
+            "command that was actually approved (raw_cmd, normalized_template, "
+            "cwd, agent_id) so a wrong approval is detectable. "
+            "PRIMARY SESSION ONLY — agents cannot call this themselves. "
+            "approver_agent_id is REQUIRED: the server rejects self-approval and "
+            "non-primary approvers. Call shell_get_pending first to see what a "
+            "prompt_id actually refers to before approving it."
         ),
         "schema": {
             "type": "object",
-            "required": ["prompt_id", "decision"],
+            "required": ["prompt_id", "decision", "approver_agent_id"],
             "properties": {
                 "prompt_id": {"type": "string"},
                 "decision": {
@@ -111,11 +113,41 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "approver_agent_id": {
                     "type": "string",
                     "description": (
-                        "Identity of the approver (should be the primary/DENY-capability "
-                        "session, distinct from the command's executing agent). When "
-                        "supplied, the server rejects self-approval and non-primary "
-                        "approvers. NOTE: agent_id is self-asserted — this is a "
-                        "mitigation; authenticated identity is tracked in issue #29."
+                        "REQUIRED. Identity of the approver — the primary/DENY-capability "
+                        "session, and necessarily distinct from the command's executing "
+                        "agent. Accepts 'primary' or a suffixed form such as "
+                        "'primary-session-<id>'. Omitting it is no longer permitted: the "
+                        "omitted path used to skip the self-approval and capability checks "
+                        "entirely, making it strictly more permissive than supplying it "
+                        "(issue #36). NOTE: agent_id is self-asserted — this is a "
+                        "mitigation, not an authenticated boundary; see issue #29."
+                    ),
+                },
+            },
+        },
+    },
+    "shell_get_pending": {
+        "description": (
+            "Read-only inspection of pending T3/T4 approval prompts. Returns "
+            "raw_cmd, normalized_template, cwd, agent_id, command_tier and a "
+            "scope_warning for each prompt. Omit prompt_id to list all outstanding "
+            "prompts. Exists because the approver is otherwise deciding blind "
+            "(issue #37), and because normalization can silently widen what "
+            "approve_template promotes — e.g. 'rm -f /repo/.git/index.lock' "
+            "becomes 'rm -f <cwd_path>', granting auto-'rm -f' on ANY absolute "
+            "path. Mutates nothing; safe to call before every approval."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "prompt_id": {
+                    "type": ["string", "null"],
+                    "description": ("Specific prompt to inspect; omit to list all outstanding."),
+                },
+                "include_resolved": {
+                    "type": "boolean",
+                    "description": (
+                        "Also include prompts already approved/denied/consumed. " "Default false."
                     ),
                 },
             },

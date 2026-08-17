@@ -483,6 +483,58 @@ class Persistence:
             ).fetchone()
             return dict(row) if row is not None else None
 
+    def list_pending_prompts(
+        self, *, include_resolved: bool = False, limit: int = 100
+    ) -> list[dict]:
+        """List pending prompts so the approver can inspect what they are
+        deciding on (issue #37).
+
+        By default only actionable prompts are returned (no decision made
+        yet and not consumed). Expiry is intentionally not filtered in SQL:
+        the approver benefits from seeing a just-expired prompt rather than
+        it silently vanishing from the list.
+        """
+        query = """
+            SELECT id, raw_cmd, agent_id, cwd, normalized_template,
+                   command_tier, matched_rule_category, expires_at,
+                   approve_token, approve_decision, approved_at, consumed_at,
+                   created_at
+            FROM pending_prompts
+            {where}
+            ORDER BY created_at DESC, id
+            LIMIT ?
+        """
+        where = (
+            "" if include_resolved else "WHERE approve_decision IS NULL AND consumed_at IS NULL"
+        )
+        with self._conn() as conn:
+            rows = conn.execute(query.format(where=where), (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def peek_approve_token(self, *, token: str) -> dict | None:
+        """Look up the prompt bound to `token` without consuming it.
+
+        server.py:544 previously called consume_approve_token and only
+        THEN validated that the token's bound command/cwd/agent match the
+        request, so a caller who retries with a corrected cwd had already
+        burned the approval and had to go through a whole fresh
+        prompt/approve cycle. peek lets the server validate the binding
+        first and consume only on a match (issue #36, secondary
+        observation 1). This method never mutates a row: no consumed_at
+        write, no decision write.
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id, raw_cmd, agent_id, cwd, normalized_template,
+                       command_tier, matched_rule_category, expires_at, consumed_at
+                FROM pending_prompts
+                WHERE approve_token = ?
+                """,
+                (token,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
     def create_template_approval(
         self,
         *,

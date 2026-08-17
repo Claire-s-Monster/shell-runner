@@ -6,6 +6,7 @@ substitution for paths, URLs, and other variable tokens.
 
 Public API:
     normalize(command, cwd, *, env=None, safe_domains=None) -> NormalizedCommand
+    describe_template_scope(template) -> str | None
 """
 
 from __future__ import annotations
@@ -290,6 +291,21 @@ def classify_path(p: str, cwd: str, env: dict[str, str] | None) -> str:
         return "<home_path>"
 
     return "<abs_path>"
+
+
+# Path placeholders emitted by classify_path(), in the order they are first
+# produced above. A template containing one of these matches ANY path in that
+# category, not just the literal path that produced it — this is the scope-
+# widening risk that describe_template_scope() surfaces at approval time
+# (issue #37).
+PATH_PLACEHOLDERS: tuple[str, ...] = (
+    "<cwd_path>",
+    "<tmp_path>",
+    "<etc_path>",
+    "<system_path>",
+    "<home_path>",
+    "<abs_path>",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1039,3 +1055,24 @@ def normalize(
         NormalizedCommand with template, segments, placeholders, and warnings.
     """
     return _normalize_internal(command, cwd, env=env, safe_domains=safe_domains, depth=0)
+
+
+def describe_template_scope(template: str) -> str | None:
+    """Return a warning if promoting `template` would widen scope beyond the
+    literal command, else None.
+
+    A template containing path placeholders matches far more than the command
+    the approver saw: `rm -f <cwd_path>` grants auto-`rm -f` on any absolute
+    path, not just the one file that produced it. Surfacing this at approval
+    time is the point of issue #37.
+    """
+    present = [p for p in PATH_PLACEHOLDERS if p in template]
+    if not present:
+        return None
+    names = ", ".join(present)
+    plural = "these placeholders" if len(present) > 1 else "that placeholder"
+    return (
+        f"Template contains path placeholder(s) {names}: promoting this rule applies to "
+        f"ANY value matching {plural}, not just the observed command. Prefer approve_once "
+        "unless the broadened scope is genuinely intended."
+    )

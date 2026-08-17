@@ -77,13 +77,46 @@ KNOWN_AGENT_CAPS: dict[str, Tier] = {
 }
 
 
+PRIMARY_IDENTITY = "primary"
+
+
+def is_primary_identity(agent_id: str | None) -> bool:
+    """Return True if agent_id names the primary / DENY-capability session.
+
+    Accepts the bare "primary" plus the "primary-<suffix>" and "primary:<suffix>"
+    family, so a real primary session that qualifies its id with a session
+    discriminator (e.g. "primary-session-482f1f98") is still recognised.
+    Matching is case-insensitive and ignores surrounding whitespace.
+
+    This deliberately does NOT consult KNOWN_AGENT_CAPS. That registry falls
+    back to DEFAULT_AGENT_CAP (AUTO_CAPPED) for unrecognised agents — a
+    permissive default that is right for *execution* and exactly backwards for
+    deciding who may *approve*. Routing the approver guard through it made a
+    genuine suffixed primary id fail the guard while an omitted id skipped it
+    entirely (issue #36), and let a suffixed id claim AUTO_CAPPED execute
+    rights that the bare "primary" is denied.
+
+    Prefix matching does not widen the attack surface: agent_id is self-asserted
+    either way, so anything that could claim "primary-x" could already claim
+    "primary". See the guard in server.approve_route for why this is a
+    mitigation rather than a security boundary.
+    """
+    if not agent_id:
+        return False
+    candidate = agent_id.strip().lower()
+    if candidate == PRIMARY_IDENTITY:
+        return True
+    return candidate.startswith((f"{PRIMARY_IDENTITY}-", f"{PRIMARY_IDENTITY}:"))
+
+
 def lookup_agent_cap(agent_id: str | None) -> Tier:
     """Return the tier cap for the given agent_id.
 
-    None, empty string, or "primary" all resolve to Tier.DENY.
-    Unrecognized agent IDs fall back to DEFAULT_AGENT_CAP.
+    None, empty string, and any primary identity (see is_primary_identity)
+    all resolve to Tier.DENY. Unrecognized agent IDs fall back to
+    DEFAULT_AGENT_CAP.
     """
-    if not agent_id or agent_id == "primary":
+    if not agent_id or is_primary_identity(agent_id):
         return Tier.DENY
     return KNOWN_AGENT_CAPS.get(agent_id, DEFAULT_AGENT_CAP)
 

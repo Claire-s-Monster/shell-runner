@@ -100,6 +100,24 @@ def test_execute_respects_cwd(tmp_path: Path) -> None:
     assert str(sub) in result.stdout
 
 
+def test_execute_uses_resolved_symlink_target_not_symlink_path(tmp_path: Path) -> None:
+    """The path validated by resolve_cwd() must be the same path used by subprocess.run.
+
+    Guards against reintroducing a double-resolve TOCTOU: if execute() ever
+    re-derives cwd with its own realpath() call instead of reusing the value
+    returned by resolve_cwd(), a symlink swapped between the two calls could
+    run the process in a directory that was never validated.
+    """
+    target = tmp_path / "real_target"
+    target.mkdir()
+    link = tmp_path / "link_to_target"
+    link.symlink_to(target)
+
+    result = execute(command="pwd", cwd=str(link))
+    assert result.exit_code == 0
+    assert result.stdout.strip() == str(target.resolve())
+
+
 def test_execute_cwd_outside_jail_returns_minus_3(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/tmp")
     importlib.reload(shell_runner.executor)

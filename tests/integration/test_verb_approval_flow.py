@@ -44,7 +44,11 @@ def _execute(client: TestClient, command: str, cwd: str, agent_id: str) -> dict:
 
 
 def _approve(client: TestClient, prompt_id: str, decision: str, promote_to_tier: int | None = None):
-    body: dict = {"prompt_id": prompt_id, "decision": decision}
+    body: dict = {
+        "prompt_id": prompt_id,
+        "decision": decision,
+        "approver_agent_id": "primary",
+    }
     if promote_to_tier is not None:
         body["promote_to_tier"] = promote_to_tier
     return client.post("/approve_pending", json=body)
@@ -94,6 +98,10 @@ def test_approve_verb_promotion_does_not_apply_outside_cwd_prefix(
     assert resp.json()["verb_promoted"] is True
 
     outside = tmp_path.parent / f"sibling-{tmp_path.name}"
+    # must exist: the T3/T4 path now rejects an unhonourable cwd before
+    # minting a prompt (issue #36), so a nonexistent dir would return
+    # "denied" and this test is about cwd-PREFIX scope, not cwd existence.
+    outside.mkdir()
     data2 = _execute(client, "nonexistent_cmd_xyz --different-flag", str(outside), _AGENT_A)
     assert data2["decision"] == "prompt_required"
 
