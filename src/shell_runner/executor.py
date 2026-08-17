@@ -135,6 +135,29 @@ def _truncate_output(
     return truncated, str(overflow_path) if overflow_path is not None else None
 
 
+def resolve_cwd(cwd: str) -> tuple[Path | None, str | None]:
+    """Resolve cwd once and validate it, returning (resolved, None) on success
+    or (None, error_message) on failure.
+
+    Callers MUST use the returned path rather than re-deriving it with their own
+    realpath() call. Re-deriving opens a TOCTOU window: a symlink component
+    swapped between validation and use would let the process run in a directory
+    that was never validated. Resolving once and threading the validated value
+    through is what closes it.
+    """
+    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+    with _cwd_roots_lock:
+        current_roots = list(_CWD_ROOTS)
+    if not any(resolved.is_relative_to(r) for r in current_roots):
+        sorted_roots = sorted(str(r) for r in current_roots)
+        return None, f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"
+    if not resolved.exists():
+        return None, f"cwd does not exist: {cwd}"
+    if not resolved.is_dir():
+        return None, f"cwd is not a directory: {cwd}"
+    return resolved, None
+
+
 def validate_cwd(cwd: str) -> str | None:
     """Return a human-readable error message if cwd is unusable, else None.
 
@@ -142,18 +165,12 @@ def validate_cwd(cwd: str) -> str | None:
     path in server.py so that a command whose cwd can never be honoured is
     rejected at classify/prompt time rather than after an approval token has
     already been spent on it (issue #36).
+
+    This is the error-only view of resolve_cwd() for callers that only need
+    the failure message and do not need the resolved path itself.
     """
-    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
-    with _cwd_roots_lock:
-        current_roots = list(_CWD_ROOTS)
-    if not any(resolved.is_relative_to(r) for r in current_roots):
-        sorted_roots = sorted(str(r) for r in current_roots)
-        return f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"
-    if not resolved.exists():
-        return f"cwd does not exist: {cwd}"
-    if not resolved.is_dir():
-        return f"cwd is not a directory: {cwd}"
-    return None
+    _, error = resolve_cwd(cwd)
+    return error
 
 
 def execute(
@@ -168,7 +185,7 @@ def execute(
     """Run command via /bin/bash with cwd jail, env stripping, timeout, output truncation."""
     import time
 
-    cwd_error = validate_cwd(cwd)
+    resolved, cwd_error = resolve_cwd(cwd)
     if cwd_error is not None:
         return ExecutionResult(
             exit_code=-3,
@@ -179,10 +196,6 @@ def execute(
             duration_ms=0,
             timed_out=False,
         )
-
-    # validate_cwd() has already confirmed containment/existence; re-derive
-    # the resolved path here for use by subprocess.run below.
-    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
 
     # Build restricted environment
     allowed = env_passthrough if env_passthrough is not None else DEFAULT_ENV_PASSTHROUGH
@@ -271,13 +284,9 @@ async def execute_background(
     Foreground execution path is completely unchanged.
     """
     # Validate cwd — same logic as foreground execute()
-    cwd_error = validate_cwd(cwd)
+    resolved, cwd_error = resolve_cwd(cwd)
     if cwd_error is not None:
         raise ValueError(cwd_error)
-
-    # validate_cwd() has already confirmed containment/existence; re-derive
-    # the resolved path here for use by asyncio.create_subprocess_exec below.
-    resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
 
     job_id = str(uuid.uuid4())
     job_dir = _job_dir_base() / job_id
