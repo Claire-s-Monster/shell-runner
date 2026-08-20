@@ -149,8 +149,21 @@ class GetPendingResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """Service health snapshot.
+
+    total_calls_24h: every shell_calls row in the last 24h, including
+        passive 'observed_externally' /observe telemetry.
+    observed_24h: the subset of total_calls_24h with decision =
+        'observed_externally' (passive telemetry, not a gating decision).
+    denied_rate_24h / prompt_rate_24h: fraction of *gated* calls (i.e.
+        total_calls_24h - observed_24h) that were denied / required a
+        prompt. Passive observations are excluded from the denominator so
+        these rates reflect actual gating behavior.
+    """
+
     status: Literal["ok", "degraded"]
     total_calls_24h: int
+    observed_24h: int
     denied_rate_24h: float
     prompt_rate_24h: float
     p50_latency_ms: int
