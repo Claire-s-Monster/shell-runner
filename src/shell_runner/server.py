@@ -72,6 +72,30 @@ db = Persistence(db_path=_db_path)
 _cleanup_task: asyncio.Task[None] | None = None
 
 RETENTION_S = int(os.environ.get("SHELL_RUNNER_JOB_RETENTION_S", str(7 * 24 * 3600)))
+SHELL_CALLS_RETENTION_S = int(
+    os.environ.get("SHELL_CALLS_RETENTION_S", str(14 * 24 * 3600))
+)
+
+
+def _validate_shell_calls_retention(shell_calls_retention_s: float, job_retention_s: float) -> None:
+    """Fail loudly if SHELL_CALLS_RETENTION_S is shorter than RETENTION_S.
+
+    jobs.telemetry_id references shell_calls(id) with no ON DELETE clause,
+    and foreign_keys=ON, so pruning shell_calls rows still referenced by
+    live job rows would raise 'FOREIGN KEY constraint failed' every cleanup
+    cycle. This must never be silently clamped.
+    """
+    if shell_calls_retention_s < job_retention_s:
+        raise RuntimeError(
+            f"SHELL_CALLS_RETENTION_S ({shell_calls_retention_s}) must be >= "
+            f"RETENTION_S ({job_retention_s}): jobs.telemetry_id references "
+            "shell_calls(id) with no ON DELETE clause, and foreign_keys=ON, so "
+            "pruning shell_calls rows still referenced by live job rows would "
+            "raise 'FOREIGN KEY constraint failed' every cleanup cycle."
+        )
+
+
+_validate_shell_calls_retention(SHELL_CALLS_RETENTION_S, RETENTION_S)
 
 
 def _now_iso() -> str:
@@ -209,6 +233,12 @@ async def _periodic_cleanup(interval_s: int = 60) -> None:
                 logger.debug("Cleaned up %d stale job(s)", len(removed_jobs))
         except Exception:
             logger.exception("Error during periodic job cleanup")
+        try:
+            removed_shell_calls = db.cleanup_old_shell_calls(SHELL_CALLS_RETENTION_S)
+            if removed_shell_calls:
+                logger.debug("Cleaned up %d stale shell_calls row(s)", removed_shell_calls)
+        except Exception:
+            logger.exception("Error during periodic shell_calls cleanup")
 
 
 def _on_sighup() -> None:
@@ -1288,6 +1318,7 @@ async def health_route() -> HealthResponse:
     return HealthResponse(
         status="ok",
         total_calls_24h=stats["total_calls_24h"],
+        observed_24h=stats.get("observed_24h", 0),
         denied_rate_24h=stats["denied_rate_24h"],
         prompt_rate_24h=stats["prompt_rate_24h"],
         p50_latency_ms=stats.get("p50_latency_ms", 0),

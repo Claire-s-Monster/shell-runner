@@ -916,6 +916,54 @@ class Persistence:
                 )
         return removed
 
+    def cleanup_old_shell_calls(
+        self, retention_seconds: float, batch_size: int = 5000, max_batches: int = 10
+    ) -> int:
+        """Delete stale passive /observe telemetry from shell_calls.
+
+        Only rows with decision = 'observed_externally' are eligible for
+        deletion. Audit rows (executed, denied, prompt_required, running)
+        are NEVER deleted by this method, regardless of age — they are the
+        record relied on for approval/denial history and may still be
+        referenced by jobs.telemetry_id.
+
+        The cutoff is computed as an ISO-8601 UTC timestamp string in Python
+        and compared directly against the ts column (`ts < ?`) so the query
+        can use idx_shell_calls_ts. Do NOT wrap ts in julianday() or any
+        other function here — that would force a full scan of a 5M+ row
+        table.
+
+        Deletion is batched (at most batch_size rows per DELETE) and capped
+        at max_batches so a single call does bounded work and cannot stall
+        the periodic cleanup tick. Each DELETE auto-commits immediately
+        (connections use isolation_level=None). Stops early once a batch
+        deletes fewer than batch_size rows.
+
+        Returns the total number of rows deleted. Note: shell_calls' table
+        uses auto_vacuum=NONE, so deleting rows does not shrink the database
+        file — run VACUUM separately (e.g. during a low-traffic window) to
+        reclaim disk space.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(seconds=retention_seconds)).isoformat()
+        total_deleted = 0
+        with self._conn() as conn:
+            for _ in range(max_batches):
+                cursor = conn.execute(
+                    """
+                    DELETE FROM shell_calls WHERE id IN (
+                        SELECT id FROM shell_calls
+                        WHERE decision = 'observed_externally' AND ts < ?
+                        LIMIT ?
+                    )
+                    """,
+                    (cutoff, batch_size),
+                )
+                deleted = cursor.rowcount
+                total_deleted += deleted
+                if deleted < batch_size:
+                    break
+        return total_deleted
+
     # --- queries ---
 
     def telemetry_query(
@@ -955,6 +1003,13 @@ class Persistence:
             ).fetchone()
             total = total_row["cnt"] if total_row else 0
 
+            observed_row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM shell_calls"
+                " WHERE ts >= ? AND decision = 'observed_externally'",
+                (since_24h,),
+            ).fetchone()
+            observed = observed_row["cnt"] if observed_row else 0
+
             denied_row = conn.execute(
                 "SELECT COUNT(*) as cnt FROM shell_calls WHERE ts >= ? AND decision = 'denied'",
                 (since_24h,),
@@ -986,11 +1041,17 @@ class Persistence:
         p50 = _percentile(durations, 50)
         p99 = _percentile(durations, 99)
 
-        denied_rate = denied / total if total > 0 else 0.0
-        prompt_rate = prompted / total if total > 0 else 0.0
+        # denied_rate_24h / prompt_rate_24h are gating rates: they exclude
+        # passive 'observed_externally' /observe telemetry from the
+        # denominator so the rate reflects actual gating decisions rather
+        # than being diluted ~200x by passive observation volume.
+        gated_total = total - observed
+        denied_rate = denied / gated_total if gated_total > 0 else 0.0
+        prompt_rate = prompted / gated_total if gated_total > 0 else 0.0
 
         return {
             "total_calls_24h": total,
+            "observed_24h": observed,
             "denied_rate_24h": denied_rate,
             "prompt_rate_24h": prompt_rate,
             "p50_latency_ms": p50,
