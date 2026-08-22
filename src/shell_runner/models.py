@@ -47,13 +47,6 @@ class ExecutePromptInfo(BaseModel):
     why: str
 
 
-class ExecuteSuggestion(BaseModel):
-    template: str
-    tier: int
-    category: str
-    example: str | None = None
-
-
 class ExecuteResponse(BaseModel):
     decision: Literal["executed", "denied", "prompt_required", "reformulate_suggested", "running"]
     tier: int
@@ -66,7 +59,6 @@ class ExecuteResponse(BaseModel):
     duration_ms: int
     telemetry_id: str
     prompt: ExecutePromptInfo | None = None
-    suggestions: list[ExecuteSuggestion] | None = None
     job_id: str | None = None
 
 

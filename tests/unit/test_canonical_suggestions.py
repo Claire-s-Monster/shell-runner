@@ -1,12 +1,9 @@
-"""Unit tests for find_similar_approved_templates and _compute_suggestions."""
+"""Unit tests for find_similar_approved_templates."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
-from shell_runner.models import ExecuteSuggestion
 from shell_runner.persistence import Persistence
 
 
@@ -109,39 +106,3 @@ def test_example_raw_cmd_populated(tmp_path: Path) -> None:
     result = db.find_similar_approved_templates("curl <url>", "agent-a", min_similarity=0.0)
     assert len(result) == 1
     assert result[0][3] == "curl https://example.com --flag"
-
-
-# ---------------------------------------------------------------------------
-# _compute_suggestions unit tests (server helper, no HTTP round-trip)
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def patched_server(tmp_path: Path):
-    """Yield (_compute_suggestions fn, Persistence) with server's db swapped."""
-    import shell_runner.server as srv_mod
-
-    tmp_db = _db(tmp_path)
-    original_db = srv_mod.db
-    srv_mod.db = tmp_db
-    yield srv_mod._compute_suggestions, tmp_db
-    srv_mod.db = original_db
-
-
-def test_compute_suggestions_returns_none_when_no_neighbors(patched_server) -> None:  # type: ignore[type-arg]
-    compute, _ = patched_server
-    result = compute("curl <url>", "agent-a")
-    assert result is None
-
-
-def test_compute_suggestions_returns_executesuggestion_list(patched_server) -> None:  # type: ignore[type-arg]
-    compute, db = patched_server
-    _approve(db, "curl <url> --flag", tier=2)
-
-    result = compute("curl <url>", "agent-a")
-    assert result is not None
-    assert len(result) >= 1
-    suggestion = result[0]
-    assert isinstance(suggestion, ExecuteSuggestion)
-    assert suggestion.template == "curl <url> --flag"
-    assert suggestion.tier == 2
