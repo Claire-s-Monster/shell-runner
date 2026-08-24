@@ -48,7 +48,6 @@ from .models import (
     ExecutePromptInfo,
     ExecuteRequest,
     ExecuteResponse,
-    ExecuteSuggestion,
     GetPendingRequest,
     GetPendingResponse,
     HealthResponse,
@@ -396,7 +395,6 @@ async def _execute_approved_command(
             stderr_full_path=None,
             duration_ms=duration_ms,
             telemetry_id=telemetry_id,
-            suggestions=_compute_suggestions(recheck_cls.template, req.agent_id),
         )
 
     if req.run_in_background or req.output_mode == "file":
@@ -548,26 +546,6 @@ async def _execute_approved_command(
     )
 
 
-def _compute_suggestions(template: str, agent_id: str) -> list[ExecuteSuggestion] | None:
-    min_sim_env = os.environ.get("SHELL_RUNNER_SUGGESTION_MIN_SIMILARITY")
-    try:
-        min_similarity = float(min_sim_env) if min_sim_env is not None else 0.5
-    except ValueError:
-        min_similarity = 0.5
-    rows = db.find_similar_approved_templates(template, agent_id, min_similarity=min_similarity)
-    if not rows:
-        return None
-    return [
-        ExecuteSuggestion(
-            template=t,
-            tier=tier,
-            category=cat or "unknown",
-            example=ex,
-        )
-        for (t, tier, cat, ex) in rows
-    ]
-
-
 @app.post("/execute", response_model=ExecuteResponse)
 async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteResponse:
     t0 = time.monotonic()
@@ -694,7 +672,6 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             stderr_full_path=None,
             duration_ms=duration_ms,
             telemetry_id=telemetry_id,
-            suggestions=_compute_suggestions(cls.template, req.agent_id),
         )
 
     # T1/T2 — auto-execute
@@ -997,7 +974,6 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             tier=int(cls.tier),
             why=why,
         ),
-        suggestions=_compute_suggestions(cls.template, req.agent_id),
     )
 
 
