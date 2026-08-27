@@ -126,6 +126,42 @@ def test_deny_command_never_promoted_by_verb_approval(client: TestClient, tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# 3b. SECURITY: a hard-DENY command is never auto-executed even if a
+#     template_approval row exists for its exact normalized template.
+# ---------------------------------------------------------------------------
+
+
+def test_deny_command_never_promoted_by_template_approval(
+    client: TestClient, tmp_path: Path
+) -> None:
+    cwd = str(tmp_path)
+    cmd = "sudo apt-get update"
+
+    # Resolve the real normalized template via /classify so the approval row
+    # is guaranteed to match what the classifier will look up. Also assert the
+    # DENY precondition — otherwise this test could pass vacuously if "sudo"
+    # ever stopped classifying as DENY.
+    resp = client.post(
+        "/classify",
+        json={"command": cmd, "cwd": cwd, "agent_id": _AGENT_A},
+    )
+    assert resp.status_code == 200
+    cls_body = resp.json()
+    assert cls_body["command_tier"] == 0, "precondition: sudo must classify as DENY"
+    template = cls_body["template"]
+
+    # Simulate a pre-existing template approval (can never happen via the
+    # normal flow, since a DENY command never reaches prompt_required — but
+    # the guard must hold regardless of how the row got there).
+    server_module.db.create_template_approval(
+        template=template, agent_id=None, approved_tier=1
+    )
+
+    data = _execute(client, cmd, cwd, _AGENT_A)
+    assert data["decision"] == "denied"
+
+
+# ---------------------------------------------------------------------------
 # 4. approve_once durability: a token-less re-submit matching (cmd, cwd,
 #    agent) executes once; a second token-less attempt re-prompts.
 # ---------------------------------------------------------------------------

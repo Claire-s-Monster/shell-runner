@@ -566,7 +566,10 @@ class Persistence:
                 """,
                 (template, agent_id, approved_tier, now, approved_via_prompt_id),
             )
-            return int(cur.lastrowid)
+            row_id = cur.lastrowid
+            if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
+                raise RuntimeError("INSERT did not produce a rowid")
+            return row_id
 
     def seed_approvals(self, seeds: Iterable[SeedApproval]) -> int:
         """Idempotently insert seed approvals as global (agent_id IS NULL) rows.
@@ -660,7 +663,10 @@ class Persistence:
                 (verb, cwd_prefix, agent_id, approved_tier, now, approved_via_prompt_id),
             )
             conn.execute("COMMIT")
-            return int(cur.lastrowid)
+            row_id = cur.lastrowid
+            if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
+                raise RuntimeError("INSERT did not produce a rowid")
+            return row_id
 
     def get_verb_approved_tier(self, verb: str, cwd: str, agent_id: str) -> int | None:
         """Get the most restrictive approved tier among verb+cwd-prefix approvals
