@@ -20,9 +20,9 @@ REDACTED = "‹REDACTED›"
 # Rule 6 — known secret token shapes, redacted anywhere they appear.
 _TOKEN_SHAPES = [
     re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),  # JWT
-    re.compile(r"sk-[A-Za-z0-9]{20,}"),                                 # OpenAI-style
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"),                          # GitHub tokens
-    re.compile(r"AKIA[0-9A-Z]{16}"),                                    # AWS access key id
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),  # OpenAI-style
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"),  # GitHub tokens
+    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key id
 ]
 
 # Rules 1&2 — redact the value of EVERY -H/--header (over-redaction: header
@@ -82,8 +82,14 @@ def validate_proposal(obj: dict) -> dict:
     if not isinstance(obj, dict):
         raise ProposalError("proposal is not an object")
     required = {
-        "missed_reason", "existing_lever", "proposed_rule", "catalog_section",
-        "confidence", "dedupe_key", "issue_title", "risk_notes",
+        "missed_reason",
+        "existing_lever",
+        "proposed_rule",
+        "catalog_section",
+        "confidence",
+        "dedupe_key",
+        "issue_title",
+        "risk_notes",
     }
     missing = required - obj.keys()
     if missing:
@@ -108,7 +114,9 @@ def validate_proposal(obj: dict) -> dict:
         if rule["tier"] not in _TIERS:
             raise ProposalError(f"proposed_rule.tier must be one of {sorted(_TIERS)}")
         if rule["match_target"] not in _MATCH_TARGETS:
-            raise ProposalError(f"proposed_rule.match_target must be one of {sorted(_MATCH_TARGETS)}")
+            raise ProposalError(
+                f"proposed_rule.match_target must be one of {sorted(_MATCH_TARGETS)}"
+            )
         for k in ("pattern", "category", "reason"):
             if not isinstance(rule[k], str) or not rule[k].strip():
                 raise ProposalError(f"proposed_rule.{k} must be a non-empty string")
@@ -178,13 +186,15 @@ class AnalysisError(RuntimeError):
     """Raised when the read-only Claude analysis subprocess fails or returns unusable output."""
 
 
-READONLY_SETTINGS = json.dumps({
-    "permissions": {
-        "allow": ["Read", "Grep", "Glob"],
-        "deny": ["Bash", "Edit", "Write", "NotebookEdit", "mcp__*"],
-        "defaultMode": "dontAsk",
+READONLY_SETTINGS = json.dumps(
+    {
+        "permissions": {
+            "allow": ["Read", "Grep", "Glob"],
+            "deny": ["Bash", "Edit", "Write", "NotebookEdit", "mcp__*"],
+            "defaultMode": "dontAsk",
+        }
     }
-})
+)
 
 _SECRET_ENV_KEYS = ("SHELL_RUNNER_GH_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 
@@ -200,13 +210,22 @@ def _scrubbed_env() -> dict[str, str]:
 def _build_argv(claude_bin: str, prompt: str) -> list[str]:
     """Construct the deny-by-default read-only claude invocation."""
     return [
-        claude_bin, "-p", prompt,
-        "--output-format", "json",
-        "--permission-mode", "dontAsk",
-        "--allowedTools", "Read,Grep,Glob",
-        "--disallowedTools", "Bash,Edit,Write,NotebookEdit,mcp__*",
-        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-        "--settings", READONLY_SETTINGS,
+        claude_bin,
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools",
+        "Read,Grep,Glob",
+        "--disallowedTools",
+        "Bash,Edit,Write,NotebookEdit,mcp__*",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--settings",
+        READONLY_SETTINGS,
     ]
 
 
@@ -216,7 +235,7 @@ def _extract_json_object(text: str) -> dict:
     end = text.rfind("}")
     if start == -1 or end == -1 or end < start:
         raise AnalysisError("no JSON object found in analysis output")
-    return json.loads(text[start:end + 1])
+    return json.loads(text[start : end + 1])
 
 
 def run_claude_analysis(
@@ -234,8 +253,13 @@ def run_claude_analysis(
     argv = _build_argv(claude_bin, prompt)
     try:
         proc = subprocess.run(
-            argv, cwd=str(repo_dir), capture_output=True, text=True,
-            timeout=timeout_s, check=False, env=_scrubbed_env(),
+            argv,
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            env=_scrubbed_env(),
         )
     except subprocess.TimeoutExpired as exc:
         raise AnalysisError(f"analysis timed out after {timeout_s}s") from exc

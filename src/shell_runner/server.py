@@ -71,9 +71,7 @@ db = Persistence(db_path=_db_path)
 _cleanup_task: asyncio.Task[None] | None = None
 
 RETENTION_S = int(os.environ.get("SHELL_RUNNER_JOB_RETENTION_S", str(7 * 24 * 3600)))
-SHELL_CALLS_RETENTION_S = int(
-    os.environ.get("SHELL_CALLS_RETENTION_S", str(14 * 24 * 3600))
-)
+SHELL_CALLS_RETENTION_S = int(os.environ.get("SHELL_CALLS_RETENTION_S", str(14 * 24 * 3600)))
 
 
 def _validate_shell_calls_retention(shell_calls_retention_s: float, job_retention_s: float) -> None:
@@ -1015,7 +1013,7 @@ async def observe_route(request: Request, req: ObserveRequest) -> ObserveRespons
     catalog_writer = getattr(request.app.state, "catalog_writer", None)
     if telemetry_writer is not None:
         await telemetry_writer.submit(
-            call_id=telemetry_id,          # ← fixes UUID mismatch
+            call_id=telemetry_id,  # ← fixes UUID mismatch
             agent_id=req.agent_id,
             cwd=req.cwd,
             raw_cmd=req.command,

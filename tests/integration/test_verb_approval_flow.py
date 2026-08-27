@@ -153,9 +153,7 @@ def test_deny_command_never_promoted_by_template_approval(
     # Simulate a pre-existing template approval (can never happen via the
     # normal flow, since a DENY command never reaches prompt_required — but
     # the guard must hold regardless of how the row got there).
-    server_module.db.create_template_approval(
-        template=template, agent_id=None, approved_tier=1
-    )
+    server_module.db.create_template_approval(template=template, agent_id=None, approved_tier=1)
 
     data = _execute(client, cmd, cwd, _AGENT_A)
     assert data["decision"] == "denied"

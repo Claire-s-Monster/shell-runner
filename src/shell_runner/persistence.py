@@ -421,9 +421,7 @@ class Persistence:
                 "matched_rule_category": row["matched_rule_category"],
             }
 
-    def consume_approval_by_command(
-        self, *, raw_cmd: str, cwd: str, agent_id: str
-    ) -> dict | None:
+    def consume_approval_by_command(self, *, raw_cmd: str, cwd: str, agent_id: str) -> dict | None:
         """Atomically find and consume a durable approve_once approval by command.
 
         Mirrors consume_approve_token (same BEGIN IMMEDIATE serialisation and
@@ -504,9 +502,7 @@ class Persistence:
             ORDER BY created_at DESC, id
             LIMIT ?
         """
-        where = (
-            "" if include_resolved else "WHERE approve_decision IS NULL AND consumed_at IS NULL"
-        )
+        where = "" if include_resolved else "WHERE approve_decision IS NULL AND consumed_at IS NULL"
         with self._conn() as conn:
             rows = conn.execute(query.format(where=where), (limit,)).fetchall()
             return [dict(row) for row in rows]
@@ -760,9 +756,9 @@ class Persistence:
             ).fetchall()
 
             # Deduplicate: for same template keep most permissive tier; tie → prefer global
-            best: dict[str, tuple[int, str, int]] = (
-                {}
-            )  # template → (tier, approved_at, is_agent_scoped)
+            best: dict[
+                str, tuple[int, str, int]
+            ] = {}  # template → (tier, approved_at, is_agent_scoped)
             for row in rows:
                 tmpl = row["template"]
                 tier = row["approved_tier"]

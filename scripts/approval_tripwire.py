@@ -52,9 +52,7 @@ PATH_PLACEHOLDERS: tuple[str, ...] = (
 
 def _table_count(conn: sqlite3.Connection, table: str) -> int | None:
     """Return row count for `table`, or None if the table does not exist."""
-    cursor = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    )
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
     if cursor.fetchone() is None:
         return None
     return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608

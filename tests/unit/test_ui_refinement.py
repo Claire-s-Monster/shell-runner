@@ -10,12 +10,18 @@ R = "‹REDACTED›"
 @pytest.mark.parametrize(
     "raw,secret",
     [
-        ('curl -H "Authorization: Bearer sk-abc1234567890TOKENVALUE" https://api.x', "sk-abc1234567890TOKENVALUE"),
+        (
+            'curl -H "Authorization: Bearer sk-abc1234567890TOKENVALUE" https://api.x',
+            "sk-abc1234567890TOKENVALUE",
+        ),
         ("curl -u admin:hunter2 https://api.x", "hunter2"),
         ("curl --user=admin:hunter2 https://api.x", "hunter2"),
         ('curl --data "password=hunter2&x=1" https://api.x', "hunter2"),
         ('curl "https://api.x/v2?api_key=SECRETKEY123&page=2"', "SECRETKEY123"),
-        ("gh auth login --with-token ghp_0123456789abcdef0123456789abcdef0123", "ghp_0123456789abcdef0123456789abcdef0123"),
+        (
+            "gh auth login --with-token ghp_0123456789abcdef0123456789abcdef0123",
+            "ghp_0123456789abcdef0123456789abcdef0123",
+        ),
         ("echo eyJhbGciOi.eyJzdWIiOiIxIn0.sig-part", "eyJhbGciOi.eyJzdWIiOiIxIn0.sig-part"),
         ("curl -H 'X-Company-Auth: abc123def456xyz789' https://api.x", "abc123def456xyz789"),
     ],
@@ -47,8 +53,13 @@ def _valid_proposal():
     return {
         "missed_reason": "x",
         "existing_lever": "none",
-        "proposed_rule": {"pattern": "curl .*", "tier": "T2", "category": "net",
-                          "match_target": "template", "reason": "r"},
+        "proposed_rule": {
+            "pattern": "curl .*",
+            "tier": "T2",
+            "category": "net",
+            "match_target": "template",
+            "reason": "r",
+        },
         "catalog_section": "T2_AUTO_CAPPED",
         "confidence": 0.7,
         "dedupe_key": "curl-fam",
@@ -96,8 +107,14 @@ def test_build_analysis_prompt_redacts_raw_input():
         command_tier=4,
         matched_rule_category="network-write",
         decision_path=["segment 'curl': T4 -> ALWAYS_APPROVE"],
-        similar=[{"template": "curl <safe_url>", "approved_tier": 2,
-                  "similarity": 0.9, "example_raw_cmd": "curl -u me:PASSWORDX https://y"}],
+        similar=[
+            {
+                "template": "curl <safe_url>",
+                "approved_tier": 2,
+                "similarity": 0.9,
+                "example_raw_cmd": "curl -u me:PASSWORDX https://y",
+            }
+        ],
     )
     assert "sk-abc1234567890SECRETVALUE" not in p
     assert "PASSWORDX" not in p
@@ -109,8 +126,16 @@ def test_build_analysis_prompt_contains_context_and_schema():
     assert "wget <safe_url>" in p
     assert "src/shell_runner/catalog.py" in p
     assert "normalized_template" in p
-    for key in ["missed_reason", "existing_lever", "proposed_rule", "catalog_section",
-                "confidence", "dedupe_key", "issue_title", "risk_notes"]:
+    for key in [
+        "missed_reason",
+        "existing_lever",
+        "proposed_rule",
+        "catalog_section",
+        "confidence",
+        "dedupe_key",
+        "issue_title",
+        "risk_notes",
+    ]:
         assert key in p
 
 
@@ -123,12 +148,10 @@ from ui.refinement import AnalysisError, _build_argv, _scrubbed_env, run_claude_
 def _write_fake_claude(tmp_path, envelope, exit_code=0):
     script = tmp_path / "fakeclaude.py"
     script.write_text(
-        "import json, sys\n"
-        f"sys.stdout.write(json.dumps({envelope!r}))\n"
-        f"sys.exit({exit_code})\n"
+        f"import json, sys\nsys.stdout.write(json.dumps({envelope!r}))\nsys.exit({exit_code})\n"
     )
     launcher = tmp_path / "fakeclaude"
-    launcher.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n")
+    launcher.write_text(f'#!/bin/sh\nexec {sys.executable} {script} "$@"\n')
     launcher.chmod(0o755)
     return str(launcher)
 
@@ -138,7 +161,9 @@ def _proposal_text():
 
 
 def test_run_claude_analysis_parses_valid_envelope(tmp_path):
-    fake = _write_fake_claude(tmp_path, {"type": "result", "result": _proposal_text(), "is_error": False})
+    fake = _write_fake_claude(
+        tmp_path, {"type": "result", "result": _proposal_text(), "is_error": False}
+    )
     out = run_claude_analysis("p", tmp_path, claude_bin=fake, timeout_s=30)
     assert out["dedupe_key"] == "curl-fam"
     assert out["proposed_rule"]["tier"] == "T2"
@@ -151,7 +176,9 @@ def test_run_claude_analysis_is_error_raises(tmp_path):
 
 
 def test_run_claude_analysis_nonzero_exit_raises(tmp_path):
-    fake = _write_fake_claude(tmp_path, {"type": "result", "result": _proposal_text(), "is_error": False}, exit_code=1)
+    fake = _write_fake_claude(
+        tmp_path, {"type": "result", "result": _proposal_text(), "is_error": False}, exit_code=1
+    )
     with pytest.raises(AnalysisError):
         run_claude_analysis("p", tmp_path, claude_bin=fake, timeout_s=30)
 
@@ -188,7 +215,9 @@ def test_build_issue_body_has_marker_and_labels():
 
 
 def test_build_issue_body_redacts_defensively():
-    _, body, _ = build_issue_body(_valid_proposal(), "curl -u me:PASSWORDX https://x", "curl <safe_url>")
+    _, body, _ = build_issue_body(
+        _valid_proposal(), "curl -u me:PASSWORDX https://x", "curl <safe_url>"
+    )
     assert "PASSWORDX" not in body
     assert "‹REDACTED›" in body
 
@@ -218,10 +247,17 @@ def test_file_github_issue_creates_when_no_duplicate():
         return _httpx.Response(404)
 
     t = _httpx.MockTransport(handler)
-    out = file_github_issue(_valid_proposal(), "curl https://x", "curl <safe_url>", "o/r", "tok", transport=t)
+    out = file_github_issue(
+        _valid_proposal(), "curl https://x", "curl <safe_url>", "o/r", "tok", transport=t
+    )
     assert out == {"status": "created", "url": "https://gh/issues/2"}
     assert posted["auth"] == "Bearer tok"
-    assert posted["body"]["labels"] == ["classifier", "rule-enhancement", "ai-proposed", "needs-review"]
+    assert posted["body"]["labels"] == [
+        "classifier",
+        "rule-enhancement",
+        "ai-proposed",
+        "needs-review",
+    ]
 
 
 def test_file_github_issue_dedupes_without_posting():
@@ -235,7 +271,9 @@ def test_file_github_issue_dedupes_without_posting():
         return _httpx.Response(201, json={"html_url": "https://gh/nope"})
 
     t = _httpx.MockTransport(handler)
-    out = file_github_issue(_valid_proposal(), "curl https://x", "curl <safe_url>", "o/r", "tok", transport=t)
+    out = file_github_issue(
+        _valid_proposal(), "curl https://x", "curl <safe_url>", "o/r", "tok", transport=t
+    )
     assert out["status"] == "duplicate"
     assert out["url"] == "https://gh/issues/9"
     assert calls["post"] == 0

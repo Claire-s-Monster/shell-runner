@@ -83,7 +83,9 @@ def test_update_job_status_transitions_to_completed(tmp_path: Path) -> None:
     tid = _insert_shell_call(db)
     job_id = _create_job(db, tid)
 
-    db.update_job_status(job_id, status="completed", exit_code=0, finished_at="2026-01-01T00:00:00+00:00")
+    db.update_job_status(
+        job_id, status="completed", exit_code=0, finished_at="2026-01-01T00:00:00+00:00"
+    )
 
     job = db.get_job(job_id)
     assert job is not None
@@ -97,7 +99,9 @@ def test_update_job_status_transitions_to_timed_out(tmp_path: Path) -> None:
     tid = _insert_shell_call(db)
     job_id = _create_job(db, tid)
 
-    db.update_job_status(job_id, status="timed_out", exit_code=-1, finished_at="2026-01-01T00:01:00+00:00")
+    db.update_job_status(
+        job_id, status="timed_out", exit_code=-1, finished_at="2026-01-01T00:01:00+00:00"
+    )
 
     job = db.get_job(job_id)
     assert job is not None
@@ -140,7 +144,9 @@ def test_list_running_jobs_filters_correctly(tmp_path: Path) -> None:
     completed_id = _create_job(db, tid2, job_id="job-completed")
     killed_id = _create_job(db, tid3, job_id="job-killed")
 
-    db.update_job_status(completed_id, status="completed", exit_code=0, finished_at="2026-01-01T00:00:00+00:00")
+    db.update_job_status(
+        completed_id, status="completed", exit_code=0, finished_at="2026-01-01T00:00:00+00:00"
+    )
     db.update_job_status(killed_id, status="killed", finished_at="2026-01-01T00:00:00+00:00")
 
     running = db.list_running_jobs()
@@ -155,7 +161,9 @@ def test_list_running_jobs_empty_when_none_running(tmp_path: Path) -> None:
     db = _make_db(tmp_path)
     tid = _insert_shell_call(db)
     job_id = _create_job(db, tid, job_id="job-done")
-    db.update_job_status(job_id, status="completed", exit_code=0, finished_at="2026-01-01T00:00:01+00:00")
+    db.update_job_status(
+        job_id, status="completed", exit_code=0, finished_at="2026-01-01T00:00:01+00:00"
+    )
 
     assert db.list_running_jobs() == []
 

@@ -125,9 +125,9 @@ def test_template_matches(template, expected_tier, expected_category):
             if rule.tier == expected_tier and rule.category == expected_category:
                 matched_rule = rule
                 break
-    assert (
-        matched_rule is not None
-    ), f"No rule matched template={template!r} for tier={expected_tier.name} cat={expected_category}"
+    assert matched_rule is not None, (
+        f"No rule matched template={template!r} for tier={expected_tier.name} cat={expected_category}"
+    )
 
 
 def test_no_template_rule_matches_raw_t0_canonical():

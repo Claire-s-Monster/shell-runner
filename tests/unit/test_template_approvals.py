@@ -13,7 +13,9 @@ def _make_db(tmp_path: Path) -> Persistence:
     return Persistence(db_path=tmp_path / "test.sqlite3")
 
 
-def _insert_pending_prompt(db: Persistence, agent_id: str = "agent-a", command_tier: int = 3) -> str:
+def _insert_pending_prompt(
+    db: Persistence, agent_id: str = "agent-a", command_tier: int = 3
+) -> str:
     """Insert a pending prompt and return its id."""
     return db.create_pending_prompt(
         agent_id=agent_id,

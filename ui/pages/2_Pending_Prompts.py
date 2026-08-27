@@ -19,9 +19,7 @@ from ui.refinement import (
     run_claude_analysis,
 )
 
-REPO_DIR = Path(
-    os.environ.get("SHELL_RUNNER_REPO_DIR", str(Path(__file__).resolve().parents[2]))
-)
+REPO_DIR = Path(os.environ.get("SHELL_RUNNER_REPO_DIR", str(Path(__file__).resolve().parents[2])))
 CLAUDE_BIN = os.environ.get("SHELL_RUNNER_CLAUDE_BIN", "claude")
 ANALYSIS_TIMEOUT_S = int(os.environ.get("SHELL_RUNNER_ANALYSIS_TIMEOUT_S", "180"))
 GH_REPO = os.environ.get("SHELL_RUNNER_GH_REPO", "Claire-s-Monster/shell-runner")
@@ -55,9 +53,7 @@ def _render_reasoning(p):
         with st.expander("Why this needs approval"):
             for step in steps:
                 st.markdown(f"- {step}")
-    similar = get_similar_approvals(
-        p.get("normalized_template", ""), p.get("agent_id", "")
-    )
+    similar = get_similar_approvals(p.get("normalized_template", ""), p.get("agent_id", ""))
     with st.expander(f"Similar past approvals ({len(similar)})"):
         if not similar:
             st.write("None found.")
@@ -115,11 +111,7 @@ def _render_refinement(p):
             "📋 File GitHub issue",
             key=f"file_{pid}",
             disabled=file_disabled,
-            help=(
-                "Set SHELL_RUNNER_GH_TOKEN or GITHUB_TOKEN to enable"
-                if file_disabled
-                else None
-            ),
+            help=("Set SHELL_RUNNER_GH_TOKEN or GITHUB_TOKEN to enable" if file_disabled else None),
         ):
             try:
                 res = file_github_issue(
@@ -176,7 +168,9 @@ for p in prompts:
             b1, b2, b3, b4 = st.columns(4)
             if b1.button("Approve once", key=f"once_{pid}", type="primary"):
                 _act(pid, "approve_once", reason)
-            if b2.button("Approve template", key=f"tmpl_{pid}", help="Permanent for THIS agent only"):
+            if b2.button(
+                "Approve template", key=f"tmpl_{pid}", help="Permanent for THIS agent only"
+            ):
                 _act(pid, "approve_template", reason, promote_to_tier=promote_to_tier)
             if b3.button("Approve global", key=f"global_{pid}", help="Permanent for ALL agents"):
                 _act(pid, "approve_template_global", reason, promote_to_tier=promote_to_tier)

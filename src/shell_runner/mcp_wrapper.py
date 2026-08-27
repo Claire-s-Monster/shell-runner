@@ -147,7 +147,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "include_resolved": {
                     "type": "boolean",
                     "description": (
-                        "Also include prompts already approved/denied/consumed. " "Default false."
+                        "Also include prompts already approved/denied/consumed. Default false."
                     ),
                 },
             },

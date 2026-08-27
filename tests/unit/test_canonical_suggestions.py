@@ -63,7 +63,7 @@ def test_jaccard_ordering(tmp_path: Path) -> None:
 def test_global_precedence_over_agent_scoped(tmp_path: Path) -> None:
     db = _db(tmp_path)
     template = "curl <url> --flag"
-    _approve(db, template, tier=2, agent_id=None)       # global, more permissive
+    _approve(db, template, tier=2, agent_id=None)  # global, more permissive
     _approve(db, template, tier=4, agent_id="agent-a")  # agent-scoped, less permissive
 
     result = db.find_similar_approved_templates("curl <url>", "agent-a", min_similarity=0.0)

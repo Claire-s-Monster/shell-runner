@@ -122,6 +122,7 @@ def test_execute_cwd_outside_jail_returns_minus_3(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/tmp")
     importlib.reload(shell_runner.executor)
     from shell_runner.executor import execute as _execute
+
     result = _execute(command="echo hi", cwd="/etc")
     assert result.exit_code == -3
     assert "escapes allowed root" in result.stderr
@@ -137,6 +138,7 @@ def test_execute_cwd_inside_jail_works(monkeypatch: pytest.MonkeyPatch, tmp_path
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
         importlib.reload(shell_runner.executor)
         from shell_runner.executor import execute as _execute
+
         result = _execute(command="echo hello", cwd=str(sub))
         assert result.exit_code == 0
         assert "hello" in result.stdout
@@ -146,6 +148,7 @@ def test_execute_cwd_default_no_jail(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/")
     importlib.reload(shell_runner.executor)
     from shell_runner.executor import execute as _execute
+
     result = _execute(command="echo ok", cwd=str(tmp_path))
     assert result.exit_code == 0
     assert "ok" in result.stdout
@@ -160,6 +163,7 @@ def test_execute_cwd_relative_resolved_under_jail(monkeypatch: pytest.MonkeyPatc
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
         importlib.reload(shell_runner.executor)
         from shell_runner.executor import execute as _execute
+
         # Pass the full path (relative cwd behaviour depends on process cwd)
         result = _execute(command="echo relative_ok", cwd=str(sub))
         assert result.exit_code == 0
@@ -176,6 +180,7 @@ def test_execute_cwd_symlink_escape_rejected(monkeypatch: pytest.MonkeyPatch) ->
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", jail_dir)
         importlib.reload(shell_runner.executor)
         from shell_runner.executor import execute as _execute
+
         result = _execute(command="echo hi", cwd=str(link))
         assert result.exit_code == -3
         assert "escapes allowed root" in result.stderr
