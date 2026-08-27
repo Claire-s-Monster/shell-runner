@@ -16,6 +16,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
@@ -30,7 +32,6 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
-    "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",
     "pre-commit>=3.0.0",
@@ -92,14 +93,13 @@ bandit = ">=1.8.0"
 pre-commit = ">=4.0.0"
 
 [tool.pixi.feature.quality.pypi-dependencies]
-black = ">=23.0.0"
 build = ">=1.0.0"
 httpx = ">=0.27"
 pytest-timeout = ">=2.1.0"
 
 [tool.pixi.feature.quality.tasks]
 lint-fix = "ruff check --fix ."
-format-check = "ruff format --check ."
+format-check = "ruff format --check src/ tests/ ui/ scripts/"
 type-check = "mypy src/"
 security = "bandit -c pyproject.toml -r src/"
 pre-commit-install = "pre-commit install"
@@ -112,7 +112,7 @@ test-live = "pytest tests/live -v"
 test-all = "pytest tests/ -v"
 test-cov = "pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=html"
 lint = "ruff check src/"
-format = "black src/ tests/"
+format = "ruff format src/ tests/ ui/ scripts/"
 type-check-lenient = "mypy src/ || echo 'mypy: warnings found (non-blocking)'"
 quality = { depends-on = ["lint", "type-check-lenient"] }
 check-all = { depends-on = ["test", "quality"] }
@@ -159,10 +159,6 @@ select = [
     "RET", # flake8-return
 ]
 ignore = ["E501", "SIM105"]
-
-[tool.black]
-target-version = ["py311"]
-line-length = 100
 
 [tool.mypy]
 python_version = "3.11"
