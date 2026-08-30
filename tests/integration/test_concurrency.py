@@ -119,9 +119,7 @@ def test_concurrent_approve_token_consume(
     assert failure_count == 1, f"expected exactly one 403, got {failure_count}: {results}"
 
 
-def test_concurrent_template_upserts(
-    client: TestClient, tmp_path: Path, db_path: Path
-) -> None:
+def test_concurrent_template_upserts(client: TestClient, tmp_path: Path, db_path: Path) -> None:
     """15 concurrent agents hitting the same command keep a consistent template count."""
 
     def call(agent_id: str) -> None:
@@ -155,6 +153,4 @@ def test_concurrent_template_upserts(
     assert row["observed_count"] >= 15, (
         f"observed_count={row['observed_count']} < 15 (template={row['template']!r})"
     )
-    assert len(set(agents)) == 15, (
-        f"expected 15 distinct agents, got {len(set(agents))}: {agents}"
-    )
+    assert len(set(agents)) == 15, f"expected 15 distinct agents, got {len(set(agents))}: {agents}"

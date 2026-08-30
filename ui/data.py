@@ -52,9 +52,7 @@ def get_health(api_url: str = DEFAULT_API_URL, timeout: float = 2.0) -> dict[str
         return {"status": "unreachable", "error": str(exc)}
 
 
-def get_recent_calls(
-    db_path: Path = DEFAULT_DB_PATH, limit: int = 50
-) -> list[dict[str, Any]]:
+def get_recent_calls(db_path: Path = DEFAULT_DB_PATH, limit: int = 50) -> list[dict[str, Any]]:
     """Return the most recent N calls from shell_calls, ordered DESC by ts."""
     if not db_path.exists():
         return []
@@ -194,9 +192,12 @@ def get_similar_approvals(
                 "AND decision = 'executed' ORDER BY ts DESC LIMIT 1",
                 (t,),
             ).fetchone()
-            out.append({
-                "template": t, "approved_tier": tier,
-                "example_raw_cmd": call["raw_cmd"] if call else None,
-                "similarity": round(sim, 3),
-            })
+            out.append(
+                {
+                    "template": t,
+                    "approved_tier": tier,
+                    "example_raw_cmd": call["raw_cmd"] if call else None,
+                    "similarity": round(sim, 3),
+                }
+            )
     return out

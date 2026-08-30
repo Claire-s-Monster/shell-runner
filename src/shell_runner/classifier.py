@@ -305,7 +305,7 @@ def classify(
     command_tier = command_tier_seg.tier
     matched_rule = command_tier_seg.matched_rule
     decision_path.append(
-        f"pipe combined -> {command_tier.name}" f" (from segment {command_tier_seg.segment.verb!r})"
+        f"pipe combined -> {command_tier.name} (from segment {command_tier_seg.segment.verb!r})"
     )
 
     # Step 6: Apply agent cap -- least permissive of (command_tier, agent_cap).

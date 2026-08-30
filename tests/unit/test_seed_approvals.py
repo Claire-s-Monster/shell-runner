@@ -29,8 +29,7 @@ def _row_count(db: Persistence) -> int:
 def _fetch_row(db: Persistence, template: str) -> dict | None:
     with db._conn() as conn:
         row = conn.execute(
-            "SELECT template, agent_id, approved_tier FROM template_approvals"
-            " WHERE template = ?",
+            "SELECT template, agent_id, approved_tier FROM template_approvals WHERE template = ?",
             (template,),
         ).fetchone()
         return dict(row) if row is not None else None
@@ -154,9 +153,7 @@ def test_seeds_skip_agent_specific_approval(tmp_path: Path) -> None:
         ),
     ],
 )
-def test_default_seed_list_normalizes_to_same_form(
-    raw_cmd: str, expected_template: str
-) -> None:
+def test_default_seed_list_normalizes_to_same_form(raw_cmd: str, expected_template: str) -> None:
     result = normalize(raw_cmd, cwd="/tmp")
     assert result.template == expected_template, (
         f"normalize({raw_cmd!r}) -> {result.template!r}, expected {expected_template!r}"

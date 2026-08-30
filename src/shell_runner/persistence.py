@@ -421,9 +421,7 @@ class Persistence:
                 "matched_rule_category": row["matched_rule_category"],
             }
 
-    def consume_approval_by_command(
-        self, *, raw_cmd: str, cwd: str, agent_id: str
-    ) -> dict | None:
+    def consume_approval_by_command(self, *, raw_cmd: str, cwd: str, agent_id: str) -> dict | None:
         """Atomically find and consume a durable approve_once approval by command.
 
         Mirrors consume_approve_token (same BEGIN IMMEDIATE serialisation and
@@ -504,9 +502,7 @@ class Persistence:
             ORDER BY created_at DESC, id
             LIMIT ?
         """
-        where = (
-            "" if include_resolved else "WHERE approve_decision IS NULL AND consumed_at IS NULL"
-        )
+        where = "" if include_resolved else "WHERE approve_decision IS NULL AND consumed_at IS NULL"
         with self._conn() as conn:
             rows = conn.execute(query.format(where=where), (limit,)).fetchall()
             return [dict(row) for row in rows]
@@ -566,7 +562,10 @@ class Persistence:
                 """,
                 (template, agent_id, approved_tier, now, approved_via_prompt_id),
             )
-            return int(cur.lastrowid)
+            row_id = cur.lastrowid
+            if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
+                raise RuntimeError("INSERT did not produce a rowid")
+            return row_id
 
     def seed_approvals(self, seeds: Iterable[SeedApproval]) -> int:
         """Idempotently insert seed approvals as global (agent_id IS NULL) rows.
@@ -660,7 +659,10 @@ class Persistence:
                 (verb, cwd_prefix, agent_id, approved_tier, now, approved_via_prompt_id),
             )
             conn.execute("COMMIT")
-            return int(cur.lastrowid)
+            row_id = cur.lastrowid
+            if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
+                raise RuntimeError("INSERT did not produce a rowid")
+            return row_id
 
     def get_verb_approved_tier(self, verb: str, cwd: str, agent_id: str) -> int | None:
         """Get the most restrictive approved tier among verb+cwd-prefix approvals
@@ -754,9 +756,9 @@ class Persistence:
             ).fetchall()
 
             # Deduplicate: for same template keep most permissive tier; tie → prefer global
-            best: dict[str, tuple[int, str, int]] = (
-                {}
-            )  # template → (tier, approved_at, is_agent_scoped)
+            best: dict[
+                str, tuple[int, str, int]
+            ] = {}  # template → (tier, approved_at, is_agent_scoped)
             for row in rows:
                 tmpl = row["template"]
                 tier = row["approved_tier"]

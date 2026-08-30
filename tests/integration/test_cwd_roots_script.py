@@ -15,9 +15,7 @@ from pathlib import Path
 import pytest
 
 # Absolute path to the helper script being tested
-_SCRIPT = (
-    Path(__file__).parent.parent.parent / "scripts" / "cwd-roots.sh"
-).resolve()
+_SCRIPT = (Path(__file__).parent.parent.parent / "scripts" / "cwd-roots.sh").resolve()
 
 
 def _run(

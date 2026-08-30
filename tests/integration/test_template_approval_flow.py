@@ -32,8 +32,8 @@ def client() -> TestClient:
 
 
 # Agents used in tests
-_AGENT_A = "focused-ghc-ci-analyzer"   # ALWAYS_APPROVE cap
-_AGENT_B = "focused-patch-generator"   # ALWAYS_APPROVE cap
+_AGENT_A = "focused-ghc-ci-analyzer"  # ALWAYS_APPROVE cap
+_AGENT_B = "focused-patch-generator"  # ALWAYS_APPROVE cap
 _T3_CMD = "nonexistent_cmd_xyz --flag"
 _T3_CWD = "/tmp"
 

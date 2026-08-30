@@ -139,9 +139,11 @@ def _render_panel(candidate: dict[str, Any], position: int, total: int) -> Panel
 
 def _prompt_action() -> str:
     while True:
-        raw = console.input(
-            "\n[bold]\\[a]pprove / \\[d]eny / \\[s]kip / \\[q]uit[/bold]: "
-        ).strip().lower()
+        raw = (
+            console.input("\n[bold]\\[a]pprove / \\[d]eny / \\[s]kip / \\[q]uit[/bold]: ")
+            .strip()
+            .lower()
+        )
         if raw in ("a", "d", "s", "q"):
             return raw
         console.print("[yellow]Enter a, d, s, or q.[/yellow]")
@@ -170,9 +172,7 @@ def _print_summary(results: list[dict[str, Any]]) -> None:
     detail.add_column("Action")
     detail.add_column("Rationale")
     for r in recorded:
-        action_label = (
-            "[green]approve[/green]" if r["action"] == "approve" else "[red]deny[/red]"
-        )
+        action_label = "[green]approve[/green]" if r["action"] == "approve" else "[red]deny[/red]"
         detail.add_row(r["template"], action_label, r["rationale"] or "[dim]—[/dim]")
     console.print("\n[bold]Decisions[/bold]")
     console.print(detail)

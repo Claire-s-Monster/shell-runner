@@ -16,6 +16,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
@@ -30,7 +32,6 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
-    "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",
     "pre-commit>=3.0.0",
@@ -43,7 +44,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
-[tool.pixi.project]
+[tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64"]
 
@@ -77,23 +78,9 @@ daemon-status = { cmd = "scripts/shell-runner-daemon.sh status" }
 install-systemd = { cmd = "scripts/install-systemd.sh" }
 setup-scripts = { cmd = "python -c \"import os,stat; [os.chmod(f, os.stat(f).st_mode | 0o111) for f in ['scripts/shell-runner-daemon.sh','scripts/install-systemd.sh','scripts/cwd-roots.sh']]; print('scripts are executable')\"" }
 check-scripts = { cmd = "bash -n scripts/shell-runner-daemon.sh && bash -n scripts/install-systemd.sh && bash -n scripts/cwd-roots.sh && echo 'bash syntax OK'" }
-# Quality tasks
-test = "pytest tests/ -v --ignore=tests/live --ignore=tests/debug"
-test-unit = "pytest tests/unit -v"
-test-integration = "pytest tests/integration -v"
-test-debug = "pytest tests/debug -v"
-test-live = "pytest tests/live -v"
-test-all = "pytest tests/ -v"
-test-cov = "pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=html"
-lint = "ruff check src/ --fix"
-format = "black src/ tests/"
-type-check = "mypy src/"
 dead-code = "vulture src/ --min-confidence 80"
-quality = { depends-on = ["lint", "type-check-lenient"] }
-type-check-lenient = "mypy src/ || echo 'mypy: warnings found (non-blocking)'"
-check-all = { depends-on = ["test", "quality"] }
-build = "python -m build"
 verify-mcp-mount = "python scripts/verify_mcp_mount.py"
+approval-tripwire = "python scripts/approval_tripwire.py"
 
 [tool.pixi.feature.quality.dependencies]
 pytest = ">=8.0.0"
@@ -105,20 +92,30 @@ bandit = ">=1.8.0"
 pre-commit = ">=4.0.0"
 
 [tool.pixi.feature.quality.pypi-dependencies]
-black = ">=23.0.0"
 build = ">=1.0.0"
 httpx = ">=0.27"
 pytest-timeout = ">=2.1.0"
 
 [tool.pixi.feature.quality.tasks]
 lint-fix = "ruff check --fix ."
-format-check = "ruff format --check ."
+format = "ruff format src/ tests/ ui/ scripts/"
+format-check = "ruff format --check src/ tests/ ui/ scripts/"
 type-check = "mypy src/"
 security = "bandit -c pyproject.toml -r src/"
 pre-commit-install = "pre-commit install"
 pre-commit-run = "pre-commit run --all-files"
 test-unit = "pytest tests/unit -v"
 test-integration = "pytest tests/integration -v"
+test = "pytest tests/ -v --ignore=tests/live --ignore=tests/debug"
+test-debug = "pytest tests/debug -v"
+test-live = "pytest tests/live -v"
+test-all = "pytest tests/ -v"
+test-cov = "pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=html"
+lint = "ruff check src/"
+type-check-lenient = "mypy src/ || echo 'mypy: warnings found (non-blocking)'"
+quality = { depends-on = ["lint", "type-check-lenient"] }
+check-all = { depends-on = ["test", "quality"] }
+build = "python -m build"
 
 [tool.pixi.feature.quality-extended.dependencies]
 bandit = ">=1.7.0"
@@ -135,7 +132,7 @@ ui = "streamlit run $PIXI_PROJECT_ROOT/ui/app.py --server.address 127.0.0.1 --se
 
 [tool.pixi.environments]
 default = { solve-group = "default" }
-dev = { features = ["dev"], solve-group = "default" }
+dev = { features = ["quality"], solve-group = "default" }
 ci = { features = ["quality"], solve-group = "default" }
 quality-ci = { features = ["quality"], solve-group = "default" }
 quality-extended = { features = ["quality", "quality-extended"], solve-group = "default" }
@@ -161,10 +158,6 @@ select = [
     "RET", # flake8-return
 ]
 ignore = ["E501", "SIM105"]
-
-[tool.black]
-target-version = ["py311"]
-line-length = 100
 
 [tool.mypy]
 python_version = "3.11"

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Verify /health and /mcp endpoints respond on port 4112."""
+
 import json
 import os
 import subprocess
@@ -16,11 +17,16 @@ _env = {**os.environ, "SHELL_RUNNER_DB": "/tmp/sr-verify.sqlite3", "PYTHONPATH":
 # Start uvicorn on 4112 in the background
 proc = subprocess.Popen(
     [
-        sys.executable, "-m", "uvicorn",
+        sys.executable,
+        "-m",
+        "uvicorn",
         "shell_runner.server:app",
-        "--host", "127.0.0.1",
-        "--port", "4112",
-        "--log-level", "warning",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "4112",
+        "--log-level",
+        "warning",
     ],
     env=_env,
 )

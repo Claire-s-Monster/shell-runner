@@ -69,9 +69,9 @@ def test_t0_template_match_via_subshell_unsafe():
 def test_t4_before_t2_for_gh_api_post():
     """`gh api -X POST` must classify as T4, not the more permissive T2 `gh api \\S+`."""
     r = classify("gh api -X POST /repos/x/y/issues", CWD, "focused-ghc-ci-analyzer", env=ENV)
-    assert (
-        r.command_tier == Tier.ALWAYS_APPROVE
-    ), f"expected T4, got {r.command_tier.name}; path={r.decision_path}"
+    assert r.command_tier == Tier.ALWAYS_APPROVE, (
+        f"expected T4, got {r.command_tier.name}; path={r.decision_path}"
+    )
 
 
 def test_t4_before_t2_for_curl_post():

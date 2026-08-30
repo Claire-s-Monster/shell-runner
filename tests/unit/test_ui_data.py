@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from ui.data import get_health, get_pending_prompts, get_recent_calls, get_similar_approvals, parse_decision_path
+from ui.data import (
+    get_health,
+    get_pending_prompts,
+    get_recent_calls,
+    get_similar_approvals,
+    parse_decision_path,
+)
 
 
 def _make_db(tmp_path: Path) -> Path:
@@ -234,8 +240,9 @@ def _seed_similar(tmp_path):
 
 def test_get_similar_approvals_ranks_and_filters(tmp_path):
     db = _seed_similar(tmp_path)
-    out = get_similar_approvals("curl <safe_url> extra", agent_id="primary",
-                                db_path=db, limit=3, min_similarity=0.3)
+    out = get_similar_approvals(
+        "curl <safe_url> extra", agent_id="primary", db_path=db, limit=3, min_similarity=0.3
+    )
     templates = [row["template"] for row in out]
     assert "wget <safe_url>" not in templates
     assert "curl <safe_url> extra" not in templates
@@ -245,5 +252,6 @@ def test_get_similar_approvals_ranks_and_filters(tmp_path):
 
 
 def test_get_similar_approvals_missing_db_returns_empty(tmp_path):
-    assert get_similar_approvals("curl <safe_url>", "primary",
-                                 db_path=tmp_path / "nope.sqlite3") == []
+    assert (
+        get_similar_approvals("curl <safe_url>", "primary", db_path=tmp_path / "nope.sqlite3") == []
+    )

@@ -236,7 +236,8 @@ def test_get_mcp_route_exists_not_405(client: TestClient) -> None:
 
     scope = {"type": "http", "method": "GET", "path": "/mcp"}
     matched = any(
-        route.matches(scope)[0] == Match.FULL for route in client.app.routes  # type: ignore[attr-defined]
+        route.matches(scope)[0] == Match.FULL
+        for route in client.app.routes  # type: ignore[attr-defined]
     )
     assert matched, "GET /mcp route is not registered — Claude Code client will receive 405"
 
@@ -254,9 +255,7 @@ def test_resources_list_returns_empty(client: TestClient) -> None:
 
 
 def test_resources_templates_list_returns_empty(client: TestClient) -> None:
-    r = client.post(
-        "/mcp", json={"jsonrpc": "2.0", "method": "resources/templates/list", "id": 1}
-    )
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "method": "resources/templates/list", "id": 1})
     assert r.status_code == 200
     assert r.json()["result"] == {"resourceTemplates": []}
 

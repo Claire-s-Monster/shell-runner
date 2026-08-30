@@ -51,11 +51,11 @@ SAFE_DOMAINS_READ: frozenset[str] = frozenset(
         # pixi tooling docs
         "docs.pixi.sh",
         # CI-log artifact hosts
-        "*.blob.core.windows.net",        # Azure Blob Storage (GHA/conda-forge log artifacts)
+        "*.blob.core.windows.net",  # Azure Blob Storage (GHA/conda-forge log artifacts)
         "actions.githubusercontent.com",
-        "*.actions.githubusercontent.com", # GitHub Actions pipeline hosts
-        "objects.githubusercontent.com",   # GitHub artifact CDN
-        "pkgs.dev.azure.com",              # Azure DevOps package URLs
+        "*.actions.githubusercontent.com",  # GitHub Actions pipeline hosts
+        "objects.githubusercontent.com",  # GitHub artifact CDN
+        "pkgs.dev.azure.com",  # Azure DevOps package URLs
     }
 )
 
@@ -66,32 +66,76 @@ _EXEC_UNSAFE_VERBS: frozenset[str] = frozenset({"curl", "wget", "fetch"})
 _DESTRUCTIVE_VERBS: frozenset[str] = frozenset({"rm", "mv", "cp", "chmod"})
 
 # Pipeline filter verbs whose entire pipe segment is safe to collapse to <safe_pipe>
-SAFE_PIPE_FILTERS: frozenset[str] = frozenset({
-    "head", "tail", "grep", "wc", "awk", "sed", "cut",
-    "sort", "uniq", "jq", "tr", "less", "more", "cat",
-})
+SAFE_PIPE_FILTERS: frozenset[str] = frozenset(
+    {
+        "head",
+        "tail",
+        "grep",
+        "wc",
+        "awk",
+        "sed",
+        "cut",
+        "sort",
+        "uniq",
+        "jq",
+        "tr",
+        "less",
+        "more",
+        "cat",
+    }
+)
 
 # Verbs whose flag tokens (matching ^-+[A-Za-z]) are stripped from templates
-SAFE_FLAG_STRIP_VERBS: frozenset[str] = frozenset({
-    "curl", "wget", "ls", "pgrep", "ps", "head", "tail",
-    "grep", "wc", "awk", "sed", "cut", "sort", "uniq",
-    "jq", "tr", "find", "cat",
-})
+SAFE_FLAG_STRIP_VERBS: frozenset[str] = frozenset(
+    {
+        "curl",
+        "wget",
+        "ls",
+        "pgrep",
+        "ps",
+        "head",
+        "tail",
+        "grep",
+        "wc",
+        "awk",
+        "sed",
+        "cut",
+        "sort",
+        "uniq",
+        "jq",
+        "tr",
+        "find",
+        "cat",
+    }
+)
 
 # Per-verb flag preserve list. Even when verb is in SAFE_FLAG_STRIP_VERBS,
 # flags in this set are NEVER stripped — they carry security signal.
 FLAG_PRESERVE_FOR_VERB: dict[str, frozenset[str]] = {
-    "curl": frozenset({
-        "-X", "--request",
-        "-d", "--data", "--data-binary", "--data-raw", "--data-urlencode",
-        "-T", "--upload-file",
-        "-F", "--form",
-    }),
-    "wget": frozenset({
-        "--method",
-        "--post-data", "--post-file",
-        "--body-data", "--body-file",
-    }),
+    "curl": frozenset(
+        {
+            "-X",
+            "--request",
+            "-d",
+            "--data",
+            "--data-binary",
+            "--data-raw",
+            "--data-urlencode",
+            "-T",
+            "--upload-file",
+            "-F",
+            "--form",
+        }
+    ),
+    "wget": frozenset(
+        {
+            "--method",
+            "--post-data",
+            "--post-file",
+            "--body-data",
+            "--body-file",
+        }
+    ),
 }
 
 # Per-verb value-flags whose value should be replaced with <file_arg> in the
@@ -106,10 +150,26 @@ FLAG_VALUE_TO_FILE_ARG: dict[str, frozenset[str]] = {
 
 # Verbs that take file paths as positional args read-only. Path-classified
 # tokens (anywhere in the segment) become <file_arg> for these verbs.
-READ_ONLY_FILE_VERBS: frozenset[str] = frozenset({
-    "head", "tail", "cat", "wc", "grep", "awk", "sed", "cut",
-    "sort", "uniq", "jq", "tr", "less", "more", "find", "file",
-})
+READ_ONLY_FILE_VERBS: frozenset[str] = frozenset(
+    {
+        "head",
+        "tail",
+        "cat",
+        "wc",
+        "grep",
+        "awk",
+        "sed",
+        "cut",
+        "sort",
+        "uniq",
+        "jq",
+        "tr",
+        "less",
+        "more",
+        "find",
+        "file",
+    }
+)
 
 # Maximum subshell recursion depth before truncating
 _MAX_SUBSHELL_DEPTH = 3
@@ -691,10 +751,16 @@ def _normalize_segment(
                     next_classified = _classify_token(
                         next_tok, cwd, env, safe_domains, state, depth
                     )
-                    path_placeholders = frozenset({
-                        "<tmp_path>", "<cwd_path>", "<home_path>",
-                        "<system_path>", "<etc_path>", "<abs_path>",
-                    })
+                    path_placeholders = frozenset(
+                        {
+                            "<tmp_path>",
+                            "<cwd_path>",
+                            "<home_path>",
+                            "<system_path>",
+                            "<etc_path>",
+                            "<abs_path>",
+                        }
+                    )
                     if next_classified in path_placeholders:
                         deferred.append("<file_arg>")
                         i += 2
@@ -715,15 +781,18 @@ def _normalize_segment(
 
     # B2: for read-only file verbs, rewrite any path placeholder to <file_arg>.
     # This collapses e.g. `wc /tmp/x` and `wc ./x` to the same template `wc <file_arg>`.
-    path_placeholders_b2 = frozenset({
-        "<tmp_path>", "<cwd_path>", "<home_path>",
-        "<system_path>", "<etc_path>", "<abs_path>",
-    })
+    path_placeholders_b2 = frozenset(
+        {
+            "<tmp_path>",
+            "<cwd_path>",
+            "<home_path>",
+            "<system_path>",
+            "<etc_path>",
+            "<abs_path>",
+        }
+    )
     if verb in READ_ONLY_FILE_VERBS:
-        normalized = [
-            "<file_arg>" if t in path_placeholders_b2 else t
-            for t in normalized
-        ]
+        normalized = ["<file_arg>" if t in path_placeholders_b2 else t for t in normalized]
 
     # B3: redirect-destination collapse.
     # Any path placeholder immediately following a `>` or `>>` operator becomes

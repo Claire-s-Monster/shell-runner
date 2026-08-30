@@ -17,9 +17,7 @@ with hcol2:
         st.rerun()
 
 # Sidebar opt-in auto-refresh
-refresh_choice = st.sidebar.selectbox(
-    "Auto-refresh", ["Off", "30s", "60s", "5min"], index=0
-)
+refresh_choice = st.sidebar.selectbox("Auto-refresh", ["Off", "30s", "60s", "5min"], index=0)
 refresh_seconds = {"Off": 0, "30s": 30, "60s": 60, "5min": 300}[refresh_choice]
 
 health = get_health()

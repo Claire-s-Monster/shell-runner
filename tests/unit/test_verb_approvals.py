@@ -67,9 +67,7 @@ def test_get_verb_approved_tier_none_outside_prefix(tmp_path: Path) -> None:
     inside = tmp_path / "inside"
     inside.mkdir()
     outside = tmp_path.parent / f"sibling-{tmp_path.name}"
-    db.create_verb_approval(
-        verb="git", cwd_prefix=str(inside), agent_id="agent-a", approved_tier=2
-    )
+    db.create_verb_approval(verb="git", cwd_prefix=str(inside), agent_id="agent-a", approved_tier=2)
     result = db.get_verb_approved_tier("git", str(outside), "agent-a")
     assert result is None
 

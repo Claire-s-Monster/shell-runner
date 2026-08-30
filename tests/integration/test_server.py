@@ -283,9 +283,7 @@ def test_approve_pending_primary_approver_succeeds(client: TestClient, fresh_db:
     assert data["approve_token"] is not None
 
 
-def test_approve_pending_omitted_approver_is_rejected(
-    client: TestClient, fresh_db: Path
-) -> None:
+def test_approve_pending_omitted_approver_is_rejected(client: TestClient, fresh_db: Path) -> None:
     """approver_agent_id omitted -> 403 (issue #36).
 
     This test previously asserted the omitted path SUCCEEDED; #36 made that
