@@ -319,3 +319,71 @@ async def test_background_timeout_marks_timed_out(job_dir: Path) -> None:
         )
 
     assert final["status"] == "timed_out"
+
+
+async def test_background_timeout_sends_sigterm_before_sigkill(
+    job_dir: Path, tmp_path: Path
+) -> None:
+    """The background watcher's timeout path must also send a catchable
+    SIGTERM first: the trap writes a marker file that only a caught TERM
+    (not a SIGKILL) can produce. `sleep 30 & wait` (rather than a foreground
+    `sleep 30`) is required because bash does not run trap handlers while
+    blocked in a foreground `sleep`.
+
+    The `trap` builtin is an unrecognised verb, so it classifies as T3
+    (prompt_required) rather than auto-executing. Same two-step
+    prompt -> approve_verb -> retry dance as
+    test_approve_verb_promotion_auto_executes_variant_in_subdir in
+    test_verb_approval_flow.py: promote the verb to T2 (AUTO_CAPPED) so the
+    resubmitted command actually reaches the background execution path.
+    """
+    marker = tmp_path / "termed"
+    command = f"trap 'touch {marker}; exit 42' TERM; sleep 30 & wait"
+    agent_id = "focused-ghc-ci-analyzer"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        prompt_resp = await client.post(
+            "/execute",
+            json={"command": command, "cwd": str(tmp_path), "agent_id": agent_id},
+        )
+        assert prompt_resp.status_code == 200
+        prompt_data = prompt_resp.json()
+        assert prompt_data["decision"] == "prompt_required", f"expected a prompt, got {prompt_data}"
+        prompt_id = prompt_data["prompt"]["id"]
+
+        approve_resp = await client.post(
+            "/approve_pending",
+            json={
+                "prompt_id": prompt_id,
+                "decision": "approve_verb",
+                "promote_to_tier": 2,
+                "approver_agent_id": "primary",
+            },
+        )
+        assert approve_resp.status_code == 200
+        assert approve_resp.json()["verb_promoted"] is True
+
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": command,
+                "cwd": str(tmp_path),
+                "agent_id": agent_id,
+                "run_in_background": True,
+                "timeout_s": 1,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["decision"] == "running", f"expected background, got {data}"
+        job_id = data["job_id"]
+
+        final = await _wait_for_status(
+            client,
+            job_id,
+            terminal={"timed_out", "completed", "failed", "killed"},
+            timeout_s=8.0,
+        )
+
+    assert final["status"] == "timed_out"
+    assert marker.exists()
