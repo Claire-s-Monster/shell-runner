@@ -10,10 +10,13 @@ Runs commands via /bin/bash with:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import signal
 import subprocess
 import threading
+import time
 import tomllib
 import uuid
 from dataclasses import dataclass
@@ -29,6 +32,10 @@ if TYPE_CHECKING:
 OUTPUT_HEAD_BYTES = 4096
 OUTPUT_TAIL_BYTES = 4096
 DEFAULT_TIMEOUT_S = 30
+# Window a timed-out child gets to run its own cleanup (e.g. lockfile removal)
+# after SIGTERM before we escalate to SIGKILL. Module-level so tests can
+# monkeypatch it to keep timeout tests fast.
+TERMINATE_GRACE_S = 3.0
 
 DEFAULT_ENV_PASSTHROUGH = ["HOME", "USER", "PATH", "LANG", "TERM"]
 
@@ -173,6 +180,74 @@ def validate_cwd(cwd: str) -> str | None:
     return error
 
 
+def _signal_group(pid: int, sig: int) -> None:
+    """Send sig to the process group of pid, falling back to the bare pid.
+
+    Never signals shell-runner's own process group: if the child's pgid
+    matches ours (e.g. start_new_session failed to take effect), falls back
+    to signalling the bare child pid instead of killpg, to avoid the server
+    SIGTERM/SIGKILL-ing itself. Swallows ProcessLookupError/PermissionError
+    at every signal site since the process (or its group) may already have
+    exited by the time we signal it.
+    """
+    try:
+        pgid: int | None = os.getpgid(pid)
+    except ProcessLookupError:
+        pgid = None
+    if pgid is not None and pgid == os.getpgid(0):
+        logger.warning(
+            "Child pid %d shares shell-runner's own process group (%d); "
+            "signalling pid directly instead of killpg",
+            pid,
+            pgid,
+        )
+        pgid = None
+    try:
+        if pgid is not None:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _terminate_group_sync(proc: subprocess.Popen[bytes]) -> None:
+    """SIGTERM the process group led by proc, then SIGKILL it if still alive
+    after TERMINATE_GRACE_S.
+
+    Gives a child (e.g. git) a window to run its own cleanup — such as
+    removing a lockfile — before being force-killed. Used on the synchronous
+    foreground execute() path. proc.wait(timeout=...) both detects exit and
+    reaps the child; polling with os.kill(pid, 0) instead would report a
+    reaped-but-not-yet-collected zombie as "still alive" for the whole grace
+    window. Callers still call communicate() afterwards to drain any
+    buffered pipe output.
+    """
+    _signal_group(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=TERMINATE_GRACE_S)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(proc.pid, signal.SIGKILL)
+
+
+async def _terminate_group_async(proc: asyncio.subprocess.Process) -> None:
+    """Async counterpart of _terminate_group_sync for the background job path.
+
+    SIGTERM the process group led by proc, then SIGKILL it if still alive
+    after TERMINATE_GRACE_S. Callers must still await proc.wait() afterwards
+    to finish reaping.
+    """
+    _signal_group(proc.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=TERMINATE_GRACE_S)
+        return
+    except TimeoutError:
+        pass
+    _signal_group(proc.pid, signal.SIGKILL)
+
+
 def execute(
     *,
     command: str,
@@ -183,8 +258,6 @@ def execute(
     overflow_dir: str = str(_OVERFLOW_DIR),
 ) -> ExecutionResult:
     """Run command via /bin/bash with cwd jail, env stripping, timeout, output truncation."""
-    import time
-
     resolved, cwd_error = resolve_cwd(cwd)
     if cwd_error is not None:
         return ExecutionResult(
@@ -203,28 +276,43 @@ def execute(
 
     t0 = time.monotonic()
     timed_out = False
-    proc = None
 
     try:
-        proc = subprocess.run(  # noqa: S603
+        proc = subprocess.Popen(  # noqa: S603
             ["/bin/bash", "-c", command],
             cwd=str(resolved),
             env=env,
-            capture_output=True,
-            timeout=min(timeout_s, MAX_TIMEOUT_S),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-        exit_code = proc.returncode
-        raw_stdout = proc.stdout
-        raw_stderr = proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        exit_code = -1
-        raw_stdout = exc.stdout or b""
-        raw_stderr = exc.stderr or b""
     except Exception as exc:  # noqa: BLE001
         exit_code = -2
         raw_stdout = b""
         raw_stderr = str(exc).encode()
+    else:
+        try:
+            raw_stdout, raw_stderr = proc.communicate(timeout=min(timeout_s, MAX_TIMEOUT_S))
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            exit_code = -1
+            _terminate_group_sync(proc)
+            raw_stdout, raw_stderr = proc.communicate()
+            raw_stdout = raw_stdout or b""
+            raw_stderr = raw_stderr or b""
+        except Exception as exc:  # noqa: BLE001
+            exit_code = -2
+            raw_stdout = b""
+            raw_stderr = str(exc).encode()
+            _terminate_group_sync(proc)
+            with contextlib.suppress(Exception):
+                proc.communicate()
+        except BaseException:
+            _terminate_group_sync(proc)
+            with contextlib.suppress(Exception):
+                proc.communicate()
+            raise
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -340,10 +428,7 @@ async def execute_background(
             job_id,
             proc.pid,
         )
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        await _terminate_group_async(proc)
         try:
             await proc.wait()
         except Exception:
@@ -362,10 +447,7 @@ async def execute_background(
                 finished_at=_now_iso(),
             )
         except TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            await _terminate_group_async(proc)
             await proc.wait()
             persistence.update_job_status(
                 job_id,

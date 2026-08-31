@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import os
+import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,70 @@ def test_execute_timeout_kills_process(tmp_path: Path) -> None:
     result = execute(command="sleep 30", cwd=str(tmp_path), timeout_s=1)
     assert result.timed_out is True
     assert result.exit_code == -1
+
+
+def test_execute_timeout_sends_sigterm_before_sigkill(tmp_path: Path) -> None:
+    """A timed-out child must receive a catchable SIGTERM before any SIGKILL.
+
+    The trap writes a marker file and exits with code 42 on TERM; since
+    SIGKILL cannot be trapped, the marker's existence is proof SIGTERM (not
+    SIGKILL) arrived first. `sleep 30 & wait` (rather than a foreground
+    `sleep 30`) is required because bash does not run trap handlers while
+    blocked in a foreground `sleep` — it only checks for pending traps
+    between commands / while waiting on a child via `wait`.
+    """
+    marker = tmp_path / "termed"
+    command = f"trap 'touch {marker}; exit 42' TERM; sleep 30 & wait"
+    result = execute(command=command, cwd=str(tmp_path), timeout_s=1)
+    assert result.timed_out is True
+    assert marker.exists()
+    # Contract: exit_code is always -1 on timeout, regardless of what the
+    # trap itself exits with.
+    assert result.exit_code == -1
+
+
+def test_execute_timeout_escalates_to_sigkill_when_sigterm_ignored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the child ignores SIGTERM, executor must escalate to SIGKILL after
+    TERMINATE_GRACE_S rather than waiting out the child's full runtime.
+    """
+    monkeypatch.setattr(shell_runner.executor, "TERMINATE_GRACE_S", 0.5)
+    command = "trap '' TERM; sleep 30 & wait"
+
+    start = time.monotonic()
+    result = execute(command=command, cwd=str(tmp_path), timeout_s=1)
+    elapsed = time.monotonic() - start
+
+    assert result.timed_out is True
+    assert elapsed < 10, f"execute() took {elapsed}s; SIGKILL escalation did not force-kill"
+
+
+def test_execute_timeout_kills_whole_process_group(tmp_path: Path) -> None:
+    """Killing must target the whole process group, not just the bash pid,
+    so grandchildren (e.g. a backgrounded `sleep 300`) die too.
+    """
+    pidfile = tmp_path / "grandchild.pid"
+    command = f"sleep 300 & echo $! > {pidfile}; sleep 30 & wait"
+    execute(command=command, cwd=str(tmp_path), timeout_s=1)
+
+    pid = int(pidfile.read_text().strip())
+    try:
+        deadline = time.monotonic() + 3.0
+        gone = False
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.1)
+        assert gone, f"grandchild pid {pid} was not reaped after process-group kill"
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def test_execute_missing_cwd_returns_cwd_jail_code(tmp_path: Path) -> None:
