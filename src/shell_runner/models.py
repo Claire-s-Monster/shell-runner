@@ -60,6 +60,13 @@ class ExecuteResponse(BaseModel):
     telemetry_id: str
     prompt: ExecutePromptInfo | None = None
     job_id: str | None = None
+    # issue #42 — a factual note about the fate of an already-consumed
+    # one-shot approval (e.g. it was spent on a command that failed without
+    # taking effect). This field NEVER proposes an alternative command or any
+    # way around a gate — see commit 016a52c, which removed a `suggestions`
+    # field for exactly that reason. It only reports what happened to an
+    # approval the human already granted.
+    approval_note: str | None = None
 
 
 class ClassifyRequest(BaseModel):
