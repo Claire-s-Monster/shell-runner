@@ -363,6 +363,91 @@ def test_execute_with_bad_approve_token_returns_403(client: TestClient) -> None:
     assert resp.status_code == 403
 
 
+def test_execute_approved_command_sqlite_busy_sets_approval_note_and_stays_consumed(
+    client: TestClient, fresh_db: Path
+) -> None:
+    """issue #42 — a token spent on a SQLite-busy no-op is made legible, but the
+    token is still consumed: a retry with the same token is still rejected.
+    """
+    import shell_runner.server as srv
+
+    db_inst: Persistence = srv.db
+    command = 'ls "/nonexistent/database is locked"'
+    pid = db_inst.create_pending_prompt(
+        agent_id="test-agent",
+        cwd="/tmp",
+        raw_cmd=command,
+        normalized_template="ls <path>",
+        command_tier=4,
+        matched_rule_category=None,
+        decision_path=[],
+    )
+    token = db_inst.approve_prompt(prompt_id=pid, decision="approve_once")
+    assert token is not None
+
+    resp = client.post(
+        "/execute",
+        json={
+            "command": command,
+            "cwd": "/tmp",
+            "agent_id": "test-agent",
+            "approve_token": token,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["decision"] == "executed"
+    assert data["exit_code"] != 0
+    assert data["approval_note"] is not None
+    assert "consumed" in data["approval_note"]
+
+    retry = client.post(
+        "/execute",
+        json={
+            "command": command,
+            "cwd": "/tmp",
+            "agent_id": "test-agent",
+            "approve_token": token,
+        },
+    )
+    assert retry.status_code == 403
+
+
+def test_execute_approved_command_ordinary_failure_has_no_approval_note(
+    client: TestClient, fresh_db: Path
+) -> None:
+    import shell_runner.server as srv
+
+    db_inst: Persistence = srv.db
+    command = "ls /nonexistent-plain-path"
+    pid = db_inst.create_pending_prompt(
+        agent_id="test-agent",
+        cwd="/tmp",
+        raw_cmd=command,
+        normalized_template="ls <path>",
+        command_tier=4,
+        matched_rule_category=None,
+        decision_path=[],
+    )
+    token = db_inst.approve_prompt(prompt_id=pid, decision="approve_once")
+    assert token is not None
+
+    resp = client.post(
+        "/execute",
+        json={
+            "command": command,
+            "cwd": "/tmp",
+            "agent_id": "test-agent",
+            "approve_token": token,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["decision"] == "executed"
+    assert data["exit_code"] != 0
+    assert data["approval_note"] is None
+
+
 # ---------------------------------------------------------------------------
 # /health
 # ---------------------------------------------------------------------------

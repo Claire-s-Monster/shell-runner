@@ -114,6 +114,27 @@ def _tail(path: str | None, max_bytes: int) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+# issue #42 — recognised SQLite busy-handler stderr markers. The sqlite3 CLI
+# defaults busy_timeout to 0, so a concurrent writer (e.g. shell-runner's own
+# TelemetryWriter) makes it fail immediately instead of waiting.
+_SQLITE_BUSY_STDERR_MARKERS = ("database is locked", "database table is locked")
+
+
+def _is_sqlite_busy_noop(exit_code: int, stderr: str) -> bool:
+    """True when a command failed WITHOUT taking effect due to SQLite lock contention.
+
+    This identifies a command that failed WITHOUT taking effect: SQLite's busy
+    handler rejects the statement before applying it, so no row was read or
+    written. That is worth reporting distinctly from an ordinary non-zero
+    exit, where the command may have partially run or failed after mutating
+    state.
+    """
+    if exit_code == 0:
+        return False
+    stderr_lower = stderr.lower()
+    return any(marker in stderr_lower for marker in _SQLITE_BUSY_STDERR_MARKERS)
+
+
 def _compute_duration_ms(job: dict) -> int | None:
     if job.get("finished_at") is None:
         return None
@@ -477,6 +498,24 @@ async def _execute_approved_command(
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
+
+    # issue #42 — the approval above was already consumed (this function is
+    # only reached after a one-shot token or token-less approve_once was
+    # atomically consumed). If the approved command turns out to be a SQLite
+    # busy-handler no-op, make that legible instead of silently spending the
+    # human's approval on a command that demonstrably did nothing. This does
+    # NOT refund, retry, or re-mint the token — consumption already happened.
+    sqlite_busy_noop = _is_sqlite_busy_noop(exec_result.exit_code, exec_result.stderr)
+    decision_path = [consumed_via]
+    approval_note: str | None = None
+    if sqlite_busy_noop:
+        decision_path.append("approve_token consumed on sqlite-busy no-op")
+        approval_note = (
+            "The one-shot approval was consumed, but the command reported SQLite "
+            "lock contention and so did not take effect; a fresh approval is "
+            "required to retry."
+        )
+
     if telemetry_writer is not None:
         await telemetry_writer.submit(
             call_id=telemetry_id,
@@ -493,7 +532,7 @@ async def _execute_approved_command(
             stdout_bytes=len(exec_result.stdout),
             stderr_bytes=len(exec_result.stderr),
             duration_ms=duration_ms,
-            decision_path=[consumed_via],
+            decision_path=decision_path,
             normalizer_warnings=[],
         )
     else:
@@ -512,7 +551,7 @@ async def _execute_approved_command(
             stdout_bytes=len(exec_result.stdout),
             stderr_bytes=len(exec_result.stderr),
             duration_ms=duration_ms,
-            decision_path=[consumed_via],
+            decision_path=decision_path,
             normalizer_warnings=[],
         )
     if catalog_writer is not None:
@@ -541,6 +580,7 @@ async def _execute_approved_command(
         stderr_full_path=exec_result.stderr_full_path,
         duration_ms=duration_ms,
         telemetry_id=telemetry_id,
+        approval_note=approval_note,
     )
 
 

@@ -21,7 +21,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             "(executed|denied|prompt_required|running), exit_code, stdout, stderr, telemetry_id. "
             "For T3/T4 commands, returns prompt_required with prompt_id; user must call "
             "shell_approve_pending then re-call shell_execute with approve_token. "
-            "Set run_in_background=true to spawn asynchronously and get a job_id."
+            "Set run_in_background=true to spawn asynchronously and get a job_id. "
+            "An approval is consumed when the command is dispatched, not when it succeeds — "
+            "a command writing to a busy SQLite database should set PRAGMA busy_timeout "
+            "itself, since the sqlite3 CLI defaults busy_timeout to 0."
         ),
         "schema": {
             "type": "object",
