@@ -378,3 +378,74 @@ def test_finalize_call_unknown_call_id_is_silent_noop(tmp_path: Path) -> None:
         duration_ms=1,
     )
     assert db.telemetry_query() == []
+
+
+# ---------------------------------------------------------------------------
+# finalize_call(only_if_running=True) — issue #49 race-safe reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_call_only_if_running_updates_a_running_row(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    call_id = _record_call(
+        db, decision="running", exit_code=None, stdout_bytes=0, stderr_bytes=0, duration_ms=0
+    )
+    db.finalize_call(
+        call_id,
+        decision="executed",
+        exit_code=0,
+        stdout_bytes=5,
+        stderr_bytes=0,
+        duration_ms=10,
+        only_if_running=True,
+    )
+    rows = db.telemetry_query()
+    row = next(r for r in rows if r["id"] == call_id)
+    assert row["decision"] == "executed"
+    assert row["exit_code"] == 0
+    assert row["output_bytes_stdout"] == 5
+    assert row["duration_ms"] == 10
+
+
+def test_finalize_call_only_if_running_is_noop_on_already_executed_row(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    call_id = _record_call(
+        db, decision="executed", exit_code=1, stdout_bytes=1, stderr_bytes=1, duration_ms=1
+    )
+    db.finalize_call(
+        call_id,
+        decision="executed",
+        exit_code=99,
+        stdout_bytes=999,
+        stderr_bytes=999,
+        duration_ms=999,
+        only_if_running=True,
+    )
+    rows = db.telemetry_query()
+    row = next(r for r in rows if r["id"] == call_id)
+    # Values from _record_call above, untouched by the attempted overwrite.
+    assert row["exit_code"] == 1
+    assert row["output_bytes_stdout"] == 1
+    assert row["duration_ms"] == 1
+
+
+def test_finalize_call_default_only_if_running_false_updates_regardless_of_decision(
+    tmp_path: Path,
+) -> None:
+    db = _make_db(tmp_path)
+    call_id = _record_call(
+        db, decision="executed", exit_code=1, stdout_bytes=1, stderr_bytes=1, duration_ms=1
+    )
+    db.finalize_call(
+        call_id,
+        decision="executed",
+        exit_code=42,
+        stdout_bytes=42,
+        stderr_bytes=42,
+        duration_ms=42,
+    )
+    rows = db.telemetry_query()
+    row = next(r for r in rows if r["id"] == call_id)
+    assert row["exit_code"] == 42
+    assert row["output_bytes_stdout"] == 42
+    assert row["duration_ms"] == 42

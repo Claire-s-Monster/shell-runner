@@ -229,6 +229,7 @@ class Persistence:
         stderr_bytes: int,
         duration_ms: int,
         decision_path: list[str] | None = None,
+        only_if_running: bool = False,
     ) -> None:
         """Reconcile a shell_calls row once a real outcome is known.
 
@@ -247,6 +248,15 @@ class Persistence:
         UPDATE-only: a call_id with no matching row is a silent no-op.
         decision_path is left unchanged when None (matches the JSON encoding
         used by record_call, i.e. json.dumps of the list).
+
+        only_if_running=True (issue #49) adds `AND decision = 'running'` to
+        the WHERE clause, making the write atomic and a no-op if some other
+        caller already reconciled the row. This lets executor.py's background
+        watcher and server.py's inline-budget reconciliation race safely: the
+        watcher always calls with only_if_running=True, so whichever of the
+        two finalizers runs second observes decision != 'running' and does
+        nothing. Default False preserves the unconditional overwrite used by
+        the existing server.py caller.
         """
         set_clauses = [
             "decision = ?",
@@ -260,9 +270,12 @@ class Persistence:
             set_clauses.append("decision_path_json = ?")
             params.append(json.dumps(decision_path))
         params.append(call_id)
+        where = "WHERE id = ?"
+        if only_if_running:
+            where += " AND decision = 'running'"
         with self._conn() as conn:
             conn.execute(
-                f"UPDATE shell_calls SET {', '.join(set_clauses)} WHERE id = ?",  # noqa: S608
+                f"UPDATE shell_calls SET {', '.join(set_clauses)} {where}",  # noqa: S608
                 params,
             )
 

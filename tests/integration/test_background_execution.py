@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import shell_runner.server as server_module
 from shell_runner.persistence import Persistence
 from shell_runner.server import app
 
@@ -57,6 +58,34 @@ async def _wait_for_status(
             return data
         await asyncio.sleep(poll_interval)
     pytest.fail(f"job {job_id} did not reach {terminal} within {timeout_s}s")
+
+
+def _shell_calls_row(telemetry_id: str) -> dict:
+    rows = server_module.db.telemetry_query(limit=100)
+    return next(r for r in rows if r["id"] == telemetry_id)
+
+
+async def _wait_for_reconciled_shell_calls_row(
+    telemetry_id: str, *, timeout_s: float = 5.0, poll_interval: float = 0.1
+) -> dict:
+    """Poll shell_calls until telemetry_id's row leaves decision="running".
+
+    shell_kill_route writes the jobs row's terminal status="killed"
+    synchronously and independently of the background watcher task, so a
+    caller observing status="killed" via shell_status is NOT guaranteed the
+    watcher's own shell_calls reconciliation (issue #49) — which only runs
+    once the watcher's own proc.wait() resolves — has completed yet. Must
+    poll rather than assume synchronity with the jobs-row transition.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while asyncio.get_running_loop().time() < deadline:
+        row = _shell_calls_row(telemetry_id)
+        if row["decision"] != "running":
+            return row
+        await asyncio.sleep(poll_interval)
+    pytest.fail(
+        f"shell_calls row for telemetry_id={telemetry_id} still 'running' after {timeout_s}s"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +135,36 @@ async def test_background_execute_completes_with_output(job_dir: Path) -> None:
     assert status["exit_code"] == 0
     assert "hello" in status["stdout_tail"]
     assert status["stderr_tail"] == ""
+
+
+async def test_background_execute_reconciles_shell_calls_row(job_dir: Path) -> None:
+    """issue #49: an explicit run_in_background=True job's shell_calls row is
+    pre-written as decision="running" and must be reconciled once the job
+    finishes — decision="executed", the real exit_code, a non-zero stdout
+    byte count, and decision_path still containing "background" (preserved,
+    not overwritten, by the watcher's reconciliation)."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "echo hello",
+                "cwd": "/tmp",
+                "agent_id": "focused-ghc-ci-analyzer",
+                "run_in_background": True,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        job_id = data["job_id"]
+        telemetry_id = data["telemetry_id"]
+
+        await _wait_for_status(client, job_id, terminal={"completed", "failed", "timed_out"})
+
+    row = _shell_calls_row(telemetry_id)
+    assert row["decision"] == "executed"
+    assert row["exit_code"] == 0
+    assert row["output_bytes_stdout"] > 0
+    assert "background" in row["decision_path_json"]
 
 
 async def test_background_execute_uses_shell_semantics(job_dir: Path) -> None:
@@ -265,6 +324,47 @@ async def test_shell_kill_terminates_running_job(job_dir: Path) -> None:
     assert final["status"] in {"killed", "failed"}
 
 
+async def test_shell_kill_reconciles_shell_calls_row(job_dir: Path) -> None:
+    """issue #49: killing a background job must reconcile its shell_calls row
+    (decision="executed") without disturbing the jobs row's terminal
+    status="killed" written by shell_kill_route (the #48 terminal-status
+    guard in _watch()'s _job_is_terminal check still holds)."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "sleep 30",
+                "cwd": "/tmp",
+                "agent_id": "focused-ghc-ci-analyzer",
+                "run_in_background": True,
+                "timeout_s": 60,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        job_id = data["job_id"]
+        telemetry_id = data["telemetry_id"]
+
+        await asyncio.sleep(0.3)
+
+        kill_resp = await client.post(
+            "/tools/shell_kill", json={"job_id": job_id, "sig": "SIGTERM"}
+        )
+        assert kill_resp.status_code == 200
+        assert kill_resp.json()["killed"] is True
+
+        final = await _wait_for_status(
+            client,
+            job_id,
+            terminal={"killed", "failed", "completed", "timed_out"},
+            timeout_s=5.0,
+        )
+
+    assert final["status"] == "killed"
+    row = await _wait_for_reconciled_shell_calls_row(telemetry_id)
+    assert row["decision"] == "executed"
+
+
 async def test_shell_kill_returns_false_for_completed_job(job_dir: Path) -> None:
     """Killing an already-completed job returns killed=False."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -319,6 +419,41 @@ async def test_background_timeout_marks_timed_out(job_dir: Path) -> None:
         )
 
     assert final["status"] == "timed_out"
+
+
+async def test_background_timeout_reconciles_shell_calls_row(job_dir: Path) -> None:
+    """issue #49: a timed-out background job's shell_calls row must be
+    reconciled to decision="executed" (the command DID run, it just outlived
+    its timeout) with the timeout exit code — specifically not left stuck at
+    decision="running" forever."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "sleep 10",
+                "cwd": "/tmp",
+                "agent_id": "focused-ghc-ci-analyzer",
+                "run_in_background": True,
+                "timeout_s": 1,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        job_id = data["job_id"]
+        telemetry_id = data["telemetry_id"]
+
+        final = await _wait_for_status(
+            client,
+            job_id,
+            terminal={"timed_out", "completed", "failed", "killed"},
+            timeout_s=8.0,
+        )
+
+    assert final["status"] == "timed_out"
+    row = _shell_calls_row(telemetry_id)
+    assert row["decision"] == "executed"
+    assert row["decision"] != "running"
+    assert row["exit_code"] == final["exit_code"]
 
 
 async def test_background_timeout_sends_sigterm_before_sigkill(
