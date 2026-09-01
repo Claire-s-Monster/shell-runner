@@ -219,6 +219,53 @@ class Persistence:
             )
         return telemetry_id
 
+    def finalize_call(
+        self,
+        call_id: str,
+        *,
+        decision: str,
+        exit_code: int | None,
+        stdout_bytes: int,
+        stderr_bytes: int,
+        duration_ms: int,
+        decision_path: list[str] | None = None,
+    ) -> None:
+        """Reconcile a shell_calls row once a real outcome is known.
+
+        Exists to fix up the row pre-written as decision="running" by the
+        issue #46 inline-budget-divert path (_prewrite_inline_budget_telemetry
+        in server.py): that path must commit a shell_calls row before
+        _run_with_inline_budget can reach execute_background(), because
+        jobs.telemetry_id has an immediate FK on shell_calls(id) and
+        Persistence opens every connection with PRAGMA foreign_keys=ON. When
+        the command actually finishes within the inline budget instead of
+        being diverted to a background job, that row must be updated here —
+        otherwise it stays decision="running" with exit_code=NULL forever,
+        corrupting health-stat denominators and decision-aware retention
+        (issue #41).
+
+        UPDATE-only: a call_id with no matching row is a silent no-op.
+        decision_path is left unchanged when None (matches the JSON encoding
+        used by record_call, i.e. json.dumps of the list).
+        """
+        set_clauses = [
+            "decision = ?",
+            "exit_code = ?",
+            "output_bytes_stdout = ?",
+            "output_bytes_stderr = ?",
+            "duration_ms = ?",
+        ]
+        params: list[object] = [decision, exit_code, stdout_bytes, stderr_bytes, duration_ms]
+        if decision_path is not None:
+            set_clauses.append("decision_path_json = ?")
+            params.append(json.dumps(decision_path))
+        params.append(call_id)
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE shell_calls SET {', '.join(set_clauses)} WHERE id = ?",  # noqa: S608
+                params,
+            )
+
     # --- templates ---
 
     def upsert_template(

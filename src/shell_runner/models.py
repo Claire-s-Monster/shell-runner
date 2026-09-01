@@ -67,6 +67,11 @@ class ExecuteResponse(BaseModel):
     # field for exactly that reason. It only reports what happened to an
     # approval the human already granted.
     approval_note: str | None = None
+    # issue #46 — a factual note about how the command was routed (e.g. it
+    # was diverted to the background job path after outliving the inline
+    # budget). Like approval_note, this field NEVER proposes an alternative
+    # command or any way around a gate — it only reports what happened.
+    execution_note: str | None = None
 
 
 class ClassifyRequest(BaseModel):

@@ -301,3 +301,80 @@ def test_schema_initializes_idempotently(tmp_path: Path) -> None:
     # Verify we can still operate
     _record_call(db)
     assert len(db.telemetry_query()) == 1
+
+
+# ---------------------------------------------------------------------------
+# finalize_call() — issue #46 reconciliation of a pre-written "running" row
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_call_updates_existing_row(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    call_id = _record_call(
+        db, decision="running", exit_code=None, stdout_bytes=0, stderr_bytes=0, duration_ms=0
+    )
+    db.finalize_call(
+        call_id,
+        decision="executed",
+        exit_code=0,
+        stdout_bytes=42,
+        stderr_bytes=7,
+        duration_ms=123,
+    )
+    rows = db.telemetry_query()
+    row = next(r for r in rows if r["id"] == call_id)
+    assert row["decision"] == "executed"
+    assert row["exit_code"] == 0
+    assert row["output_bytes_stdout"] == 42
+    assert row["output_bytes_stderr"] == 7
+    assert row["duration_ms"] == 123
+
+
+def test_finalize_call_leaves_decision_path_untouched_when_none(tmp_path: Path) -> None:
+    import json
+
+    db = _make_db(tmp_path)
+    call_id = _record_call(db, decision_path=["original", "path"])
+    db.finalize_call(
+        call_id,
+        decision="executed",
+        exit_code=0,
+        stdout_bytes=1,
+        stderr_bytes=0,
+        duration_ms=1,
+    )
+    rows = db.telemetry_query()
+    row = next(r for r in rows if r["id"] == call_id)
+    assert json.loads(row["decision_path_json"]) == ["original", "path"]
+
+
+def test_finalize_call_replaces_decision_path_when_given(tmp_path: Path) -> None:
+    import json
+
+    db = _make_db(tmp_path)
+    call_id = _record_call(db, decision_path=["original"])
+    db.finalize_call(
+        call_id,
+        decision="executed",
+        exit_code=0,
+        stdout_bytes=1,
+        stderr_bytes=0,
+        duration_ms=1,
+        decision_path=["replaced", "path"],
+    )
+    rows = db.telemetry_query()
+    row = next(r for r in rows if r["id"] == call_id)
+    assert json.loads(row["decision_path_json"]) == ["replaced", "path"]
+
+
+def test_finalize_call_unknown_call_id_is_silent_noop(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    db.finalize_call(
+        "00000000-0000-0000-0000-000000000000",
+        decision="executed",
+        exit_code=0,
+        stdout_bytes=1,
+        stderr_bytes=0,
+        duration_ms=1,
+    )
+    assert db.telemetry_query() == []

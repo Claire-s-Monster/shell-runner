@@ -22,6 +22,13 @@ TOOLS: dict[str, dict[str, Any]] = {
             "For T3/T4 commands, returns prompt_required with prompt_id; user must call "
             "shell_approve_pending then re-call shell_execute with approve_token. "
             "Set run_in_background=true to spawn asynchronously and get a job_id. "
+            "Output is only returned inline if the command finishes within the inline budget "
+            "(default 20s, configurable via SHELL_RUNNER_INLINE_BUDGET_S) — a command that is "
+            "still running when the budget elapses is automatically diverted to the background "
+            "job path instead of being killed: the response comes back with decision='running' "
+            "plus a job_id to poll via shell_status, and an execution_note explaining the "
+            "divert (issue #46). timeout_s still bounds the command's total life regardless of "
+            "whether it ran inline or was diverted. "
             "An approval is consumed when the command is dispatched, not when it succeeds — "
             "a command writing to a busy SQLite database should set PRAGMA busy_timeout "
             "itself, since the sqlite3 CLI defaults busy_timeout to 0."
@@ -38,6 +45,13 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": 30,
                     "minimum": 1,
                     "maximum": 3600,
+                    "description": (
+                        "Total time the command is allowed to run. A value above the inline "
+                        "budget (default 20s, SHELL_RUNNER_INLINE_BUDGET_S) is safe and does not "
+                        "truncate the command. Results return inline if it finishes within the "
+                        "budget; if still running when the budget elapses, the response comes "
+                        "back with decision='running' plus a job_id to poll via shell_status."
+                    ),
                 },
                 "approve_token": {
                     "type": ["string", "null"],

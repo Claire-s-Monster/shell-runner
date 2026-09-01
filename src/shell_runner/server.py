@@ -38,7 +38,17 @@ from .classifier import (
     classify,
     is_primary_identity,
 )
-from .executor import OUTPUT_TAIL_BYTES, execute, execute_background, validate_cwd
+from .executor import (
+    OUTPUT_TAIL_BYTES,
+    ExecutionResult,
+    discard_job_tracking,
+    execute,
+    execute_background,
+    inline_budget_s,
+    job_result,
+    validate_cwd,
+    wait_for_job,
+)
 from .mcp_wrapper import TOOLS
 from .models import (
     ApproveRequest,
@@ -312,6 +322,153 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
 app = FastAPI(title="shell-runner", version="0.1.0", lifespan=_lifespan)
 
 
+def _inline_budget_divert_note(*, budget: int, job_id: str, timeout_s: int) -> str:
+    """Factual note (issue #46) for a request diverted to the background job
+    path after outliving the inline budget. Like approval_note (issue #42),
+    this must never propose an alternative command or any way around a gate
+    — it only reports what happened.
+    """
+    return (
+        f"Command was still running after the {budget}s inline budget, so it was moved to "
+        f"the background instead of being killed mid-run (issue #46). It is still running "
+        f"as job {job_id} — poll shell_status(job_id) for output. Its own timeout_s="
+        f"{timeout_s} still applies."
+    )
+
+
+async def _prewrite_inline_budget_telemetry(
+    *,
+    req: ExecuteRequest,
+    telemetry_id: str,
+    telemetry_writer: TelemetryWriter | None,
+    catalog_writer: CatalogWriter | None,
+    normalized_template: str,
+    command_tier: int,
+    final_tier: int,
+    catalog_tier: int,
+    matched_rule_pattern: str | None,
+    matched_rule_category: str | None,
+    decision_path: list[str],
+    duration_ms: int,
+) -> None:
+    """Write the shell_calls row for telemetry_id BEFORE a call to
+    _run_with_inline_budget may reach execute_background() (issue #46).
+
+    jobs.telemetry_id references shell_calls(id), and Persistence opens every
+    connection with PRAGMA foreign_keys=ON — checked immediately, not
+    deferred — so execute_background()'s create_job() would raise
+    IntegrityError if the parent shell_calls row did not already exist yet.
+    A second INSERT for the same telemetry_id would violate shell_calls'
+    primary key, so this is the only INSERT for telemetry_id on a request
+    whose timeout_s exceeds the inline budget. It is no longer the only
+    telemetry *write*, though: if the command goes on to finish within the
+    budget after all (i.e. it was never actually diverted to a background
+    job), the caller reconciles this row via Persistence.finalize_call with
+    the real decision/exit_code/bytes/duration. The row is left permanently
+    decision="running" only when the command is genuinely still running as a
+    background job — the same convention already used by this file's
+    run_in_background/output_mode="file" dispatch paths, where the jobs table
+    (not shell_calls) is the authoritative source of the terminal outcome.
+    """
+    if telemetry_writer is not None:
+        await telemetry_writer.submit(
+            call_id=telemetry_id,
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=normalized_template,
+            command_tier=command_tier,
+            final_tier=final_tier,
+            decision="running",
+            matched_rule_pattern=matched_rule_pattern,
+            matched_rule_category=matched_rule_category,
+            exit_code=None,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            duration_ms=duration_ms,
+            decision_path=decision_path,
+            normalizer_warnings=[],
+            wait=True,
+        )
+    else:
+        db.record_call(
+            call_id=telemetry_id,
+            agent_id=req.agent_id,
+            cwd=req.cwd,
+            raw_cmd=req.command,
+            normalized_template=normalized_template,
+            command_tier=command_tier,
+            final_tier=final_tier,
+            decision="running",
+            matched_rule_pattern=matched_rule_pattern,
+            matched_rule_category=matched_rule_category,
+            exit_code=None,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            duration_ms=duration_ms,
+            decision_path=decision_path,
+            normalizer_warnings=[],
+        )
+    if catalog_writer is not None:
+        await catalog_writer.submit(
+            template=normalized_template,
+            agent_id=req.agent_id,
+            current_tier=catalog_tier,
+            was_denied=False,
+        )
+    else:
+        await asyncio.to_thread(
+            db.upsert_template,
+            template=normalized_template,
+            agent_id=req.agent_id,
+            current_tier=catalog_tier,
+            was_denied=False,
+        )
+
+
+async def _run_with_inline_budget(
+    *, req: ExecuteRequest, telemetry_id: str
+) -> tuple[ExecutionResult | None, str | None]:
+    """Run req, diverting to the background job path if it would outlive the
+    inline budget (issue #46).
+
+    Returns (result, None) if it finished within the budget, or (None, job_id)
+    if it was diverted and is still running.
+
+    Callers whose req.timeout_s exceeds the inline budget MUST already have a
+    shell_calls row committed for telemetry_id before calling this function
+    (see _prewrite_inline_budget_telemetry) — execute_background() below
+    creates a jobs row with an immediate FK on shell_calls(id).
+    """
+    budget = inline_budget_s()
+    if budget <= 0 or req.timeout_s <= budget:
+        return (
+            await asyncio.to_thread(
+                execute, command=req.command, cwd=req.cwd, timeout_s=req.timeout_s
+            ),
+            None,
+        )
+    job_id = await execute_background(
+        command=req.command,
+        cwd=req.cwd,
+        timeout_s=req.timeout_s,
+        telemetry_id=telemetry_id,
+        agent_id=req.agent_id,
+        persistence=db,
+        track_completion=True,
+    )
+    try:
+        finished = await wait_for_job(job_id, budget)
+    finally:
+        discard_job_tracking(job_id)
+    if not finished:
+        return None, job_id
+    result = job_result(job_id=job_id, persistence=db)
+    if result is None:
+        return None, job_id
+    return result, None
+
+
 async def _execute_approved_command(
     req: ExecuteRequest,
     prompt: dict,
@@ -493,11 +650,52 @@ async def _execute_approved_command(
             telemetry_id=telemetry_id,
             job_id=job_id,
         )
-    exec_result = await asyncio.to_thread(
-        execute, command=req.command, cwd=req.cwd, timeout_s=req.timeout_s
-    )
-    duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
+    budget = inline_budget_s()
+    over_budget = budget > 0 and req.timeout_s > budget
+    if over_budget:
+        # issue #46 — must run before _run_with_inline_budget can reach
+        # execute_background(); see _prewrite_inline_budget_telemetry docstring.
+        await _prewrite_inline_budget_telemetry(
+            req=req,
+            telemetry_id=telemetry_id,
+            telemetry_writer=telemetry_writer,
+            catalog_writer=catalog_writer,
+            normalized_template=prompt["normalized_template"],
+            command_tier=prompt["command_tier"],
+            final_tier=prompt["command_tier"],
+            catalog_tier=prompt["command_tier"],
+            matched_rule_pattern=None,
+            matched_rule_category=prompt["matched_rule_category"],
+            decision_path=[consumed_via, "background", "inline_budget_divert"],
+            duration_ms=int((time.monotonic() - t0) * 1000),
+        )
+
+    exec_result, diverted_job_id = await _run_with_inline_budget(req=req, telemetry_id=telemetry_id)
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    if diverted_job_id is not None:
+        note = _inline_budget_divert_note(
+            budget=budget, job_id=diverted_job_id, timeout_s=req.timeout_s
+        )
+        return ExecuteResponse(
+            decision="running",
+            tier=prompt["command_tier"],
+            matched_rule=None,
+            exit_code=None,
+            stdout="",
+            stderr="",
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=duration_ms,
+            telemetry_id=telemetry_id,
+            job_id=diverted_job_id,
+            execution_note=note,
+        )
+    if exec_result is None:
+        # Defensive: _run_with_inline_budget's contract guarantees a result
+        # here whenever job_id is None.
+        raise RuntimeError("inline budget helper returned neither a result nor a job_id")
 
     # issue #42 — the approval above was already consumed (this function is
     # only reached after a one-shot token or token-less approve_once was
@@ -516,58 +714,81 @@ async def _execute_approved_command(
             "required to retry."
         )
 
-    if telemetry_writer is not None:
-        await telemetry_writer.submit(
-            call_id=telemetry_id,
-            agent_id=req.agent_id,
-            cwd=req.cwd,
-            raw_cmd=req.command,
-            normalized_template=prompt["normalized_template"],
-            command_tier=prompt["command_tier"],
-            final_tier=prompt["command_tier"],
-            decision="executed",
-            matched_rule_pattern=None,
-            matched_rule_category=prompt["matched_rule_category"],
-            exit_code=exec_result.exit_code,
-            stdout_bytes=len(exec_result.stdout),
-            stderr_bytes=len(exec_result.stderr),
-            duration_ms=duration_ms,
-            decision_path=decision_path,
-            normalizer_warnings=[],
-        )
+    if not over_budget:
+        # issue #46 — when over_budget, telemetry was already written by
+        # _prewrite_inline_budget_telemetry above; a second insert here would
+        # violate shell_calls' primary key (see that helper's docstring).
+        if telemetry_writer is not None:
+            await telemetry_writer.submit(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=prompt["normalized_template"],
+                command_tier=prompt["command_tier"],
+                final_tier=prompt["command_tier"],
+                decision="executed",
+                matched_rule_pattern=None,
+                matched_rule_category=prompt["matched_rule_category"],
+                exit_code=exec_result.exit_code,
+                stdout_bytes=len(exec_result.stdout),
+                stderr_bytes=len(exec_result.stderr),
+                duration_ms=duration_ms,
+                decision_path=decision_path,
+                normalizer_warnings=[],
+            )
+        else:
+            db.record_call(
+                call_id=telemetry_id,
+                agent_id=req.agent_id,
+                cwd=req.cwd,
+                raw_cmd=req.command,
+                normalized_template=prompt["normalized_template"],
+                command_tier=prompt["command_tier"],
+                final_tier=prompt["command_tier"],
+                decision="executed",
+                matched_rule_pattern=None,
+                matched_rule_category=prompt["matched_rule_category"],
+                exit_code=exec_result.exit_code,
+                stdout_bytes=len(exec_result.stdout),
+                stderr_bytes=len(exec_result.stderr),
+                duration_ms=duration_ms,
+                decision_path=decision_path,
+                normalizer_warnings=[],
+            )
+        if catalog_writer is not None:
+            await catalog_writer.submit(
+                template=prompt["normalized_template"],
+                agent_id=req.agent_id,
+                current_tier=prompt["command_tier"],
+                was_denied=False,
+            )
+        else:
+            await asyncio.to_thread(
+                db.upsert_template,
+                template=prompt["normalized_template"],
+                agent_id=req.agent_id,
+                current_tier=prompt["command_tier"],
+                was_denied=False,
+            )
     else:
-        db.record_call(
-            call_id=telemetry_id,
-            agent_id=req.agent_id,
-            cwd=req.cwd,
-            raw_cmd=req.command,
-            normalized_template=prompt["normalized_template"],
-            command_tier=prompt["command_tier"],
-            final_tier=prompt["command_tier"],
-            decision="executed",
-            matched_rule_pattern=None,
-            matched_rule_category=prompt["matched_rule_category"],
-            exit_code=exec_result.exit_code,
-            stdout_bytes=len(exec_result.stdout),
-            stderr_bytes=len(exec_result.stderr),
-            duration_ms=duration_ms,
-            decision_path=decision_path,
-            normalizer_warnings=[],
-        )
-    if catalog_writer is not None:
-        await catalog_writer.submit(
-            template=prompt["normalized_template"],
-            agent_id=req.agent_id,
-            current_tier=prompt["command_tier"],
-            was_denied=False,
-        )
-    else:
+        # issue #46 — over_budget but not diverted: the command finished
+        # within the inline budget after all. _prewrite_inline_budget_telemetry
+        # already committed the row (decision="running") and upserted the
+        # catalog template; reconcile the row with the real outcome here.
+        # Do NOT repeat the catalog upsert — that would double-count the
+        # template. Call db.finalize_call directly (not through
+        # telemetry_writer): the pre-write already committed with wait=True,
+        # so ordering is safe and the writer has no update path.
         await asyncio.to_thread(
-            db.upsert_template,
-            template=prompt["normalized_template"],
-            agent_id=req.agent_id,
-            current_tier=prompt["command_tier"],
-            was_denied=False,
+            db.finalize_call,
+            telemetry_id,
+            decision="executed",
+            exit_code=exec_result.exit_code,
+            stdout_bytes=len(exec_result.stdout),
+            stderr_bytes=len(exec_result.stderr),
+            duration_ms=duration_ms,
+            decision_path=decision_path,
         )
     return ExecuteResponse(
         decision="executed",
@@ -791,63 +1012,136 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 telemetry_id=telemetry_id,
                 job_id=job_id,
             )
-        exec_result = await asyncio.to_thread(
-            execute, command=req.command, cwd=req.cwd, timeout_s=req.timeout_s
+        telemetry_id = str(uuid.uuid4())
+        budget = inline_budget_s()
+        over_budget = budget > 0 and req.timeout_s > budget
+        if over_budget:
+            # issue #46 — must run before _run_with_inline_budget can reach
+            # execute_background(); see _prewrite_inline_budget_telemetry docstring.
+            await _prewrite_inline_budget_telemetry(
+                req=req,
+                telemetry_id=telemetry_id,
+                telemetry_writer=telemetry_writer,
+                catalog_writer=catalog_writer,
+                normalized_template=cls.template,
+                command_tier=int(cls.command_tier),
+                final_tier=int(cls.tier),
+                catalog_tier=int(cls.tier),
+                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+                decision_path=[*cls.decision_path, "background", "inline_budget_divert"],
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
+
+        exec_result, diverted_job_id = await _run_with_inline_budget(
+            req=req, telemetry_id=telemetry_id
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
-        telemetry_id = str(uuid.uuid4())
-        if telemetry_writer is not None:
-            await telemetry_writer.submit(
-                call_id=telemetry_id,
-                agent_id=req.agent_id,
-                cwd=req.cwd,
-                raw_cmd=req.command,
-                normalized_template=cls.template,
-                command_tier=int(cls.command_tier),
-                final_tier=int(cls.tier),
-                decision="executed",
-                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-                exit_code=exec_result.exit_code,
-                stdout_bytes=len(exec_result.stdout),
-                stderr_bytes=len(exec_result.stderr),
+
+        if diverted_job_id is not None:
+            note = _inline_budget_divert_note(
+                budget=budget, job_id=diverted_job_id, timeout_s=req.timeout_s
+            )
+            return ExecuteResponse(
+                decision="running",
+                tier=int(cls.tier),
+                matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
+                exit_code=None,
+                stdout="",
+                stderr="",
+                stdout_full_path=None,
+                stderr_full_path=None,
                 duration_ms=duration_ms,
-                decision_path=list(cls.decision_path),
-                normalizer_warnings=list(cls.normalizer_warnings),
+                telemetry_id=telemetry_id,
+                job_id=diverted_job_id,
+                execution_note=note,
             )
+        if exec_result is None:
+            # Defensive: _run_with_inline_budget's contract guarantees a
+            # result here whenever job_id is None.
+            raise RuntimeError("inline budget helper returned neither a result nor a job_id")
+
+        if not over_budget:
+            # issue #46 — when over_budget, telemetry was already written by
+            # _prewrite_inline_budget_telemetry above; a second insert here
+            # would violate shell_calls' primary key (see that helper's
+            # docstring).
+            if telemetry_writer is not None:
+                await telemetry_writer.submit(
+                    call_id=telemetry_id,
+                    agent_id=req.agent_id,
+                    cwd=req.cwd,
+                    raw_cmd=req.command,
+                    normalized_template=cls.template,
+                    command_tier=int(cls.command_tier),
+                    final_tier=int(cls.tier),
+                    decision="executed",
+                    matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                    matched_rule_category=(
+                        cls.matched_rule.category if cls.matched_rule else None
+                    ),
+                    exit_code=exec_result.exit_code,
+                    stdout_bytes=len(exec_result.stdout),
+                    stderr_bytes=len(exec_result.stderr),
+                    duration_ms=duration_ms,
+                    decision_path=list(cls.decision_path),
+                    normalizer_warnings=list(cls.normalizer_warnings),
+                )
+            else:
+                db.record_call(
+                    call_id=telemetry_id,
+                    agent_id=req.agent_id,
+                    cwd=req.cwd,
+                    raw_cmd=req.command,
+                    normalized_template=cls.template,
+                    command_tier=int(cls.command_tier),
+                    final_tier=int(cls.tier),
+                    decision="executed",
+                    matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+                    matched_rule_category=(
+                        cls.matched_rule.category if cls.matched_rule else None
+                    ),
+                    exit_code=exec_result.exit_code,
+                    stdout_bytes=len(exec_result.stdout),
+                    stderr_bytes=len(exec_result.stderr),
+                    duration_ms=duration_ms,
+                    decision_path=list(cls.decision_path),
+                    normalizer_warnings=list(cls.normalizer_warnings),
+                )
+            if catalog_writer is not None:
+                await catalog_writer.submit(
+                    template=cls.template,
+                    agent_id=req.agent_id,
+                    current_tier=int(cls.tier),
+                    was_denied=False,
+                )
+            else:
+                await asyncio.to_thread(
+                    db.upsert_template,
+                    template=cls.template,
+                    agent_id=req.agent_id,
+                    current_tier=int(cls.tier),
+                    was_denied=False,
+                )
         else:
-            db.record_call(
-                call_id=telemetry_id,
-                agent_id=req.agent_id,
-                cwd=req.cwd,
-                raw_cmd=req.command,
-                normalized_template=cls.template,
-                command_tier=int(cls.command_tier),
-                final_tier=int(cls.tier),
-                decision="executed",
-                matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-                matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-                exit_code=exec_result.exit_code,
-                stdout_bytes=len(exec_result.stdout),
-                stderr_bytes=len(exec_result.stderr),
-                duration_ms=duration_ms,
-                decision_path=list(cls.decision_path),
-                normalizer_warnings=list(cls.normalizer_warnings),
-            )
-        if catalog_writer is not None:
-            await catalog_writer.submit(
-                template=cls.template,
-                agent_id=req.agent_id,
-                current_tier=int(cls.tier),
-                was_denied=False,
-            )
-        else:
+            # issue #46 — over_budget but not diverted: the command finished
+            # within the inline budget after all. _prewrite_inline_budget_telemetry
+            # already committed the row (decision="running") and upserted the
+            # catalog template; reconcile the row with the real outcome here.
+            # Do NOT repeat the catalog upsert — that would double-count the
+            # template. Call db.finalize_call directly (not through
+            # telemetry_writer): the pre-write already committed with
+            # wait=True, so ordering is safe and the writer has no update
+            # path.
             await asyncio.to_thread(
-                db.upsert_template,
-                template=cls.template,
-                agent_id=req.agent_id,
-                current_tier=int(cls.tier),
-                was_denied=False,
+                db.finalize_call,
+                telemetry_id,
+                decision="executed",
+                exit_code=exec_result.exit_code,
+                stdout_bytes=len(exec_result.stdout),
+                stderr_bytes=len(exec_result.stderr),
+                duration_ms=duration_ms,
+                decision_path=list(cls.decision_path),
             )
         return ExecuteResponse(
             decision="executed",
@@ -1320,6 +1614,18 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
     sig = getattr(signal, body.sig, signal.SIGTERM)
     try:
         os.kill(job["pid"], sig)
+        # issue #46 — persist the terminal status ourselves: this is what makes
+        # an external shell_kill distinguishable from an executor timeout in
+        # the DB afterwards. _watch() (executor.py) now skips its own update
+        # once the row is already terminal, so this write is not clobbered by
+        # the background watcher racing to record its own outcome.
+        db.update_job_status(body.job_id, status="killed", finished_at=_now_iso())
+        logger.info(
+            "shell_kill terminated job %s (pid %d) with %s",
+            body.job_id,
+            job["pid"],
+            body.sig,
+        )
         return ShellKillResponse(killed=True, sig=body.sig)
     except ProcessLookupError:
         db.update_job_status(body.job_id, status="killed", finished_at=_now_iso())

@@ -37,6 +37,19 @@ DEFAULT_TIMEOUT_S = 30
 # monkeypatch it to keep timeout tests fast.
 TERMINATE_GRACE_S = 3.0
 
+DEFAULT_INLINE_BUDGET_S = 20
+
+
+def inline_budget_s() -> int:
+    """Seconds a command may block the inline/foreground path before it is
+    diverted to the background job path (issue #46). 0 disables diverting."""
+    raw = os.environ.get("SHELL_RUNNER_INLINE_BUDGET_S", str(DEFAULT_INLINE_BUDGET_S))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_INLINE_BUDGET_S
+
+
 DEFAULT_ENV_PASSTHROUGH = ["HOME", "USER", "PATH", "LANG", "TERM"]
 
 _OVERFLOW_DIR = Path("/tmp/shell-runner-overflow")  # noqa: S108
@@ -125,21 +138,34 @@ class ExecutionResult:
     timed_out: bool
 
 
+def _build_truncated(raw: bytes, head: int, tail: int) -> tuple[str, bool]:
+    """Decode raw bytes to text, truncating with a marker if it exceeds
+    head+tail. Returns (text, was_truncated). Pure — performs no I/O — so
+    execute() (overflow file) and job_result() (existing job log path) can
+    share identical marker text while differing in what they point
+    stdout_full_path/stderr_full_path at.
+    """
+    if len(raw) <= head + tail:
+        return raw.decode("utf-8", errors="replace"), False
+    head_str = raw[:head].decode("utf-8", errors="replace")
+    tail_str = raw[-tail:].decode("utf-8", errors="replace")
+    omitted = len(raw) - head - tail
+    truncated = f"{head_str}\n...truncated {omitted} bytes...\n{tail_str}"
+    return truncated, True
+
+
 def _truncate_output(
     raw: bytes,
     head: int,
     tail: int,
     overflow_path: Path | None,
 ) -> tuple[str, str | None]:
-    if len(raw) <= head + tail:
-        return raw.decode("utf-8", errors="replace"), None
+    text, was_truncated = _build_truncated(raw, head, tail)
+    if not was_truncated:
+        return text, None
     if overflow_path is not None:
         overflow_path.write_bytes(raw)
-    head_str = raw[:head].decode("utf-8", errors="replace")
-    tail_str = raw[-tail:].decode("utf-8", errors="replace")
-    omitted = len(raw) - head - tail
-    truncated = f"{head_str}\n...truncated {omitted} bytes...\n{tail_str}"
-    return truncated, str(overflow_path) if overflow_path is not None else None
+    return text, str(overflow_path) if overflow_path is not None else None
 
 
 def resolve_cwd(cwd: str) -> tuple[Path | None, str | None]:
@@ -297,6 +323,11 @@ def execute(
         except subprocess.TimeoutExpired:
             timed_out = True
             exit_code = -1
+            logger.info(
+                "Inline command hit its executor timeout (%ss); "
+                "terminating SIGTERM->grace->SIGKILL",
+                min(timeout_s, MAX_TIMEOUT_S),
+            )
             _terminate_group_sync(proc)
             raw_stdout, raw_stderr = proc.communicate()
             raw_stdout = raw_stdout or b""
@@ -356,6 +387,29 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+_job_completion: dict[str, asyncio.Event] = {}
+
+
+def _job_is_terminal(persistence: Persistence, job_id: str) -> bool:
+    """True if the persisted job status is anything other than 'running'.
+
+    Used by _watch() to avoid clobbering a terminal status (e.g. 'killed',
+    set concurrently by shell_kill) with its own 'completed'/'failed'/
+    'timed_out' outcome. Any exception reading the row is treated as
+    non-terminal so the watcher still records its own outcome rather than
+    getting stuck.
+    """
+    try:
+        row = persistence.get_job(job_id)
+    except Exception:
+        logger.exception(
+            "Failed to read job %s status before update; proceeding with watcher's own status",
+            job_id,
+        )
+        return False
+    return row is not None and row.get("status") != "running"
+
+
 async def execute_background(
     *,
     command: str,
@@ -365,11 +419,18 @@ async def execute_background(
     agent_id: str,
     persistence: Persistence,
     env_passthrough: list[str] | None = None,
+    track_completion: bool = False,
 ) -> str:
     """Spawn command in background, persist a jobs row, return job_id immediately.
 
     The asyncio watcher task handles timeout and final status update.
     Foreground execution path is completely unchanged.
+
+    If track_completion is True, an asyncio.Event is registered for job_id
+    before the watcher task is scheduled, so a caller (e.g. the inline path
+    diverting per issue #46) can await wait_for_job(job_id, ...) for it.
+    Callers that pass track_completion=True MUST call discard_job_tracking()
+    in a finally block to keep the tracking dict bounded.
     """
     # Validate cwd — same logic as foreground execute()
     resolved, cwd_error = resolve_cwd(cwd)
@@ -435,29 +496,131 @@ async def execute_background(
             logger.exception("Error reaping killed process for job %s", job_id)
         raise
 
+    if track_completion:
+        _job_completion[job_id] = asyncio.Event()
+
     async def _watch() -> None:
         try:
-            await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
-            rc = proc.returncode
-            status = "completed" if rc == 0 else "failed"
-            persistence.update_job_status(
-                job_id,
-                status=status,
-                exit_code=rc,
-                finished_at=_now_iso(),
-            )
-        except TimeoutError:
-            await _terminate_group_async(proc)
-            await proc.wait()
-            persistence.update_job_status(
-                job_id,
-                status="timed_out",
-                exit_code=proc.returncode,
-                finished_at=_now_iso(),
-            )
-        except Exception:
-            logger.exception("Unexpected error in background watcher for job %s", job_id)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
+                rc = proc.returncode
+                status = "completed" if rc == 0 else "failed"
+                logger.debug(
+                    "Background job %s exited on its own (exit_code=%s)", job_id, rc
+                )
+                if _job_is_terminal(persistence, job_id):
+                    return
+                persistence.update_job_status(
+                    job_id,
+                    status=status,
+                    exit_code=rc,
+                    finished_at=_now_iso(),
+                )
+            except TimeoutError:
+                logger.info(
+                    "Background job %s hit its executor timeout (%ss); "
+                    "terminating SIGTERM->grace->SIGKILL",
+                    job_id,
+                    effective_timeout,
+                )
+                await _terminate_group_async(proc)
+                await proc.wait()
+                if _job_is_terminal(persistence, job_id):
+                    return
+                persistence.update_job_status(
+                    job_id,
+                    status="timed_out",
+                    exit_code=proc.returncode,
+                    finished_at=_now_iso(),
+                )
+            except Exception:
+                logger.exception("Unexpected error in background watcher for job %s", job_id)
+        finally:
+            event = _job_completion.get(job_id)
+            if event is not None:
+                event.set()
 
     asyncio.create_task(_watch(), name=f"bg-watch-{job_id}")
 
     return job_id
+
+
+async def wait_for_job(job_id: str, timeout_s: float) -> bool:
+    """Await terminal state for a job registered via execute_background(...,
+    track_completion=True).
+
+    Returns True if the job reached a terminal state within timeout_s, False
+    on timeout or if job_id was never tracked (issue #46: lets the inline
+    execute() path divert a slow command to the background job path and
+    still get a fast result if it finishes quickly after all).
+    """
+    event = _job_completion.get(job_id)
+    if event is None:
+        return False
+    try:
+        await asyncio.wait_for(event.wait(), timeout=timeout_s)
+    except TimeoutError:
+        return False
+    return True
+
+
+def discard_job_tracking(job_id: str) -> None:
+    """Remove job_id's completion Event, if any.
+
+    Callers that pass track_completion=True to execute_background() MUST
+    call this in a finally block so _job_completion stays bounded.
+    """
+    _job_completion.pop(job_id, None)
+
+
+def _read_log_bytes(path: str | None) -> bytes:
+    """Best-effort read of a job log file.
+
+    Missing/unreadable files are treated as empty rather than raising, since
+    job_result() must not fail just because a log file was cleaned up or
+    never flushed.
+    """
+    if not path:
+        return b""
+    try:
+        return Path(path).read_bytes()
+    except OSError:
+        return b""
+
+
+def job_result(*, job_id: str, persistence: Persistence) -> ExecutionResult | None:
+    """Build an ExecutionResult for a finished background job.
+
+    Reads the jobs row and the persisted stdout/stderr log files, applying
+    the exact same truncation rule and marker text as execute() (via
+    _build_truncated) so callers cannot tell inline and diverted-background
+    results apart by their output formatting.
+
+    Returns None if the job row does not exist or is still running.
+    stdout_full_path/stderr_full_path point at the existing job log file
+    (never a fresh overflow file — the log already holds the full output)
+    and are set only when that stream was actually truncated, matching
+    execute()'s contract. duration_ms is always 0; the server computes its
+    own from job timestamps.
+    """
+    row = persistence.get_job(job_id)
+    if row is None or row.get("status") == "running":
+        return None
+
+    raw_stdout = _read_log_bytes(row.get("stdout_path"))
+    raw_stderr = _read_log_bytes(row.get("stderr_path"))
+
+    stdout, stdout_truncated = _build_truncated(raw_stdout, OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES)
+    stderr, stderr_truncated = _build_truncated(raw_stderr, OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES)
+
+    exit_code = row.get("exit_code")
+
+    return ExecutionResult(
+        exit_code=exit_code if exit_code is not None else -1,
+        stdout=stdout,
+        stderr=stderr,
+        stdout_full_path=row.get("stdout_path") if stdout_truncated else None,
+        stderr_full_path=row.get("stderr_path") if stderr_truncated else None,
+        duration_ms=0,
+        timed_out=row.get("status") == "timed_out",
+    )
