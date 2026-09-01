@@ -211,6 +211,78 @@ async def test_over_budget_slow_command_diverts_and_completes(
 
 
 # ---------------------------------------------------------------------------
+# 9b) issue #49: a genuinely diverted job's shell_calls row is reconciled
+#     from decision="running" to "executed" once it reaches terminal state,
+#     with decision_path still containing "inline_budget_divert" (preserved,
+#     not overwritten, by the watcher's reconciliation).
+# ---------------------------------------------------------------------------
+
+
+async def test_over_budget_slow_command_reconciles_shell_calls_row(
+    job_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHELL_RUNNER_INLINE_BUDGET_S", "1")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "sleep 3 && echo DONE_MARKER",
+                "cwd": "/tmp",
+                "agent_id": AGENT_ID,
+                "timeout_s": 30,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["decision"] == "running"
+        job_id = data["job_id"]
+        telemetry_id = data["telemetry_id"]
+
+        await _wait_for_status(
+            client, job_id, terminal={"completed", "failed", "timed_out"}, timeout_s=8.0
+        )
+
+    row = _shell_calls_row(telemetry_id)
+    assert row["decision"] == "executed"
+    assert row["exit_code"] == 0
+    assert "inline_budget_divert" in row["decision_path_json"]
+
+
+# ---------------------------------------------------------------------------
+# 9c) issue #49 race regression: an over-budget but FAST command must be
+#     reconciled by the server's own unconditional finalize_call, not by the
+#     background watcher's conditional one — proven by decision_path NOT
+#     containing "inline_budget_divert" (the watcher's reconciliation is a
+#     no-op here because the server's write already flipped decision away
+#     from "running" first).
+# ---------------------------------------------------------------------------
+
+
+async def test_over_budget_but_fast_command_wins_race_against_watcher(
+    job_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SHELL_RUNNER_INLINE_BUDGET_S", "1")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/execute",
+            json={
+                "command": "echo fast",
+                "cwd": "/tmp",
+                "agent_id": AGENT_ID,
+                "timeout_s": 30,  # > budget, but the command finishes in well under 1s
+            },
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["decision"] == "executed"
+    assert data["job_id"] is None
+
+    row = _shell_calls_row(data["telemetry_id"])
+    assert row["decision"] == "executed"
+    assert "inline_budget_divert" not in row["decision_path_json"]
+
+
+# ---------------------------------------------------------------------------
 # 10) Same regression through the T3/T4 approval path
 #     (_execute_approved_command).
 # ---------------------------------------------------------------------------

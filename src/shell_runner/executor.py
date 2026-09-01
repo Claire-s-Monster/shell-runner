@@ -452,6 +452,10 @@ async def execute_background(
     stdout_file = stdout_path.open("wb")
     stderr_file = stderr_path.open("wb")
 
+    # Captured before spawn so _watch() can compute a real duration_ms when it
+    # reconciles the shell_calls row (issue #49).
+    spawn_started_at = time.monotonic()
+
     try:
         proc = await asyncio.create_subprocess_exec(
             "/bin/bash",
@@ -536,6 +540,45 @@ async def execute_background(
             except Exception:
                 logger.exception("Unexpected error in background watcher for job %s", job_id)
         finally:
+            # Reconcile the shell_calls row pre-written as decision="running"
+            # (issue #49): every dispatch through execute_background() writes
+            # that row up front — jobs.telemetry_id has an immediate FK on
+            # shell_calls(id) and Persistence opens every connection with
+            # PRAGMA foreign_keys=ON — but nothing used to update it once the
+            # job actually finished, so a completed job stayed recorded as
+            # "running" forever, corrupting health_stats() denominators and
+            # issue #41's decision-aware retention.
+            #
+            # This MUST run before event.set() below. For a job that finishes
+            # within the inline budget, server.py's own unconditional
+            # finalize_call runs (via _run_with_inline_budget) only after
+            # wait_for_job() observes event.set() — so reconciling here first
+            # means the watcher's write always lands before the server's, and
+            # only_if_running=True makes the watcher's write a safe no-op in
+            # that case: the server's unconditional write deterministically
+            # wins. Reversing this ordering would let the watcher's write win
+            # instead, silently dropping the server's more specific
+            # decision_path (e.g. "inline_budget_divert").
+            try:
+                job_row = persistence.get_job(job_id)
+                if job_row is not None:
+                    duration_ms = int((time.monotonic() - spawn_started_at) * 1000)
+                    persistence.finalize_call(
+                        telemetry_id,
+                        decision="executed",  # the command did run, even if timed_out/killed
+                        exit_code=job_row.get("exit_code"),
+                        stdout_bytes=_log_size_bytes(job_row.get("stdout_path")),
+                        stderr_bytes=_log_size_bytes(job_row.get("stderr_path")),
+                        duration_ms=duration_ms,
+                        decision_path=None,  # preserve the prewritten path
+                        only_if_running=True,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to reconcile shell_calls row for job %s (telemetry_id=%s)",
+                    job_id,
+                    telemetry_id,
+                )
             event = _job_completion.get(job_id)
             if event is not None:
                 event.set()
@@ -571,6 +614,26 @@ def discard_job_tracking(job_id: str) -> None:
     call this in a finally block so _job_completion stays bounded.
     """
     _job_completion.pop(job_id, None)
+
+
+def _log_size_bytes(path: str | None) -> int:
+    """Best-effort byte count of a job log file via stat(), 0 on OSError.
+
+    Deliberately does NOT read the file into memory the way _read_log_bytes()
+    does for the inline job_result() path — a background job may have run
+    for an hour and produced a very large log, so reconciling shell_calls
+    (see _watch()) must stay O(1) in log size. st_size is also the more
+    accurate figure for the output_bytes_stdout/output_bytes_stderr columns:
+    it is the bytes actually produced, whereas the inline path records
+    len(exec_result.stdout), the length of the (possibly truncated) decoded
+    string.
+    """
+    if not path:
+        return 0
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return 0
 
 
 def _read_log_bytes(path: str | None) -> bytes:
