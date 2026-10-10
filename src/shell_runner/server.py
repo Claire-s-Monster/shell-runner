@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import time
 import uuid
@@ -68,6 +69,8 @@ from .models import (
     ShellKillResponse,
     ShellStatusRequest,
     ShellStatusResponse,
+    ShellWaitRequest,
+    ShellWaitResponse,
 )
 from .normalizer import describe_template_scope
 from .persistence import DEFAULT_DB_PATH, CatalogWriter, Persistence, TelemetryWriter
@@ -1077,9 +1080,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     final_tier=int(cls.tier),
                     decision="executed",
                     matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-                    matched_rule_category=(
-                        cls.matched_rule.category if cls.matched_rule else None
-                    ),
+                    matched_rule_category=(cls.matched_rule.category if cls.matched_rule else None),
                     exit_code=exec_result.exit_code,
                     stdout_bytes=len(exec_result.stdout),
                     stderr_bytes=len(exec_result.stderr),
@@ -1098,9 +1099,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     final_tier=int(cls.tier),
                     decision="executed",
                     matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
-                    matched_rule_category=(
-                        cls.matched_rule.category if cls.matched_rule else None
-                    ),
+                    matched_rule_category=(cls.matched_rule.category if cls.matched_rule else None),
                     exit_code=exec_result.exit_code,
                     stdout_bytes=len(exec_result.stdout),
                     stderr_bytes=len(exec_result.stderr),
@@ -1606,6 +1605,94 @@ async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
     )
 
 
+# issue #51 — shell_wait. MAX_WAIT_S stays below the 20s inline budget / MCP
+# transport cutoff (#46) so a single call never outlives the client's patience.
+MAX_WAIT_S = 15
+MAX_CONCURRENT_WAITS = 8
+MAX_RESULT_REGEX_LEN = 256
+MAX_RESULT_LINES_CAP = 100
+WAIT_POLL_INTERVAL_S = 0.5
+
+_wait_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WAITS)
+
+
+def _is_terminal(job: dict) -> bool:
+    # Keep in sync with executor._job_is_terminal: anything other than "running" is terminal.
+    return job["status"] != "running"
+
+
+def _wait_error(job_id: str, message: str, started: float) -> ShellWaitResponse:
+    return ShellWaitResponse(
+        job_id=job_id, state="error", elapsed_s=time.monotonic() - started, error=message
+    )
+
+
+def _matched_lines(job: dict, pattern: re.Pattern[str], limit: int) -> list[str]:
+    """Lines matching *pattern* in the bounded stdout then stderr tails, up to *limit*."""
+    matches: list[str] = []
+    for path in (job["stdout_path"], job["stderr_path"]):
+        for line in _tail(path, OUTPUT_TAIL_BYTES).splitlines():
+            if pattern.search(line):
+                matches.append(line)
+                if len(matches) >= limit:
+                    return matches
+    return matches
+
+
+async def _wait_for_terminal(job_id: str, wait_s: float) -> dict | None:
+    """Poll the job row until terminal or *wait_s* elapses; return the last row (None if unknown)."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        job = db.get_job(job_id)
+        if job is None or _is_terminal(job):
+            return job
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return job
+        await asyncio.sleep(min(WAIT_POLL_INTERVAL_S, remaining))
+
+
+@app.post("/tools/shell_wait", response_model=ShellWaitResponse)
+async def shell_wait_route(body: ShellWaitRequest) -> ShellWaitResponse:
+    """Wait (bounded) for a background job to reach a terminal state; runs no command."""
+    started = time.monotonic()
+    wait_s = min(max(body.wait_s, 0.0), float(MAX_WAIT_S))
+    max_lines = min(max(body.max_result_lines, 1), MAX_RESULT_LINES_CAP)
+
+    pattern: re.Pattern[str] | None = None
+    if body.result_regex is not None:
+        if len(body.result_regex) > MAX_RESULT_REGEX_LEN:
+            return _wait_error(
+                body.job_id, f"result_regex exceeds {MAX_RESULT_REGEX_LEN} chars", started
+            )
+        try:
+            pattern = re.compile(body.result_regex)
+        except re.error as exc:
+            return _wait_error(body.job_id, f"invalid result_regex: {exc}", started)
+
+    # Saturated: do a single check rather than queueing behind other waiters.
+    if _wait_semaphore.locked():
+        job = await _wait_for_terminal(body.job_id, 0.0)
+    else:
+        async with _wait_semaphore:
+            job = await _wait_for_terminal(body.job_id, wait_s)
+
+    if job is None:
+        return _wait_error(body.job_id, f"job {body.job_id} not found", started)
+
+    done = _is_terminal(job)
+    return ShellWaitResponse(
+        job_id=job["job_id"],
+        state="done" if done else "waiting",
+        job_status=job["status"],
+        exit_code=job["exit_code"],
+        elapsed_s=time.monotonic() - started,
+        matched_lines=_matched_lines(job, pattern, max_lines) if done and pattern else [],
+        stdout_full_path=job["stdout_path"],
+        stderr_full_path=job["stderr_path"],
+    )
+
+
 @app.post("/tools/shell_kill", response_model=ShellKillResponse)
 async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
     job = db.get_job(body.job_id)
@@ -1842,6 +1929,14 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
             logger.exception("Invalid arguments for shell_status")
             return {"error": "invalid arguments"}
         return (await shell_status_route(status_req)).model_dump()
+
+    if tool_name == "shell_wait":
+        try:
+            wait_req = ShellWaitRequest(**arguments)
+        except Exception:
+            logger.exception("Invalid arguments for shell_wait")
+            return {"error": "invalid arguments"}
+        return (await shell_wait_route(wait_req)).model_dump()
 
     if tool_name == "shell_kill":
         try:

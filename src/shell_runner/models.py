@@ -215,6 +215,35 @@ class ShellStatusResponse(BaseModel):
     stderr_full_path: str | None
 
 
+class ShellWaitRequest(BaseModel):
+    job_id: str
+    wait_s: float = Field(
+        default=15,
+        allow_inf_nan=False,
+        description="Max seconds to wait for the job to finish (clamped to [0, 15]; 0 = check once).",
+    )
+    result_regex: str | None = Field(
+        default=None,
+        description="If set, matching lines from the output tails are returned once the job is done.",
+    )
+    max_result_lines: int = Field(
+        default=25,
+        description="Cap on matched_lines (clamped to [1, 100]).",
+    )
+
+
+class ShellWaitResponse(BaseModel):
+    job_id: str
+    state: Literal["done", "waiting", "error"]
+    job_status: JobStatus | None = None
+    exit_code: int | None = None
+    elapsed_s: float = 0.0
+    matched_lines: list[str] = Field(default_factory=list)
+    stdout_full_path: str | None = None
+    stderr_full_path: str | None = None
+    error: str | None = None
+
+
 class ShellKillRequest(BaseModel):
     job_id: str
     sig: str = Field(

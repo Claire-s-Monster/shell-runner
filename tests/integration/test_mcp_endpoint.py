@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from shell_runner.persistence import Persistence
 from shell_runner.server import app
@@ -62,10 +63,10 @@ def test_initialize_sets_protocol_version_header(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tools_list_returns_seven_tools(client: TestClient) -> None:
+def test_tools_list_returns_eight_tools(client: TestClient) -> None:
     resp = _post(client, "tools/list", req_id=2)
     tools = resp["result"]["tools"]
-    assert len(tools) == 7
+    assert len(tools) == 8
     names = {t["name"] for t in tools}
     assert names == {
         "shell_execute",
@@ -74,6 +75,7 @@ def test_tools_list_returns_seven_tools(client: TestClient) -> None:
         "shell_get_pending",
         "shell_health",
         "shell_status",
+        "shell_wait",
         "shell_kill",
     }
 
@@ -128,6 +130,61 @@ def test_tools_call_shell_execute_safe_cmd(client: TestClient, tmp_path: Path) -
     assert payload["decision"] == "executed"
     assert payload["exit_code"] == 0
     assert "hello" in payload["stdout"]
+
+
+async def test_tools_call_shell_wait_runs_background_job_to_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #51: shell_wait needs no agent_id and sees a background job finish.
+
+    Uses httpx.AsyncClient (not the sync TestClient) so the background watcher
+    task keeps progressing between requests.
+    """
+    monkeypatch.setenv("SHELL_RUNNER_JOB_DIR", str(tmp_path))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+
+        async def _call(name: str, arguments: dict) -> dict:
+            r = await ac.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "id": 9,
+                    "params": {"name": name, "arguments": arguments},
+                },
+            )
+            return json.loads(r.json()["result"]["content"][0]["text"])
+
+        started = await _call(
+            "shell_execute",
+            {
+                "command": "sleep 1; echo wait-marker",
+                "cwd": str(tmp_path),
+                "agent_id": "focused-ghc-ci-analyzer",
+                "run_in_background": True,
+            },
+        )
+        assert started["decision"] == "running"
+        payload = await _call(
+            "shell_wait",
+            {"job_id": started["job_id"], "wait_s": 10, "result_regex": "wait-marker"},
+        )
+    assert payload["state"] == "done"
+    assert payload["job_status"] == "completed"
+    assert payload["exit_code"] == 0
+    assert payload["matched_lines"] == ["wait-marker"]
+
+
+def test_tools_call_shell_wait_unknown_job_without_agent_id(client: TestClient) -> None:
+    resp = _post(
+        client,
+        "tools/call",
+        params={"name": "shell_wait", "arguments": {"job_id": "nope", "wait_s": 0}},
+        req_id=8,
+    )
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert payload["state"] == "error"
+    assert "not found" in payload["error"]
 
 
 def test_tools_call_shell_execute_returns_structured_error_on_exception(
