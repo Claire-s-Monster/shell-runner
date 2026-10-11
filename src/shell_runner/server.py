@@ -239,13 +239,13 @@ async def _periodic_cleanup(interval_s: int = 60) -> None:
     while True:
         await asyncio.sleep(interval_s)
         try:
-            removed_prompts = db.cleanup_expired_prompts()
+            removed_prompts = await asyncio.to_thread(db.cleanup_expired_prompts)
             if removed_prompts:
                 logger.debug("Cleaned up %d expired pending prompt(s)", removed_prompts)
         except Exception:
             logger.exception("Error during periodic prompt cleanup")
         try:
-            removed_jobs = db.cleanup_old_jobs(RETENTION_S)
+            removed_jobs = await asyncio.to_thread(db.cleanup_old_jobs, RETENTION_S)
             for job in removed_jobs:
                 for file_path in (job.get("stdout_path"), job.get("stderr_path")):
                     if file_path and Path(file_path).exists():
@@ -264,7 +264,9 @@ async def _periodic_cleanup(interval_s: int = 60) -> None:
         except Exception:
             logger.exception("Error during periodic job cleanup")
         try:
-            removed_shell_calls = db.cleanup_old_shell_calls(SHELL_CALLS_RETENTION_S)
+            removed_shell_calls = await asyncio.to_thread(
+                db.cleanup_old_shell_calls, SHELL_CALLS_RETENTION_S
+            )
             if removed_shell_calls:
                 logger.debug("Cleaned up %d stale shell_calls row(s)", removed_shell_calls)
         except Exception:
@@ -290,7 +292,7 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         logger.debug("SIGHUP not supported on this platform; skipping signal handler")
 
     if os.environ.get("SHELL_RUNNER_LOAD_SEED_APPROVALS", "1") != "0":
-        n = db.seed_approvals(DEFAULT_SEED_APPROVALS)
+        n = await asyncio.to_thread(db.seed_approvals, DEFAULT_SEED_APPROVALS)
         if n > 0:
             logger.info("Seeded %d approval template(s) into template_approvals", n)
 
@@ -394,7 +396,8 @@ async def _prewrite_inline_budget_telemetry(
             wait=True,
         )
     else:
-        db.record_call(
+        await asyncio.to_thread(
+            db.record_call,
             call_id=telemetry_id,
             agent_id=req.agent_id,
             cwd=req.cwd,
@@ -526,7 +529,8 @@ async def _execute_approved_command(
                 normalizer_warnings=list(recheck_cls.normalizer_warnings),
             )
         else:
-            db.record_call(
+            await asyncio.to_thread(
+                db.record_call,
                 call_id=telemetry_id,
                 agent_id=req.agent_id,
                 cwd=req.cwd,
@@ -599,7 +603,8 @@ async def _execute_approved_command(
                 wait=True,
             )
         else:
-            db.record_call(
+            await asyncio.to_thread(
+                db.record_call,
                 call_id=telemetry_id,
                 agent_id=req.agent_id,
                 cwd=req.cwd,
@@ -741,7 +746,8 @@ async def _execute_approved_command(
                 normalizer_warnings=[],
             )
         else:
-            db.record_call(
+            await asyncio.to_thread(
+                db.record_call,
                 call_id=telemetry_id,
                 agent_id=req.agent_id,
                 cwd=req.cwd,
@@ -847,7 +853,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 status_code=403,
                 detail="approve_token does not match: " + "; ".join(mismatches),
             )
-        prompt = db.consume_approve_token(token=req.approve_token)
+        prompt = await asyncio.to_thread(db.consume_approve_token, token=req.approve_token)
         if prompt is None:
             raise HTTPException(
                 status_code=403,
@@ -885,7 +891,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 normalizer_warnings=list(cls.normalizer_warnings),
             )
         else:
-            db.record_call(
+            await asyncio.to_thread(
+                db.record_call,
                 call_id=telemetry_id,
                 agent_id=req.agent_id,
                 cwd=req.cwd,
@@ -961,7 +968,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     wait=True,
                 )
             else:
-                db.record_call(
+                await asyncio.to_thread(
+                    db.record_call,
                     call_id=telemetry_id,
                     agent_id=req.agent_id,
                     cwd=req.cwd,
@@ -1089,7 +1097,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     normalizer_warnings=list(cls.normalizer_warnings),
                 )
             else:
-                db.record_call(
+                await asyncio.to_thread(
+                    db.record_call,
                     call_id=telemetry_id,
                     agent_id=req.agent_id,
                     cwd=req.cwd,
@@ -1161,8 +1170,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
     # (raw_cmd, cwd, agent_id) consumes it once instead of re-prompting.
     # Single-use + TTL-bounded + exact (cmd, cwd, agent) match = same trust
     # boundary as consuming an approve_token, just without requiring the token.
-    consumed = db.consume_approval_by_command(
-        raw_cmd=req.command, cwd=req.cwd, agent_id=req.agent_id
+    consumed = await asyncio.to_thread(
+        db.consume_approval_by_command, raw_cmd=req.command, cwd=req.cwd, agent_id=req.agent_id
     )
     if consumed is not None:
         return await _execute_approved_command(
@@ -1201,7 +1210,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 normalizer_warnings=list(cls.normalizer_warnings),
             )
         else:
-            db.record_call(
+            await asyncio.to_thread(
+                db.record_call,
                 call_id=telemetry_id,
                 agent_id=req.agent_id,
                 cwd=req.cwd,
@@ -1233,7 +1243,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         )
 
     # T3/T4 — create pending prompt, return prompt_required
-    prompt_id = db.create_pending_prompt(
+    prompt_id = await asyncio.to_thread(
+        db.create_pending_prompt,
         agent_id=req.agent_id,
         cwd=req.cwd,
         raw_cmd=req.command,
@@ -1264,7 +1275,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             normalizer_warnings=list(cls.normalizer_warnings),
         )
     else:
-        db.record_call(
+        await asyncio.to_thread(
+            db.record_call,
             call_id=telemetry_id,
             agent_id=req.agent_id,
             cwd=req.cwd,
@@ -1502,7 +1514,9 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             ),
         )
 
-    token = db.approve_prompt(prompt_id=req.prompt_id, decision=req.decision)
+    token = await asyncio.to_thread(
+        db.approve_prompt, prompt_id=req.prompt_id, decision=req.decision
+    )
     if token is None and req.decision != "deny":
         raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
 
@@ -1519,7 +1533,8 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         promoted_tier = _validate_promotion_tier(req.promote_to_tier, int(prompt["command_tier"]))
 
         agent_scope = None if req.decision == "approve_template_global" else prompt["agent_id"]
-        entry_id = db.create_template_approval(
+        entry_id = await asyncio.to_thread(
+            db.create_template_approval,
             template=prompt["normalized_template"],
             agent_id=agent_scope,
             approved_tier=promoted_tier,
@@ -1541,7 +1556,8 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         prompt_cls = classify(prompt["raw_cmd"], prompt["cwd"], prompt["agent_id"])
         verb = prompt_cls.segments[0].segment.verb if prompt_cls.segments else ""
         cwd_prefix = os.path.realpath(prompt["cwd"])
-        entry_id = db.create_verb_approval(
+        entry_id = await asyncio.to_thread(
+            db.create_verb_approval,
             verb=verb,
             cwd_prefix=cwd_prefix,
             agent_id=prompt["agent_id"],
@@ -1716,7 +1732,9 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
         # the DB afterwards. _watch() (executor.py) now skips its own update
         # once the row is already terminal, so this write is not clobbered by
         # the background watcher racing to record its own outcome.
-        db.update_job_status(body.job_id, status="killed", finished_at=_now_iso())
+        await asyncio.to_thread(
+            db.update_job_status, body.job_id, status="killed", finished_at=_now_iso()
+        )
         logger.info(
             "shell_kill terminated job %s (pid %d) with %s",
             body.job_id,
@@ -1725,7 +1743,9 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
         )
         return ShellKillResponse(killed=True, sig=body.sig)
     except ProcessLookupError:
-        db.update_job_status(body.job_id, status="killed", finished_at=_now_iso())
+        await asyncio.to_thread(
+            db.update_job_status, body.job_id, status="killed", finished_at=_now_iso()
+        )
         return ShellKillResponse(killed=True, reason="process already gone, status updated")
 
 
