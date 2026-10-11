@@ -1030,13 +1030,19 @@ class Persistence:
         status: str,
         exit_code: int | None = None,
         finished_at: str | None = None,
+        only_if_running: bool = False,
     ) -> None:
+        """Update a job's status.
+
+        With only_if_running=True the UPDATE is a no-op unless the row is still
+        'running', so a concurrent terminal write (e.g. shell_kill's 'killed')
+        is never clobbered; the check and write are one SQL statement.
+        """
+        guard = " AND status = 'running'" if only_if_running else ""
         with self._write_conn() as conn:
             conn.execute(
-                """
-                UPDATE jobs SET status = ?, exit_code = ?, finished_at = ?
-                WHERE job_id = ?
-                """,
+                "UPDATE jobs SET status = ?, exit_code = ?, finished_at = ? "
+                f"WHERE job_id = ?{guard}",  # noqa: S608 - constant fragment, no user input
                 (status, exit_code, finished_at, job_id),
             )
 

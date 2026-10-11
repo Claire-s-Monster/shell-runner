@@ -476,7 +476,8 @@ async def execute_background(
     stderr_file.close()
 
     try:
-        persistence.create_job(
+        await asyncio.to_thread(
+            persistence.create_job,
             job_id=job_id,
             telemetry_id=telemetry_id,
             raw_cmd=command,
@@ -509,16 +510,16 @@ async def execute_background(
                 await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
                 rc = proc.returncode
                 status = "completed" if rc == 0 else "failed"
-                logger.debug(
-                    "Background job %s exited on its own (exit_code=%s)", job_id, rc
-                )
+                logger.debug("Background job %s exited on its own (exit_code=%s)", job_id, rc)
                 if _job_is_terminal(persistence, job_id):
                     return
-                persistence.update_job_status(
+                await asyncio.to_thread(
+                    persistence.update_job_status,
                     job_id,
                     status=status,
                     exit_code=rc,
                     finished_at=_now_iso(),
+                    only_if_running=True,
                 )
             except TimeoutError:
                 logger.info(
@@ -531,11 +532,13 @@ async def execute_background(
                 await proc.wait()
                 if _job_is_terminal(persistence, job_id):
                     return
-                persistence.update_job_status(
+                await asyncio.to_thread(
+                    persistence.update_job_status,
                     job_id,
                     status="timed_out",
                     exit_code=proc.returncode,
                     finished_at=_now_iso(),
+                    only_if_running=True,
                 )
             except Exception:
                 logger.exception("Unexpected error in background watcher for job %s", job_id)
@@ -563,7 +566,8 @@ async def execute_background(
                 job_row = persistence.get_job(job_id)
                 if job_row is not None:
                     duration_ms = int((time.monotonic() - spawn_started_at) * 1000)
-                    persistence.finalize_call(
+                    await asyncio.to_thread(
+                        persistence.finalize_call,
                         telemetry_id,
                         decision="executed",  # the command did run, even if timed_out/killed
                         exit_code=job_row.get("exit_code"),
