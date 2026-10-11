@@ -122,8 +122,11 @@ def test_concurrent_approve_token_consume(
 def test_concurrent_template_upserts(client: TestClient, tmp_path: Path, db_path: Path) -> None:
     """15 concurrent agents hitting the same command keep a consistent template count."""
 
+    responses: list[tuple[int, str]] = []
+    lock = threading.Lock()
+
     def call(agent_id: str) -> None:
-        client.post(
+        r = client.post(
             "/execute",
             json={
                 "command": "ls /tmp",
@@ -131,12 +134,18 @@ def test_concurrent_template_upserts(client: TestClient, tmp_path: Path, db_path
                 "agent_id": agent_id,
             },
         )
+        with lock:
+            responses.append((r.status_code, r.text))
 
     threads = [threading.Thread(target=call, args=(f"agent-{i}",)) for i in range(15)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+
+    failed = [(sc, body) for sc, body in responses if sc != 200]
+    assert len(responses) == 15
+    assert not failed, f"{len(failed)} /execute calls did not return 200: {failed}"
 
     # Query via db_path directly (bypasses env var resolution)
     p = Persistence(db_path)
@@ -145,7 +154,7 @@ def test_concurrent_template_upserts(client: TestClient, tmp_path: Path, db_path
         # that contains "ls" to find the row regardless of exact normalization.
         row = c.execute(
             "SELECT template, observed_count, observed_agents_json"
-            " FROM templates WHERE template LIKE 'ls%'",
+            " FROM templates WHERE template LIKE 'ls%' ORDER BY observed_count DESC",
         ).fetchone()
 
     assert row is not None, "template row missing — no 'ls' template found in DB"
