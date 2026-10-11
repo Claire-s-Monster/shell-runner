@@ -222,9 +222,12 @@ class ShellWaitRequest(BaseModel):
         allow_inf_nan=False,
         description="Max seconds to wait for the job to finish (clamped to [0, 15]; 0 = check once).",
     )
-    result_regex: str | None = Field(
+    result_contains: list[str] | None = Field(
         default=None,
-        description="If set, matching lines from the output tails are returned once the job is done.",
+        description=(
+            "If set, lines from the output tails containing ANY of these strings (plain "
+            "case-sensitive substring match, no regex) are returned once the job is done."
+        ),
     )
     max_result_lines: int = Field(
         default=25,

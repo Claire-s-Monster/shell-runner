@@ -17,7 +17,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
 import time
 import uuid
@@ -1609,7 +1608,10 @@ async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
 # transport cutoff (#46) so a single call never outlives the client's patience.
 MAX_WAIT_S = 15
 MAX_CONCURRENT_WAITS = 8
-MAX_RESULT_REGEX_LEN = 256
+# Regex filtering was deliberately dropped (ReDoS on the single-process event
+# loop; CodeQL alert). result_contains is plain case-sensitive substring matching.
+MAX_RESULT_CONTAINS_ITEMS = 10
+MAX_RESULT_CONTAINS_LEN = 256
 MAX_RESULT_LINES_CAP = 100
 WAIT_POLL_INTERVAL_S = 0.5
 
@@ -1627,12 +1629,23 @@ def _wait_error(job_id: str, message: str, started: float) -> ShellWaitResponse:
     )
 
 
-def _matched_lines(job: dict, pattern: re.Pattern[str], limit: int) -> list[str]:
-    """Lines matching *pattern* in the bounded stdout then stderr tails, up to *limit*."""
+def _validate_needles(needles: list[str]) -> str | None:
+    """Return an error message if *needles* violate the count/length/non-empty limits."""
+    if len(needles) > MAX_RESULT_CONTAINS_ITEMS:
+        return f"result_contains exceeds {MAX_RESULT_CONTAINS_ITEMS} items"
+    if any(not n for n in needles):
+        return "result_contains items must be non-empty"
+    if any(len(n) > MAX_RESULT_CONTAINS_LEN for n in needles):
+        return f"result_contains item exceeds {MAX_RESULT_CONTAINS_LEN} chars"
+    return None
+
+
+def _matched_lines(job: dict, needles: tuple[str, ...] | list[str], limit: int) -> list[str]:
+    """Lines containing any of *needles* in the bounded stdout then stderr tails, up to *limit*."""
     matches: list[str] = []
     for path in (job["stdout_path"], job["stderr_path"]):
         for line in _tail(path, OUTPUT_TAIL_BYTES).splitlines():
-            if pattern.search(line):
+            if any(n in line for n in needles):
                 matches.append(line)
                 if len(matches) >= limit:
                     return matches
@@ -1659,16 +1672,12 @@ async def shell_wait_route(body: ShellWaitRequest) -> ShellWaitResponse:
     wait_s = min(max(body.wait_s, 0.0), float(MAX_WAIT_S))
     max_lines = min(max(body.max_result_lines, 1), MAX_RESULT_LINES_CAP)
 
-    pattern: re.Pattern[str] | None = None
-    if body.result_regex is not None:
-        if len(body.result_regex) > MAX_RESULT_REGEX_LEN:
-            return _wait_error(
-                body.job_id, f"result_regex exceeds {MAX_RESULT_REGEX_LEN} chars", started
-            )
-        try:
-            pattern = re.compile(body.result_regex)
-        except re.error as exc:
-            return _wait_error(body.job_id, f"invalid result_regex: {exc}", started)
+    needles: tuple[str, ...] = ()
+    if body.result_contains:
+        error = _validate_needles(body.result_contains)
+        if error is not None:
+            return _wait_error(body.job_id, error, started)
+        needles = tuple(body.result_contains)
 
     # Saturated: do a single check rather than queueing behind other waiters.
     if _wait_semaphore.locked():
@@ -1687,7 +1696,7 @@ async def shell_wait_route(body: ShellWaitRequest) -> ShellWaitResponse:
         job_status=job["status"],
         exit_code=job["exit_code"],
         elapsed_s=time.monotonic() - started,
-        matched_lines=_matched_lines(job, pattern, max_lines) if done and pattern else [],
+        matched_lines=_matched_lines(job, needles, max_lines) if done and needles else [],
         stdout_full_path=job["stdout_path"],
         stderr_full_path=job["stderr_path"],
     )

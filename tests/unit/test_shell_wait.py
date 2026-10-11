@@ -78,24 +78,49 @@ async def test_unknown_job_is_error(db: Persistence) -> None:
     assert "not found" in (resp.error or "")
 
 
-async def test_invalid_regex_is_error(db: Persistence, tmp_path: Path) -> None:
+async def test_too_many_items_is_error(db: Persistence, tmp_path: Path) -> None:
     job_id = _make_job(db, tmp_path)
-    resp = await shell_wait_route(ShellWaitRequest(job_id=job_id, wait_s=0, result_regex="("))
+    resp = await shell_wait_route(
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["a"] * 11)
+    )
     assert resp.state == "error"
-    assert "invalid result_regex" in (resp.error or "")
+    assert "10" in (resp.error or "")
 
 
-async def test_overlong_regex_is_error(db: Persistence, tmp_path: Path) -> None:
+async def test_empty_item_is_error(db: Persistence, tmp_path: Path) -> None:
     job_id = _make_job(db, tmp_path)
-    resp = await shell_wait_route(ShellWaitRequest(job_id=job_id, wait_s=0, result_regex="a" * 257))
+    resp = await shell_wait_route(
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["ok", ""])
+    )
+    assert resp.state == "error"
+    assert "non-empty" in (resp.error or "")
+
+
+async def test_overlong_item_is_error(db: Persistence, tmp_path: Path) -> None:
+    job_id = _make_job(db, tmp_path)
+    resp = await shell_wait_route(
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["a" * 257])
+    )
     assert resp.state == "error"
     assert "256" in (resp.error or "")
 
 
-async def test_regex_at_limit_is_accepted(db: Persistence, tmp_path: Path) -> None:
+async def test_item_at_limit_is_accepted(db: Persistence, tmp_path: Path) -> None:
     job_id = _make_job(db, tmp_path)
-    resp = await shell_wait_route(ShellWaitRequest(job_id=job_id, wait_s=0, result_regex="a" * 256))
+    resp = await shell_wait_route(
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["a" * 256])
+    )
     assert resp.state == "waiting"
+
+
+async def test_regex_metacharacters_are_literal(db: Persistence, tmp_path: Path) -> None:
+    job_id = _make_job(db, tmp_path, stdout="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX\nfoo (a+)+$ bar\n")
+    db.update_job_status(job_id, status="completed", exit_code=0, finished_at="2026-01-01")
+    resp = await shell_wait_route(
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["(a+)+$"])
+    )
+    assert resp.matched_lines == ["foo (a+)+$ bar"]
+    assert resp.elapsed_s < 1
 
 
 async def test_running_job_gives_waiting(db: Persistence, tmp_path: Path) -> None:
@@ -159,11 +184,13 @@ async def test_wait_s_is_clamped_to_max(
 async def test_matched_lines_filter_stdout_then_stderr(db: Persistence, tmp_path: Path) -> None:
     job_id = _make_job(db, tmp_path, stdout="ok\nERROR one\nfine\n", stderr="ERROR two\nwarn\n")
     db.update_job_status(job_id, status="completed", exit_code=0, finished_at="2026-01-01")
-    resp = await shell_wait_route(ShellWaitRequest(job_id=job_id, wait_s=0, result_regex=r"^ERROR"))
-    assert resp.matched_lines == ["ERROR one", "ERROR two"]
+    resp = await shell_wait_route(
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["ERROR", "warn"])
+    )
+    assert resp.matched_lines == ["ERROR one", "ERROR two", "warn"]
 
 
-async def test_no_regex_returns_no_lines(db: Persistence, tmp_path: Path) -> None:
+async def test_no_needles_returns_no_lines(db: Persistence, tmp_path: Path) -> None:
     job_id = _make_job(db, tmp_path, stdout="secret output\n")
     db.update_job_status(job_id, status="completed", exit_code=0, finished_at="2026-01-01")
     resp = await shell_wait_route(ShellWaitRequest(job_id=job_id, wait_s=0))
@@ -172,7 +199,9 @@ async def test_no_regex_returns_no_lines(db: Persistence, tmp_path: Path) -> Non
 
 async def test_no_matched_lines_while_waiting(db: Persistence, tmp_path: Path) -> None:
     job_id = _make_job(db, tmp_path, stdout="hit\n")
-    resp = await shell_wait_route(ShellWaitRequest(job_id=job_id, wait_s=0, result_regex="hit"))
+    resp = await shell_wait_route(
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["hit"])
+    )
     assert resp.state == "waiting"
     assert resp.matched_lines == []
 
@@ -181,15 +210,15 @@ async def test_max_result_lines_caps_and_clamps(db: Persistence, tmp_path: Path)
     job_id = _make_job(db, tmp_path, stdout="".join(f"hit {i}\n" for i in range(50)))
     db.update_job_status(job_id, status="completed", exit_code=0, finished_at="2026-01-01")
     capped = await shell_wait_route(
-        ShellWaitRequest(job_id=job_id, wait_s=0, result_regex="hit", max_result_lines=5)
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["hit"], max_result_lines=5)
     )
     assert capped.matched_lines == [f"hit {i}" for i in range(5)]
     low = await shell_wait_route(
-        ShellWaitRequest(job_id=job_id, wait_s=0, result_regex="hit", max_result_lines=0)
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["hit"], max_result_lines=0)
     )
     assert len(low.matched_lines) == 1
     high = await shell_wait_route(
-        ShellWaitRequest(job_id=job_id, wait_s=0, result_regex="hit", max_result_lines=10_000)
+        ShellWaitRequest(job_id=job_id, wait_s=0, result_contains=["hit"], max_result_lines=10_000)
     )
     assert len(high.matched_lines) == 50
 

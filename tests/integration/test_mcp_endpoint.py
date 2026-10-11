@@ -167,7 +167,7 @@ async def test_tools_call_shell_wait_runs_background_job_to_done(
         assert started["decision"] == "running"
         payload = await _call(
             "shell_wait",
-            {"job_id": started["job_id"], "wait_s": 10, "result_regex": "wait-marker"},
+            {"job_id": started["job_id"], "wait_s": 10, "result_contains": ["wait-marker"]},
         )
     assert payload["state"] == "done"
     assert payload["job_status"] == "completed"

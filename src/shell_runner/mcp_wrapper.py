@@ -198,7 +198,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Wait up to wait_s (max 15) for a background job to reach a terminal state; runs no "
             "command. Returns state (done|waiting|error), the raw job_status, exit_code, "
-            "elapsed_s and full log paths. If result_regex is given and the job is done, "
+            "elapsed_s and full log paths. If result_contains is given and the job is done, "
             "matched_lines holds the matching lines from the stdout/stderr tails (never a raw "
             "tail). state='waiting' means the job is still running: call shell_wait again."
         ),
@@ -215,9 +215,14 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": 15,
                     "description": "Max seconds to wait, clamped to [0, 15]; 0 checks once",
                 },
-                "result_regex": {
-                    "type": "string",
-                    "description": "Regex (max 256 chars) used to filter output lines",
+                "result_contains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 10,
+                    "description": (
+                        "Plain case-sensitive substrings (max 10 items, each 1-256 chars); "
+                        "output lines containing any of them are returned"
+                    ),
                 },
                 "max_result_lines": {
                     "type": "integer",
