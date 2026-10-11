@@ -307,6 +307,7 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         await telemetry_writer.stop()
         await catalog_writer.stop()
+        db.close()
 
         _cleanup_task.cancel()
         try:

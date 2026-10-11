@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import uuid
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
@@ -136,6 +137,70 @@ CREATE INDEX IF NOT EXISTS idx_verb_approvals_verb ON verb_approvals(verb);
 APPROVE_ONCE_DURABLE_TTL_S = 3600
 
 
+BUSY_TIMEOUT_MS = 5000
+
+
+# Issue #53: SQLite's busy handler is unfair, so many threads in this process
+# writing through per-call connections can starve past the busy timeout. All
+# Persistence instances on the same db file share one in-process write lock.
+#
+# Writes also share ONE long-lived connection per db file (opening and closing a
+# WAL connection per call costs a checkpoint + fsync). It is created lazily,
+# uses synchronous=NORMAL (safe under WAL: no corruption, only the last commits
+# can be lost on power failure) and is only touched while holding the RLock.
+class _WriteState:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.lock = threading.RLock()
+        self.conn: sqlite3.Connection | None = None
+        self.depth = 0  # reentrancy depth; only mutated by the lock holder
+
+    def connection(self) -> sqlite3.Connection:
+        if self.conn is None:
+            conn = sqlite3.connect(
+                self.path,
+                isolation_level=None,
+                timeout=BUSY_TIMEOUT_MS / 1000,
+                check_same_thread=False,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_MS)}")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn = conn
+        return self.conn
+
+    def close(self) -> None:
+        with self.lock:
+            conn, self.conn = self.conn, None
+            if conn is not None:
+                conn.close()
+
+
+_WRITE_STATES: dict[str, _WriteState] = {}
+_WRITE_STATES_GUARD = threading.Lock()
+
+
+def _write_state_for(db_path: Path) -> _WriteState:
+    key = os.path.realpath(str(db_path))
+    with _WRITE_STATES_GUARD:
+        state = _WRITE_STATES.get(key)
+        if state is None:
+            state = _WRITE_STATES[key] = _WriteState(key)
+        return state
+
+
+def _close_all_write_conns() -> None:
+    """Close every registered shared write connection (tests / shutdown)."""
+    # States (and their locks) stay registered so instances keep sharing one
+    # lock; only the connections are dropped and reopen lazily.
+    with _WRITE_STATES_GUARD:
+        states = list(_WRITE_STATES.values())
+    for state in states:
+        state.close()
+
+
 def _now_utc() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -144,23 +209,63 @@ class Persistence:
     def __init__(self, db_path: Path | str = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_state = _write_state_for(self.db_path)
+        self._write_lock = self._write_state.lock
         self._init_schema()
 
+    def close(self) -> None:
+        """Close the shared write connection for this db path (idempotent).
+
+        The next write transparently reopens it.
+        """
+        self._write_state.close()
+
     def _init_schema(self) -> None:
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.executescript(_SCHEMA_SQL)
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_MS)}")
         try:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def _write_conn(self) -> Generator[sqlite3.Connection, None, None]:
+        """Shared long-lived write connection, held under the per-db RLock.
+
+        Never closed here. Whenever the outermost block exits (normally or via
+        an exception) with a transaction still open, it is rolled back so the
+        shared connection cannot be left mid-transaction (which would hold the
+        write lock and swallow later writes). This matches the old per-call
+        connection semantics, where close() discarded uncommitted work; a
+        normal exit with an open transaction also logs a warning. Nested use is
+        reentrant: inner levels never roll back, so a caller that catches an
+        inner failure keeps its outer transaction.
+        """
+        state = self._write_state
+        with state.lock:
+            conn = state.connection()
+            state.depth += 1
+            failed = True
+            try:
+                yield conn
+                failed = False
+            finally:
+                state.depth -= 1
+                if state.depth == 0 and conn.in_transaction:
+                    if not failed:
+                        logger.warning(
+                            "write block exited with an open transaction; rolling back (db=%s)",
+                            self.db_path,
+                        )
+                    conn.rollback()
 
     # --- shell_calls ---
 
@@ -186,7 +291,7 @@ class Persistence:
     ) -> str:
         telemetry_id = call_id if call_id is not None else str(uuid.uuid4())
         ts = _now_utc()
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO shell_calls (
@@ -273,7 +378,7 @@ class Persistence:
         where = "WHERE id = ?"
         if only_if_running:
             where += " AND decision = 'running'"
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute(
                 f"UPDATE shell_calls SET {', '.join(set_clauses)} {where}",  # noqa: S608
                 params,
@@ -297,7 +402,7 @@ class Persistence:
         """
         now = _now_utc()
         denial_inc = 1 if was_denied else 0
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT observed_agents_json FROM templates WHERE template = ?",
@@ -361,7 +466,7 @@ class Persistence:
         prompt_id = str(uuid.uuid4())
         now = datetime.now(UTC)
         expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO pending_prompts (
@@ -395,7 +500,7 @@ class Persistence:
             "approve_verb",
         )
         token = str(uuid.uuid4()) if is_approved else None
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             row = conn.execute(
                 "SELECT id, expires_at FROM pending_prompts WHERE id = ?",
                 (prompt_id,),
@@ -444,7 +549,7 @@ class Persistence:
         the second sees consumed_at IS NOT NULL and returns None.
         """
         now = _now_utc()
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -493,7 +598,7 @@ class Persistence:
         subagent that generated the pending prompt has exited.
         """
         now = _now_utc()
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -605,7 +710,7 @@ class Persistence:
         """
         now = _now_utc()
         scope_key = agent_id if agent_id is not None else ""
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             # Delete any existing approval for this scope (replace semantics)
             conn.execute(
                 """
@@ -636,7 +741,7 @@ class Persistence:
         Returns the count of newly-inserted rows.
         """
         inserted = 0
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             for seed in seeds:
                 existing = conn.execute(
                     "SELECT 1 FROM template_approvals WHERE template = ? LIMIT 1",
@@ -701,7 +806,7 @@ class Persistence:
         """
         now = _now_utc()
         scope_key = agent_id if agent_id is not None else ""
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
@@ -876,7 +981,7 @@ class Persistence:
 
     def cleanup_expired_prompts(self) -> int:
         now = _now_utc()
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             cursor = conn.execute("DELETE FROM pending_prompts WHERE expires_at < ?", (now,))
             return cursor.rowcount
 
@@ -896,7 +1001,7 @@ class Persistence:
         pid: int,
     ) -> None:
         started_at = _now_utc()
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO jobs (
@@ -926,7 +1031,7 @@ class Persistence:
         exit_code: int | None = None,
         finished_at: str | None = None,
     ) -> None:
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             conn.execute(
                 """
                 UPDATE jobs SET status = ?, exit_code = ?, finished_at = ?
@@ -959,7 +1064,7 @@ class Persistence:
         returns NULL for ISO 8601 strings with timezone suffix (e.g. '+00:00'),
         which is the format produced by _now_iso().
         """
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
@@ -1008,7 +1113,7 @@ class Persistence:
         """
         cutoff = (datetime.now(UTC) - timedelta(seconds=retention_seconds)).isoformat()
         total_deleted = 0
-        with self._conn() as conn:
+        with self._write_conn() as conn:
             for _ in range(max_batches):
                 cursor = conn.execute(
                     """
