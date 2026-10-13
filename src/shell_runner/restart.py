@@ -134,16 +134,20 @@ def systemd_env() -> dict[str, str]:
 
 def clean_env() -> dict[str, str]:
     """os.environ minus activated pixi/conda/venv state, for preflight and smoke children."""
+    pixi_home = os.environ.get("PIXI_HOME")  # read before PIXI_* is dropped
+    pixi_bin = (Path(pixi_home) / "bin") if pixi_home else (Path.home() / ".pixi" / "bin")
     drop = {"VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"}
     env = {
         k: v
         for k, v in os.environ.items()
         if k not in drop and not k.startswith(("PIXI_", "CONDA_"))
     }
-    if "PATH" in env:
-        env["PATH"] = os.pathsep.join(
-            p for p in env["PATH"].split(os.pathsep) if "/.pixi/envs/" not in p
-        )
+    entries = [p for p in env.get("PATH", os.defpath).split(os.pathsep) if "/.pixi/envs/" not in p]
+    if pixi_bin.is_dir() and str(pixi_bin) not in entries:
+        # systemd user units lack ~/.pixi/bin, so `pixi` would not resolve (#58)
+        entries.insert(0, str(pixi_bin))
+    if "PATH" in env or pixi_bin.is_dir():
+        env["PATH"] = os.pathsep.join(entries)
     return env
 
 
