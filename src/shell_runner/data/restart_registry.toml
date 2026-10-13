@@ -1,0 +1,51 @@
+# Default MCP server restart registry (override with SHELL_RUNNER_RESTART_REGISTRY).
+#
+# Fields per [servers.<name>]:
+#   unit       systemd --user unit (must match ^[A-Za-z0-9@._-]+\.service$)
+#   repo       working directory for preflight/smoke commands
+#   port       MCP HTTP port (health = MCP initialize POST to /mcp unless `health` is set)
+#   health     optional URL override
+#   preflight  optional list of argv lists run in `repo` before touching the live unit
+#   smoke      optional argv ("{port}" is substituted) starting a throwaway instance
+#   smoke_env  optional env additions for smoke; "{tmpdir}" and "{repo}" are substituted
+#   self       true when the server is shell-runner itself (restart is deferred via systemd-run)
+
+[servers.git]
+unit = "mcp-git-http.service"
+port = 4100
+repo = "/home/memento/ClaudeCode/Servers/git/development"
+preflight = [["pixi", "run", "-e", "dev", "test-unit"]]
+
+# pixi-shell and quality-assurance: their `test-unit` task points at a nonexistent
+# tests/unit/ dir, so run pytest over tests/ directly in the quality env.
+[servers.pixi-task]
+unit = "pixi-shell.service"
+port = 4101
+repo = "/home/memento/ClaudeCode/Servers/pixi-shell/development"
+preflight = [["pixi", "run", "-e", "quality", "pytest", "tests/", "-q", "--timeout=30"]]
+
+[servers.quality-assurance]
+unit = "quality-assurance.service"
+port = 4106
+repo = "/home/memento/ClaudeCode/Servers/quality-assurance/development"
+preflight = [["pixi", "run", "-e", "quality", "pytest", "tests/", "-q", "--timeout=30"]]
+
+[servers.session-intelligence]
+unit = "session-intelligence.service"
+port = 4002
+repo = "/home/memento/ClaudeCode/Servers/session-intelligence/development"
+preflight = [["pixi", "run", "-e", "default", "test-unit"]]
+
+[servers.shell-runner]
+unit = "shell-runner.service"
+port = 4111
+repo = "/home/memento/ClaudeCode/Servers/shell-runner/development"
+self = true
+preflight = [["pixi", "run", "-e", "dev", "test-unit"]]
+smoke = ["pixi", "run", "--environment", "ci", "uvicorn", "shell_runner.server:app", "--host", "127.0.0.1", "--port", "{port}"]
+
+[servers.shell-runner.smoke_env]
+SHELL_RUNNER_DB = "{tmpdir}/smoke.sqlite3"
+SHELL_RUNNER_JOB_DIR = "{tmpdir}/jobs"
+SHELL_RUNNER_PORT = "{port}"
+PYTHONPATH = "{repo}/src"

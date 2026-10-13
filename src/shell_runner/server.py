@@ -29,7 +29,7 @@ from typing import Any, Literal, cast
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import executor
+from . import executor, restart
 from .catalog import Tier, all_rules
 from .classifier import (
     PERMISSIVENESS,
@@ -1906,6 +1906,29 @@ async def handle_mcp_sse(request: Request) -> StreamingResponse:
     )
 
 
+def _running_jobs_summary() -> list[dict[str, Any]]:
+    return [
+        {"job_id": j["job_id"], "raw_cmd": j["raw_cmd"], "started_at": j["started_at"]}
+        for j in db.list_running_jobs()
+    ]
+
+
+async def _mcp_restart_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    """mcp_restart (issue #56). Deliberately NOT gated on the agent cap: targets are a fixed
+    registry and no command string is accepted; the human gate is Claude Code's permission
+    prompt. agent_id is accepted for telemetry only."""
+    server = arguments.get("server")
+    if not isinstance(server, str):
+        return {"error": "invalid arguments"}
+    logger.info("mcp_restart server=%s agent_id=%s", server, arguments.get("agent_id"))
+    return await restart.mcp_restart(
+        server,
+        force=bool(arguments.get("force", False)),
+        skip_preflight=bool(arguments.get("skip_preflight", False)),
+        running_jobs=_running_jobs_summary,
+    )
+
+
 async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[str, Any]:
     """Dispatch a tools/call request to the appropriate internal handler."""
     tool_name = params.get("name")
@@ -1967,6 +1990,9 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
             logger.exception("Invalid arguments for shell_wait")
             return {"error": "invalid arguments"}
         return (await shell_wait_route(wait_req)).model_dump()
+
+    if tool_name == "mcp_restart":
+        return await _mcp_restart_tool(arguments)
 
     if tool_name == "shell_kill":
         try:

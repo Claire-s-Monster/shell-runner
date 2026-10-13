@@ -232,6 +232,46 @@ TOOLS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "mcp_restart": {
+        "description": (
+            "Restart a registered MCP server (git, pixi-task, quality-assurance, "
+            "session-intelligence, shell-runner) via its systemd --user unit. Runs the "
+            "server's preflight commands and a throwaway smoke instance first; on failure "
+            "returns status='preflight_failed' with step and output_tail and leaves the live "
+            "unit untouched. Otherwise restarts and polls MCP health (<=60s): "
+            "status='healthy' or 'unhealthy' (with journal_tail). Restarting shell-runner "
+            "itself is deferred via systemd-run and returns status='restarting' with a "
+            "state_file to read after reconnecting; it is refused while background jobs are "
+            "running unless force=true. Available to ALL agent_ids including primary "
+            "(deliberate exception to the primary DENY cap: targets come from a fixed "
+            "registry and no command string is accepted); the human gate is the Claude "
+            "Code permission prompt for this tool."
+        ),
+        "schema": {
+            "type": "object",
+            "required": ["server"],
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Registry name, e.g. git, pixi-task, shell-runner",
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "shell-runner only: restart even if background jobs run",
+                },
+                "skip_preflight": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Skip preflight commands and the smoke instance",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Caller agent identifier (telemetry only; not gated)",
+                },
+            },
+        },
+    },
     "shell_kill": {
         "description": (
             "Send a signal to a running background job. "

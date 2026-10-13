@@ -63,10 +63,10 @@ def test_initialize_sets_protocol_version_header(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tools_list_returns_eight_tools(client: TestClient) -> None:
+def test_tools_list_returns_nine_tools(client: TestClient) -> None:
     resp = _post(client, "tools/list", req_id=2)
     tools = resp["result"]["tools"]
-    assert len(tools) == 8
+    assert len(tools) == 9
     names = {t["name"] for t in tools}
     assert names == {
         "shell_execute",
@@ -76,6 +76,7 @@ def test_tools_list_returns_eight_tools(client: TestClient) -> None:
         "shell_health",
         "shell_status",
         "shell_wait",
+        "mcp_restart",
         "shell_kill",
     }
 
