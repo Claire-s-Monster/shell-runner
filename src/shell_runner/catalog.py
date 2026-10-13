@@ -104,6 +104,14 @@ T0_DENY: list[Rule] = [
     Rule(r"^\s*su\b", Tier.DENY, "privilege", match_target="raw"),
     Rule(r"^\s*doas\b", Tier.DENY, "privilege", match_target="raw"),
     Rule(r"^\s*pkexec\b", Tier.DENY, "privilege", match_target="raw"),
+    # Host power state (any scope)
+    Rule(
+        r"^\s*systemctl\b(\s+\S+)*?\s+(poweroff|reboot|halt|kexec|suspend|hibernate)(\s|$)",
+        Tier.DENY,
+        "destructive",
+        match_target="raw",
+        reason="host power-state change",
+    ),
     # Pipe-exec from any source
     Rule(
         r"\|\s*(sh|bash|zsh|ksh|fish)\b",
@@ -148,7 +156,34 @@ T0_DENY: list[Rule] = [
 # T1 AUTO_LOG — match against TEMPLATE
 # ---------------------------------------------------------------------------
 
+# Single argv token safe to allow in the systemd read-only rules: either a
+# normalizer placeholder (<arg>, <n>, <cwd_path>, ...) or a plain token with no
+# shell metacharacters. Excludes redirects (<, >), pipes, `$`, backticks and
+# the <subshell:...> form, so chained/injected content never matches T1.
+_SD_TOK = r"(?:<\w+>|[^\s<>|;&$`()]+)"
+_SD_VAL = r"(?:<\w+>|[^\s<>|;&$`()-][^\s<>|;&$`()]*)"  # value token: must not start with "-"
+
 T1_AUTO_LOG: list[Rule] = [
+    # systemd user-scope read-only (anchored; whole template must match)
+    Rule(
+        r"^systemctl --user(\s+--no-pager)?\s+"
+        r"(status|is-active|is-enabled|is-failed|show|cat|list-units|list-unit-files|list-timers)"
+        rf"(?!.*\s(-H|--host|-M|--machine)\b)(\s+{_SD_TOK})*$",
+        Tier.AUTO_LOG,
+        "system-info",
+        reason="read-only systemctl --user verb",
+    ),
+    # journalctl --user: whitelist of read-only flags (no -f/--follow, no --vacuum*/--rotate/--flush)
+    Rule(
+        r"^journalctl --user"
+        r"(\s+(-[uenopbrkqxgSU]+|"
+        r"--(unit|lines|no-pager|since|until|output|priority|reverse|boot|dmesg|quiet|utc|"
+        r"catalog|no-hostname|grep|case-sensitive))"
+        rf"(={_SD_TOK})?|\s+{_SD_VAL})*$",
+        Tier.AUTO_LOG,
+        "system-info",
+        reason="read-only journalctl --user (flag whitelist)",
+    ),
     # FS-read
     # <_path> group matches any path placeholder produced by normalizer, including
     # <file_arg> which is emitted by READ_ONLY_FILE_VERBS post-pass.
@@ -392,6 +427,14 @@ T4_ALWAYS_APPROVE: list[Rule] = [
     Rule(r"^rsync\b", Tier.ALWAYS_APPROVE, "network-write"),
     Rule(r"^(nc|ncat)\b", Tier.ALWAYS_APPROVE, "network-write"),
     Rule(r"^ssh-keygen\b", Tier.ALWAYS_APPROVE, "network-write"),
+    # System-scope service mutation (--user scope falls through to T3)
+    Rule(
+        r"^systemctl\b(?!.*\s--user\b)(\s+\S+)*?\s+"
+        r"(start|stop|restart|reload|enable|disable|mask|unmask|daemon-reload)(\s|$)",
+        Tier.ALWAYS_APPROVE,
+        "process",
+        reason="system-scope systemctl mutation",
+    ),
     # Destructive (allowed but always prompt — not in T0)
     Rule(r"^rm\b", Tier.ALWAYS_APPROVE, "fs-write"),
     Rule(

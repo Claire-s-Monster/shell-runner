@@ -106,6 +106,9 @@ def test_t0_raw_matches(raw, expected_tier):
         ("gh api /repos/x/y", Tier.AUTO_CAPPED, "git-read"),
         # T4
         ("curl -X POST <safe_url>", Tier.ALWAYS_APPROVE, "network-write"),
+        ("systemctl --user status foo", Tier.AUTO_LOG, "system-info"),
+        ("journalctl --user -u foo -n <n> --no-pager", Tier.AUTO_LOG, "system-info"),
+        ("systemctl restart foo", Tier.ALWAYS_APPROVE, "process"),
         ("git push origin main", Tier.ALWAYS_APPROVE, "git-write"),
         ("pip install requests", Tier.ALWAYS_APPROVE, "package-mgmt"),
         ("apt install vim", Tier.ALWAYS_APPROVE, "package-mgmt"),

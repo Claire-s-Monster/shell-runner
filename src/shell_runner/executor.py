@@ -50,7 +50,15 @@ def inline_budget_s() -> int:
         return DEFAULT_INLINE_BUDGET_S
 
 
-DEFAULT_ENV_PASSTHROUGH = ["HOME", "USER", "PATH", "LANG", "TERM"]
+DEFAULT_ENV_PASSTHROUGH = [
+    "HOME",
+    "USER",
+    "PATH",
+    "LANG",
+    "TERM",
+    "XDG_RUNTIME_DIR",  # needed by `systemctl --user` / `journalctl --user`
+    "DBUS_SESSION_BUS_ADDRESS",
+]
 
 _OVERFLOW_DIR = Path("/tmp/shell-runner-overflow")  # noqa: S108
 

@@ -158,6 +158,29 @@ def test_execute_env_stripping(tmp_path: Path) -> None:
         del os.environ["SECRET_VAR"]
 
 
+def test_execute_passes_user_systemd_env_when_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS reach the child (systemctl --user)."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1234")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1234/bus")
+    result = execute(command='echo "$XDG_RUNTIME_DIR|$DBUS_SESSION_BUS_ADDRESS"', cwd=str(tmp_path))
+    assert result.exit_code == 0
+    assert "/run/user/1234|unix:path=/run/user/1234/bus" in result.stdout
+
+
+def test_execute_does_not_invent_user_systemd_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    result = execute(
+        command='echo "[${XDG_RUNTIME_DIR-unset}][${DBUS_SESSION_BUS_ADDRESS-unset}]"',
+        cwd=str(tmp_path),
+    )
+    assert "[unset][unset]" in result.stdout
+
+
 def test_execute_respects_cwd(tmp_path: Path) -> None:
     sub = tmp_path / "subdir"
     sub.mkdir()
