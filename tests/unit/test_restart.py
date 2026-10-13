@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -121,7 +122,74 @@ def test_systemd_env_from_environ(monkeypatch: pytest.MonkeyPatch) -> None:
     assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/y"
 
 
-def test_clean_env_drops_activated_env_leakage(monkeypatch: pytest.MonkeyPatch) -> None:
+def _pixi_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, create: bool = True) -> Path:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PIXI_HOME", raising=False)
+    pixi_bin = tmp_path / ".pixi" / "bin"
+    if create:
+        pixi_bin.mkdir(parents=True)
+    return pixi_bin
+
+
+def test_clean_env_prepends_pixi_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pixi_bin = _pixi_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    assert restart.clean_env()["PATH"] == f"{pixi_bin}:/usr/bin:/bin"
+
+
+def test_clean_env_no_duplicate_pixi_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pixi_bin = _pixi_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("PATH", f"/usr/bin:{pixi_bin}:/bin")
+    assert restart.clean_env()["PATH"] == f"/usr/bin:{pixi_bin}:/bin"
+
+
+def test_clean_env_skips_missing_pixi_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _pixi_home(tmp_path, monkeypatch, create=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    assert restart.clean_env()["PATH"] == "/usr/bin:/bin"
+
+
+def test_clean_env_honors_pixi_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _pixi_home(tmp_path, monkeypatch, create=False)
+    custom = tmp_path / "custom"
+    (custom / "bin").mkdir(parents=True)
+    monkeypatch.setenv("PIXI_HOME", str(custom))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = restart.clean_env()
+    assert env["PATH"] == f"{custom / 'bin'}:/usr/bin"
+    assert "PIXI_HOME" not in env
+
+
+def test_clean_env_missing_path_uses_defpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pixi_bin = _pixi_home(tmp_path, monkeypatch)
+    monkeypatch.delenv("PATH", raising=False)
+    assert restart.clean_env()["PATH"] == str(pixi_bin) + os.pathsep + os.defpath
+
+
+def test_preflight_finds_pixi_outside_service_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for #58: a systemd-style PATH lacking ~/.pixi/bin must still find pixi."""
+    pixi_bin = _pixi_home(tmp_path, monkeypatch, create=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    entry = _entry(repo=str(tmp_path), preflight=(("pixi", "run", "x"),))
+    failed = restart.run_checks(entry, skip_preflight=False)
+    assert failed is not None
+    assert failed["status"] == "preflight_failed"
+
+    pixi_bin.mkdir(parents=True)
+    stub = pixi_bin / "pixi"
+    stub.write_text('#!/bin/sh\necho stub-pixi "$@"\n')
+    os.chmod(stub, 0o755)  # noqa: S103
+    assert restart.run_checks(entry, skip_preflight=False) is None
+
+
+def test_clean_env_drops_activated_env_leakage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _pixi_home(tmp_path, monkeypatch, create=False)
     for k, v in {
         "PIXI_PROJECT_ROOT": "/p",
         "CONDA_PREFIX": "/c",
