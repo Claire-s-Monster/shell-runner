@@ -347,3 +347,37 @@ def test_check_health_false_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(restart.urllib.request, "urlopen", boom)
     assert not restart.check_health(_entry())
+
+
+@pytest.mark.parametrize(
+    "health",
+    [
+        "file:///etc/passwd",
+        "http://example.com/mcp",
+        "ftp://127.0.0.1/x",
+        "http://192.168.1.1:4100",
+    ],
+)
+def test_health_url_validation_rejects_invalid(tmp_path: Path, health: str) -> None:
+    f = tmp_path / "r.toml"
+    f.write_text(f'[servers.x]\nunit = "x.service"\nport = 1\nrepo = "/r"\nhealth = "{health}"\n')
+    with pytest.raises(RegistryError, match="loopback"):
+        restart.load_registry(f)
+
+
+@pytest.mark.parametrize(
+    "health",
+    [
+        "http://127.0.0.1:4100/health",
+        "http://localhost:4100/mcp",
+        "http://[::1]:4100/mcp",
+        "https://127.0.0.1:4100/health",
+        "https://localhost:4100/mcp",
+        "https://[::1]:4100/mcp",
+    ],
+)
+def test_health_url_validation_accepts_loopback(tmp_path: Path, health: str) -> None:
+    f = tmp_path / "r.toml"
+    f.write_text(f'[servers.x]\nunit = "x.service"\nport = 1\nrepo = "/r"\nhealth = "{health}"\n')
+    reg = restart.load_registry(f)
+    assert reg["x"].health == health

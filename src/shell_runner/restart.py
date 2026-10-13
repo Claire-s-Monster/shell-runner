@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -85,6 +86,17 @@ def _parse_entry(name: str, raw: Any) -> RestartEntry:
     health = raw.get("health")
     if health is not None and not isinstance(health, str):
         raise RegistryError(f"servers.{name}.health: expected a string")
+    if health is not None:
+        parsed = urllib.parse.urlsplit(health)
+        if parsed.scheme not in ("http", "https"):
+            raise RegistryError(
+                f"servers.{name}.health: must be an http(s) URL on a loopback host, got {health!r}"
+            )
+        hostname = (parsed.hostname or "").lower()
+        if hostname not in ("127.0.0.1", "localhost", "::1"):
+            raise RegistryError(
+                f"servers.{name}.health: must be an http(s) URL on a loopback host, got {health!r}"
+            )
     return RestartEntry(
         name=name,
         unit=unit,
@@ -182,6 +194,8 @@ _INIT_BODY = json.dumps(
 
 def check_health(entry: RestartEntry) -> bool:
     """True when the server answers an MCP initialize POST with HTTP 200."""
+    # URL is loopback-only: built from a validated int port, or a registry `health` restricted to
+    # http(s)://loopback in _parse_entry.
     url = entry.health or f"http://127.0.0.1:{entry.port}/mcp"
     req = urllib.request.Request(  # noqa: S310
         url,
@@ -193,6 +207,7 @@ def check_health(entry: RestartEntry) -> bool:
         },
     )
     try:
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
             return bool(resp.status == 200)
     except (OSError, ValueError):
