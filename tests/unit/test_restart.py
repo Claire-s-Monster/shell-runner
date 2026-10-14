@@ -397,8 +397,14 @@ async def test_self_force_invokes_systemd_run(
     assert res["status"] == "restarting"
     assert res["state_file"].endswith("shell-runner/last-restart.json")
     argv, kw = calls[-1]
-    assert argv[:4] == ["systemd-run", "--user", "--on-active=2", argv[3]]
-    assert argv[3].startswith("--unit=shell-runner-restart-")
+    assert argv[:5] == [
+        "systemd-run",
+        "--user",
+        "--on-active=2",
+        "--timer-property=AccuracySec=100ms",
+        argv[4],
+    ]
+    assert argv[4].startswith("--unit=shell-runner-restart-")
     assert "--collect" in argv
     assert argv[-1] == "/tmp/sr/scripts/shell-runner-self-restart.sh"
     assert kw["env"]["XDG_RUNTIME_DIR"]
