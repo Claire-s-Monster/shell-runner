@@ -16,19 +16,17 @@ port = 4100
 repo = "/home/memento/ClaudeCode/Servers/git/development"
 preflight = [["pixi", "run", "-e", "dev", "test-unit"]]
 
-# pixi-shell and quality-assurance: their `test-unit` task points at a nonexistent
-# tests/unit/ dir, so run pytest over tests/ directly in the quality env.
 [servers.pixi-task]
 unit = "pixi-shell.service"
 port = 4101
 repo = "/home/memento/ClaudeCode/Servers/pixi-shell/development"
-preflight = [["pixi", "run", "-e", "quality", "pytest", "tests/", "-q", "--timeout=30"]]
+preflight = [["pixi", "run", "-e", "quality", "test-unit"]]
 
 [servers.quality-assurance]
 unit = "quality-assurance.service"
 port = 4106
 repo = "/home/memento/ClaudeCode/Servers/quality-assurance/development"
-preflight = [["pixi", "run", "-e", "quality", "pytest", "tests/", "-q", "--timeout=30"]]
+preflight = [["pixi", "run", "-e", "quality", "test-unit"]]
 
 [servers.session-intelligence]
 unit = "session-intelligence.service"
