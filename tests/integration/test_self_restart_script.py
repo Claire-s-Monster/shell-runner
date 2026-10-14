@@ -20,12 +20,14 @@ def _stub(bin_dir: Path, name: str, body: str) -> None:
     path.chmod(0o755)
 
 
-def _run(tmp_path: Path, *, restart_rc: int, http_code: str) -> tuple[int, dict[str, object]]:
+def _run(
+    tmp_path: Path, *, restart_rc: int, http_code: str, journal: str | None = None
+) -> tuple[int, dict[str, object]]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _stub(bin_dir, "systemctl", f"exit {restart_rc}")
     _stub(bin_dir, "curl", f"printf '{http_code}'")
-    _stub(bin_dir, "journalctl", "printf 'line \"quoted\"\\nsecond\\n'")
+    _stub(bin_dir, "journalctl", journal or "printf 'line \"quoted\"\\nsecond\\n'")
     _stub(bin_dir, "sleep", "exit 0")
     env = {
         **os.environ,
@@ -47,6 +49,30 @@ def test_restart_failure_is_not_ok(tmp_path: Path) -> None:
     assert record["ok"] is False
     assert record["restart_rc"] == 5
     assert 'line "quoted"' in str(record["journal_tail"])
+
+
+@pytest.mark.integration
+def test_journal_tail_filters_access_lines(tmp_path: Path) -> None:
+    access = 'INFO:     127.0.0.1:48962 - "POST /observe HTTP/1.1" 200 OK'
+    body = (
+        f"printf '%s\\n' 'Oct 1 h pixi[1]: {access}' 'Oct 1 h pixi[1]: ERROR:    boom' "
+        f"'Oct 1 h pixi[1]: INFO:     Application startup complete.' 'Oct 1 h pixi[1]: {access}'"
+    )
+    rc, record = _run(tmp_path, restart_rc=0, http_code="200", journal=body)
+    assert rc == 0
+    tail = str(record["journal_tail"])
+    assert "POST /observe" not in tail
+    assert "ERROR:    boom" in tail
+    assert "Application startup complete" in tail
+
+
+@pytest.mark.integration
+def test_journal_tail_all_access_lines_keeps_state(tmp_path: Path) -> None:
+    access = 'INFO:     127.0.0.1:1 - "GET / HTTP/1.1" 200 OK'
+    rc, record = _run(tmp_path, restart_rc=0, http_code="200", journal=f"printf '%s\\n' '{access}'")
+    assert rc == 0
+    assert record["ok"] is True
+    assert record["journal_tail"] == ""
 
 
 @pytest.mark.integration

@@ -33,6 +33,9 @@ HELPER_RELPATH = "scripts/shell-runner-self-restart.sh"
 _UNIT_RE = re.compile(r"^[A-Za-z0-9@._-]+\.service$")
 _TAIL_CHARS = 2000
 _JOURNAL_LINES = 40
+_JOURNAL_FETCH_LINES = 400
+# uvicorn access-log lines, e.g. `INFO:     127.0.0.1:48962 - "POST /observe HTTP/1.1" 200 OK`
+_ACCESS_LOG_RE = re.compile(r'INFO:\s+\S+:\d+ - "[A-Z]+ \S+ HTTP/[\d.]+" \d{3}')
 PREFLIGHT_TIMEOUT_S = 900
 SMOKE_TIMEOUT_S = 30
 HEALTH_TIMEOUT_S = 60
@@ -313,12 +316,15 @@ def run_checks(entry: RestartEntry, skip_preflight: bool) -> dict[str, Any] | No
 
 def _journal_tail(entry: RestartEntry, env: dict[str, str]) -> str:
     cp = _run(
-        ["journalctl", "--user", "-u", entry.unit, "-n", str(_JOURNAL_LINES), "--no-pager"],
+        ["journalctl", "--user", "-u", entry.unit, "-n", str(_JOURNAL_FETCH_LINES), "--no-pager"],
         cwd=None,
         env=env,
         timeout=30,
     )
-    return "\n".join((cp.stdout or cp.stderr or "").splitlines()[-_JOURNAL_LINES:])
+    lines = [
+        ln for ln in (cp.stdout or cp.stderr or "").splitlines() if not _ACCESS_LOG_RE.search(ln)
+    ]
+    return "\n".join(lines[-_JOURNAL_LINES:])
 
 
 def _restart_other(entry: RestartEntry) -> dict[str, Any]:

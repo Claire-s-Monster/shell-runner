@@ -6,7 +6,9 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=%h/ClaudeCode/Servers/shell-runner/development
-ExecStart=pixi run http-server --port 4003
+Environment=SHELL_RUNNER_HOST=127.0.0.1
+Environment=SHELL_RUNNER_PORT=4111
+ExecStart=pixi run --environment ci uvicorn shell_runner.server:app --host 127.0.0.1 --port 4111
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5

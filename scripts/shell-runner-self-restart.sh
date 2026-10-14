@@ -21,7 +21,10 @@ write_state() {
     mkdir -p "$STATE_DIR" 2>/dev/null || return 0
     tmp="$STATE_FILE.tmp.$$"
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)
-    tail=$(journalctl --user -u "$UNIT" -n 40 --no-pager 2>&1 || true)
+    # Drop uvicorn access-log lines; `|| true` since grep -v exits 1 when nothing remains.
+    tail=$( { journalctl --user -u "$UNIT" -n 400 --no-pager 2>&1 \
+        | grep -Ev 'INFO:[[:space:]]+[^[:space:]]+:[0-9]+ - "[A-Z]+ [^[:space:]]+ HTTP/[0-9.]+" [0-9]{3}' \
+        | tail -n 40; } || true)
     if ! python3 - "$tmp" "$ok" "$attempts" "$restart_rc" "$ts" "$tail" 2>/dev/null <<'PY'
 import json
 import sys
