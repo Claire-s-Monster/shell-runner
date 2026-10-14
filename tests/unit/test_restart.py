@@ -316,7 +316,48 @@ async def test_non_self_unhealthy_returns_journal(
     assert res["status"] == "unhealthy"
     assert res["journal_tail"].splitlines()[-1] == "line99"
     assert len(res["journal_tail"].splitlines()) == 40
-    assert ["journalctl", "--user", "-u", "mcp-git-http.service", "-n", "40", "--no-pager"] in calls
+    assert [
+        "journalctl",
+        "--user",
+        "-u",
+        "mcp-git-http.service",
+        "-n",
+        "400",
+        "--no-pager",
+    ] in calls
+
+
+_ACCESS = (
+    'Oct 12 22:28:12 host pixi[1]: INFO:     127.0.0.1:48962 - "POST /observe HTTP/1.1" 200 OK'
+)
+
+
+def _tail_with(monkeypatch: pytest.MonkeyPatch, lines: list[str]) -> list[str]:
+    monkeypatch.setattr(restart, "_run", lambda argv, **kw: _cp(0, "\n".join(lines)))
+    return restart._journal_tail(_entry(), {}).splitlines()
+
+
+def test_journal_tail_filters_access_keeps_others(monkeypatch: pytest.MonkeyPatch) -> None:
+    keep = [
+        "Oct 12 22:28:00 host pixi[1]: INFO:     Started server process [1]",
+        "Oct 12 22:28:01 host pixi[1]: INFO:     Application startup complete.",
+        "Oct 12 22:28:02 host pixi[1]: INFO:     Uvicorn running on http://127.0.0.1:4111",
+        "Oct 12 22:28:03 host pixi[1]: ERROR:    boom",
+        "Oct 12 22:28:04 host pixi[1]: WARNING:  careful",
+        "Traceback (most recent call last):",
+    ]
+    mixed = [keep[0], _ACCESS, keep[1], _ACCESS, keep[2], keep[3], _ACCESS, keep[4], keep[5]]
+    assert _tail_with(monkeypatch, mixed) == keep
+
+
+def test_journal_tail_limits_after_filtering(monkeypatch: pytest.MonkeyPatch) -> None:
+    lines: list[str] = []
+    for i in range(100):
+        lines.extend([f"keep{i}", _ACCESS])
+    out = _tail_with(monkeypatch, lines)
+    assert len(out) == 40
+    assert out[0] == "keep60"
+    assert out[-1] == "keep99"
 
 
 async def test_restart_command_failure(
