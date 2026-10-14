@@ -22,14 +22,11 @@ port = 4101
 repo = "/home/memento/ClaudeCode/Servers/pixi-shell/development"
 preflight = [["pixi", "run", "-e", "quality", "test-unit"]]
 
-# quality-assurance: until its test-unit fix (branch fix/qa-tests-and-pixi-env-selection)
-# is merged, run pytest over tests/ directly in the quality env.
-
 [servers.quality-assurance]
 unit = "quality-assurance.service"
 port = 4106
 repo = "/home/memento/ClaudeCode/Servers/quality-assurance/development"
-preflight = [["pixi", "run", "-e", "quality", "pytest", "tests/", "-q", "--timeout=30"]]
+preflight = [["pixi", "run", "-e", "quality", "test-unit"]]
 
 [servers.session-intelligence]
 unit = "session-intelligence.service"
