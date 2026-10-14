@@ -360,6 +360,7 @@ def _schedule_self(entry: RestartEntry) -> dict[str, Any]:
             "systemd-run",
             "--user",
             "--on-active=2",
+            "--timer-property=AccuracySec=100ms",  # transient timers default to 1min, which delayed restarts ~15s
             f"--unit=shell-runner-restart-{stamp}",
             "--collect",
             "bash",  # no dependency on the helper's exec bit
