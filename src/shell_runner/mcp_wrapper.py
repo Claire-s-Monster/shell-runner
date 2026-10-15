@@ -19,7 +19,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Execute a shell command with sandboxing. Returns decision "
             "(executed|denied|prompt_required|running), exit_code, stdout, stderr, telemetry_id. "
-            "For T3/T4 commands, returns prompt_required with prompt_id; user must call "
+            "For T3/T4 commands, returns prompt_required with prompt_id; a primary session must call "
             "shell_approve_pending then re-call shell_execute with approve_token. "
             "Set run_in_background=true to spawn asynchronously and get a job_id. "
             "Output is only returned inline if the command finishes within the inline budget "
