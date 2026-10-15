@@ -61,6 +61,23 @@ def test_execute_rm_rf_root_is_denied(client: TestClient) -> None:
     assert data["tier"] == 0
 
 
+@pytest.mark.parametrize("agent_id", ["primary", "primary-session-x"])
+def test_execute_reserved_primary_gets_clear_message(client: TestClient, agent_id: str) -> None:
+    resp = client.post("/execute", json={"command": "ls", "cwd": "/tmp", "agent_id": agent_id})
+    data = resp.json()
+    assert data["decision"] == "denied"
+    assert "reserved" in data["stderr"]
+    assert "session UUID" in data["stderr"]
+
+
+def test_execute_rule_denial_still_names_rule(client: TestClient) -> None:
+    resp = client.post(
+        "/execute",
+        json={"command": "rm -rf /", "cwd": "/tmp", "agent_id": "focused-ghc-ci-analyzer"},
+    )
+    assert resp.json()["stderr"].startswith("DENIED by")
+
+
 def test_execute_pip_install_prompts(client: TestClient) -> None:
     resp = client.post(
         "/execute",

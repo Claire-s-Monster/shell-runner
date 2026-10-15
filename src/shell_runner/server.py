@@ -36,6 +36,7 @@ from .classifier import (
     ClassificationResult,
     _cap_permissiveness,
     classify,
+    denial_reason,
     is_primary_identity,
 )
 from .executor import (
@@ -500,10 +501,8 @@ async def _execute_approved_command(
     if recheck_cls.command_tier == Tier.DENY:
         duration_ms = int((time.monotonic() - t0) * 1000)
         telemetry_id = str(uuid.uuid4())
-        deny_reason = (
-            f"DENIED by {recheck_cls.matched_rule.pattern!r}: {recheck_cls.matched_rule.reason}"
-            if recheck_cls.matched_rule
-            else "DENIED: agent has DENY cap"
+        deny_reason = denial_reason(
+            recheck_cls.command_tier, recheck_cls.matched_rule, req.agent_id
         )
         if telemetry_writer is not None:
             await telemetry_writer.submit(
@@ -925,11 +924,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 current_tier=int(cls.tier),
                 was_denied=True,
             )
-        deny_reason = (
-            f"DENIED by {cls.matched_rule.pattern!r}: {cls.matched_rule.reason}"
-            if cls.matched_rule
-            else "DENIED: agent has DENY cap"
-        )
+        deny_reason = denial_reason(cls.command_tier, cls.matched_rule, req.agent_id)
         return ExecuteResponse(
             decision="denied",
             tier=int(cls.tier),
@@ -1296,7 +1291,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         )
     why = (
         f"command tier={cls.command_tier.name} after agent_cap={cls.agent_cap.name}"
-        f" → {cls.tier.name}; requires user approval"
+        f" → {cls.tier.name}; requires approval via shell_approve_pending from a primary"
+        " session (approver identity is self-reported, not a human check — see issue #29)"
     )
     return ExecuteResponse(
         decision="prompt_required",

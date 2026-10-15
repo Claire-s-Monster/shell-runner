@@ -109,6 +109,12 @@ def is_primary_identity(agent_id: str | None) -> bool:
     return candidate.startswith((f"{PRIMARY_IDENTITY}-", f"{PRIMARY_IDENTITY}:"))
 
 
+def is_reserved_primary_id(agent_id: str | None) -> bool:
+    """Return True if agent_id is empty or a primary identity (reserved for the
+    approving primary session, so it can never execute commands)."""
+    return not agent_id or is_primary_identity(agent_id)
+
+
 def lookup_agent_cap(agent_id: str | None) -> Tier:
     """Return the tier cap for the given agent_id.
 
@@ -116,9 +122,32 @@ def lookup_agent_cap(agent_id: str | None) -> Tier:
     all resolve to Tier.DENY. Unrecognized agent IDs fall back to
     DEFAULT_AGENT_CAP.
     """
-    if not agent_id or is_primary_identity(agent_id):
+    if is_reserved_primary_id(agent_id):
         return Tier.DENY
     return KNOWN_AGENT_CAPS.get(agent_id, DEFAULT_AGENT_CAP)
+
+
+def denial_reason(
+    command_tier: Tier,
+    matched_rule: Rule | None,
+    agent_id: str | None,
+) -> str:
+    """Stderr text for a denied command.
+
+    A rule-level denial (command_tier == DENY) names the rule. Otherwise the
+    agent cap caused the denial, so blaming whichever rule happened to match
+    (e.g. `ls`) would mislead; say why the agent_id is denied instead.
+    """
+    if command_tier == Tier.DENY and matched_rule is not None:
+        return f"DENIED by {matched_rule.pattern!r}: {matched_rule.reason}"
+    if is_reserved_primary_id(agent_id):
+        who = f"agent_id {agent_id!r} is" if agent_id else "agent_id is empty; empty ids are"
+        return (
+            f"DENIED: {who} reserved for the approving primary session and cannot "
+            "execute commands. Pass your Claude Code session UUID (or a "
+            "subagent-specific id) as agent_id instead."
+        )
+    return f"DENIED: agent {agent_id!r} has DENY cap"
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,41 @@ DEFAULT_ENV_PASSTHROUGH = [
     "DBUS_SESSION_BUS_ADDRESS",
 ]
 
+DEFAULT_EXTRA_PATH = ["~/.pixi/bin", "~/.local/bin", "~/.cargo/bin"]
+_FALLBACK_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+
+def extra_path_dirs() -> list[str]:
+    """User tool dirs appended to the child's PATH (config-session feedback
+    2026-10-15). Appended, not prepended, so they never shadow a binary the
+    server's PATH already resolves (e.g. the pixi env's python).
+    SHELL_RUNNER_EXTRA_PATH (colon-separated) replaces the default
+    when set, even to empty (= none). ~ is expanded; missing dirs and dirs
+    already on PATH are skipped; order is preserved."""
+    raw = os.environ.get("SHELL_RUNNER_EXTRA_PATH")
+    entries = DEFAULT_EXTRA_PATH if raw is None else raw.split(":")
+    on_path = set(os.environ.get("PATH", "").split(":"))
+    dirs: list[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        path = os.path.expanduser(entry)
+        if path not in on_path and path not in dirs and os.path.isdir(path):
+            dirs.append(path)
+    return dirs
+
+
+def _build_env(env_passthrough: list[str] | None) -> dict[str, str]:
+    """Restricted child environment: allowlisted vars, plus extra PATH dirs."""
+    allowed = env_passthrough if env_passthrough is not None else DEFAULT_ENV_PASSTHROUGH
+    env = {k: v for k, v in os.environ.items() if k in allowed}
+    if "PATH" in allowed:
+        extra = extra_path_dirs()
+        if extra:
+            env["PATH"] = ":".join([env.get("PATH", _FALLBACK_PATH), *extra])
+    return env
+
+
 _OVERFLOW_DIR = Path("/tmp/shell-runner-overflow")  # noqa: S108
 
 logger = logging.getLogger(__name__)
@@ -305,8 +340,7 @@ def execute(
         )
 
     # Build restricted environment
-    allowed = env_passthrough if env_passthrough is not None else DEFAULT_ENV_PASSTHROUGH
-    env = {k: v for k, v in os.environ.items() if k in allowed}
+    env = _build_env(env_passthrough)
 
     t0 = time.monotonic()
     timed_out = False
@@ -452,8 +486,7 @@ async def execute_background(
     stdout_path = job_dir / "stdout.log"
     stderr_path = job_dir / "stderr.log"
 
-    allowed = env_passthrough if env_passthrough is not None else DEFAULT_ENV_PASSTHROUGH
-    env = {k: v for k, v in os.environ.items() if k in allowed}
+    env = _build_env(env_passthrough)
 
     effective_timeout = min(timeout_s, MAX_TIMEOUT_S)
 
