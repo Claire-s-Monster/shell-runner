@@ -19,8 +19,11 @@ TOOLS: dict[str, dict[str, Any]] = {
         "description": (
             "Execute a shell command with sandboxing. Returns decision "
             "(executed|denied|prompt_required|running), exit_code, stdout, stderr, telemetry_id. "
-            "For T3/T4 commands, returns prompt_required with prompt_id; a primary session must call "
-            "shell_approve_pending then re-call shell_execute with approve_token. "
+            "For T3/T4 commands, returns prompt_required with a prompt (id, next_steps); a primary "
+            "session must call shell_approve_pending. Meanwhile call "
+            "shell_wait(prompt_id, agent_id) repeatedly until state is 'approved' (it returns the "
+            "approve_token), then re-call shell_execute with the identical command, cwd and "
+            "agent_id plus approve_token. Stop if state is 'denied' or 'expired'. "
             "Set run_in_background=true to spawn asynchronously and get a job_id. "
             "Output is only returned inline if the command finishes within the inline budget "
             "(default 20s, configurable via SHELL_RUNNER_INLINE_BUDGET_S) — a command that is "
@@ -196,19 +199,33 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "shell_wait": {
         "description": (
-            "Wait up to wait_s (max 15) for a background job to reach a terminal state; runs no "
-            "command. Returns state (done|waiting|error), the raw job_status, exit_code, "
+            "Wait up to wait_s (max 15); runs no command. Pass exactly one of job_id or "
+            "prompt_id. job_id mode: wait for a background job to reach a terminal state. "
+            "Returns state (done|waiting|error), the raw job_status, exit_code, "
             "elapsed_s and full log paths. If result_contains is given and the job is done, "
             "matched_lines holds the matching lines from the stdout/stderr tails (never a raw "
-            "tail). state='waiting' means the job is still running: call shell_wait again."
+            "tail). state='waiting' means the job is still running: call shell_wait again. "
+            "prompt_id mode (requires agent_id, which must be the agent that got the "
+            "prompt_required): wait for a primary session to decide the prompt. Returns state "
+            "approved (with approve_token, single-use, for shell_execute), denied, expired or "
+            "waiting (call again); any other agent_id gets state=error."
         ),
         "schema": {
             "type": "object",
-            "required": ["job_id"],
             "properties": {
                 "job_id": {
                     "type": "string",
                     "description": "Job ID returned by shell_execute with run_in_background=true",
+                },
+                "prompt_id": {
+                    "type": "string",
+                    "description": "Prompt ID from a prompt_required shell_execute response",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": (
+                        "Required with prompt_id: the agent_id that created the prompt"
+                    ),
                 },
                 "wait_s": {
                     "type": "number",

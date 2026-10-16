@@ -71,15 +71,44 @@ def extra_path_dirs() -> list[str]:
     SHELL_RUNNER_EXTRA_PATH (colon-separated) replaces the default
     when set, even to empty (= none). ~ is expanded; missing dirs and dirs
     already on PATH are skipped; order is preserved."""
+    on_path = set(os.environ.get("PATH", "").split(":"))
+    return [p for p in _configured_extra_dirs() if p not in on_path]
+
+
+def _configured_extra_dirs() -> list[str]:
+    """Expanded, existing, de-duplicated SHELL_RUNNER_EXTRA_PATH / default dirs
+    (no already-on-PATH filter)."""
     raw = os.environ.get("SHELL_RUNNER_EXTRA_PATH")
     entries = DEFAULT_EXTRA_PATH if raw is None else raw.split(":")
-    on_path = set(os.environ.get("PATH", "").split(":"))
     dirs: list[str] = []
     for entry in entries:
         if not entry:
             continue
         path = os.path.expanduser(entry)
-        if path not in on_path and path not in dirs and os.path.isdir(path):
+        if path not in dirs and os.path.isdir(path):
+            dirs.append(path)
+    return dirs
+
+
+TRUSTED_SYSTEM_BIN_DIRS = [
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/local/sbin",
+    "/usr/sbin",
+    "/sbin",
+]
+
+
+def trusted_bin_dirs() -> list[str]:
+    """Dirs whose binaries the normalizer treats as the bare verb, so
+    `/usr/bin/ls` and `ls` share a template (and rules/approvals). System bin
+    dirs plus the user tool dirs, normalised but NOT symlink-resolved and NOT
+    filtered by what is already on PATH. Only existing dirs are returned."""
+    dirs: list[str] = []
+    for entry in [*TRUSTED_SYSTEM_BIN_DIRS, *_configured_extra_dirs()]:
+        path = os.path.normpath(entry)
+        if path not in dirs and os.path.isdir(path):
             dirs.append(path)
     return dirs
 

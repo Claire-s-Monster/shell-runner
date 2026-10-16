@@ -17,6 +17,8 @@ import shlex
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from .executor import trusted_bin_dirs
+
 # ---------------------------------------------------------------------------
 # Default safe domains for URL classification
 # ---------------------------------------------------------------------------
@@ -678,6 +680,18 @@ _REDIRECT_OPS = frozenset({">", ">>", "<"})
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)")
 
 
+def _trusted_basename(tok: str) -> str:
+    """Return the bare name for an already-canonical absolute path in a trusted
+    bin dir (so `/usr/bin/ls` and `ls` share template, rules and approvals);
+    anything else (relative, `..`/`//`/`./` forms, other dirs) stays as written."""
+    if not tok.startswith("/") or os.path.normpath(tok) != tok:
+        return tok
+    directory, name = os.path.split(tok)
+    if name and directory in trusted_bin_dirs():
+        return name
+    return tok
+
+
 def _normalize_segment(
     raw_tokens: list[str],
     cwd: str,
@@ -732,9 +746,9 @@ def _normalize_segment(
 
         # Identify verb: first non-flag, non-assignment token
         if not verb_found and not tok.startswith("-"):
-            verb = tok
+            verb = _trusted_basename(tok)
             verb_found = True
-            normalized.append(tok)
+            normalized.append(verb)
             i += 1
             continue
 
