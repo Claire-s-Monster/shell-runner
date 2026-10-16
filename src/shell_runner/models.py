@@ -45,6 +45,7 @@ class ExecutePromptInfo(BaseModel):
     category: str | None
     tier: int
     why: str
+    next_steps: str = ""
 
 
 class ExecuteResponse(BaseModel):
@@ -216,7 +217,16 @@ class ShellStatusResponse(BaseModel):
 
 
 class ShellWaitRequest(BaseModel):
-    job_id: str
+    # Exactly one of job_id (background job) or prompt_id (pending approval).
+    job_id: str | None = None
+    prompt_id: str | None = Field(
+        default=None,
+        description="Pending prompt to wait on; requires agent_id (the prompt's creator).",
+    )
+    agent_id: str | None = Field(
+        default=None,
+        description="Required with prompt_id; must equal the agent_id that created the prompt.",
+    )
     wait_s: float = Field(
         default=15,
         allow_inf_nan=False,
@@ -236,8 +246,11 @@ class ShellWaitRequest(BaseModel):
 
 
 class ShellWaitResponse(BaseModel):
-    job_id: str
-    state: Literal["done", "waiting", "error"]
+    job_id: str | None = None
+    prompt_id: str | None = None
+    state: Literal["done", "waiting", "error", "approved", "denied", "expired"]
+    # Set only for state="approved", and only to the agent that created the prompt.
+    approve_token: str | None = None
     job_status: JobStatus | None = None
     exit_code: int | None = None
     elapsed_s: float = 0.0

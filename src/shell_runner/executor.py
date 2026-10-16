@@ -71,15 +71,44 @@ def extra_path_dirs() -> list[str]:
     SHELL_RUNNER_EXTRA_PATH (colon-separated) replaces the default
     when set, even to empty (= none). ~ is expanded; missing dirs and dirs
     already on PATH are skipped; order is preserved."""
+    on_path = set(os.environ.get("PATH", "").split(":"))
+    return [p for p in _configured_extra_dirs() if p not in on_path]
+
+
+def _configured_extra_dirs() -> list[str]:
+    """Expanded, existing, de-duplicated SHELL_RUNNER_EXTRA_PATH / default dirs
+    (no already-on-PATH filter)."""
     raw = os.environ.get("SHELL_RUNNER_EXTRA_PATH")
     entries = DEFAULT_EXTRA_PATH if raw is None else raw.split(":")
-    on_path = set(os.environ.get("PATH", "").split(":"))
     dirs: list[str] = []
     for entry in entries:
         if not entry:
             continue
         path = os.path.expanduser(entry)
-        if path not in on_path and path not in dirs and os.path.isdir(path):
+        if path not in dirs and os.path.isdir(path):
+            dirs.append(path)
+    return dirs
+
+
+TRUSTED_SYSTEM_BIN_DIRS = [
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/local/sbin",
+    "/usr/sbin",
+    "/sbin",
+]
+
+
+def trusted_bin_dirs() -> list[str]:
+    """Dirs whose binaries the normalizer treats as the bare verb, so
+    `/usr/bin/ls` and `ls` share a template (and rules/approvals). System bin
+    dirs plus the user tool dirs, normalised but NOT symlink-resolved and NOT
+    filtered by what is already on PATH. Only existing dirs are returned."""
+    dirs: list[str] = []
+    for entry in [*TRUSTED_SYSTEM_BIN_DIRS, *_configured_extra_dirs()]:
+        path = os.path.normpath(entry)
+        if path not in dirs and os.path.isdir(path):
             dirs.append(path)
     return dirs
 
@@ -431,6 +460,9 @@ def _now_iso() -> str:
 
 _job_completion: dict[str, asyncio.Event] = {}
 
+# Strong references to pending background watcher tasks (see execute_background).
+_background_tasks: set[asyncio.Task[None]] = set()
+
 
 def _job_is_terminal(persistence: Persistence, job_id: str) -> bool:
     """True if the persisted job status is anything other than 'running'.
@@ -546,6 +578,7 @@ async def execute_background(
         _job_completion[job_id] = asyncio.Event()
 
     async def _watch() -> None:
+        closing = False
         try:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
@@ -583,6 +616,11 @@ async def execute_background(
                 )
             except Exception:
                 logger.exception("Unexpected error in background watcher for job %s", job_id)
+        except GeneratorExit:
+            # The coroutine is being close()d (typically by GC after its event
+            # loop died with this task still pending), not cancelled.
+            closing = True
+            raise
         finally:
             # Reconcile the shell_calls row pre-written as decision="running"
             # (issue #49): every dispatch through execute_background() writes
@@ -607,17 +645,30 @@ async def execute_background(
                 job_row = persistence.get_job(job_id)
                 if job_row is not None:
                     duration_ms = int((time.monotonic() - spawn_started_at) * 1000)
-                    await asyncio.to_thread(
-                        persistence.finalize_call,
-                        telemetry_id,
-                        decision="executed",  # the command did run, even if timed_out/killed
-                        exit_code=job_row.get("exit_code"),
-                        stdout_bytes=_log_size_bytes(job_row.get("stdout_path")),
-                        stderr_bytes=_log_size_bytes(job_row.get("stderr_path")),
-                        duration_ms=duration_ms,
-                        decision_path=None,  # preserve the prewritten path
-                        only_if_running=True,
-                    )
+
+                    def _finalize() -> None:
+                        persistence.finalize_call(
+                            telemetry_id,
+                            decision="executed",  # the command did run, even if timed_out/killed
+                            exit_code=job_row.get("exit_code"),
+                            stdout_bytes=_log_size_bytes(job_row.get("stdout_path")),
+                            stderr_bytes=_log_size_bytes(job_row.get("stderr_path")),
+                            duration_ms=duration_ms,
+                            decision_path=None,  # preserve the prewritten path
+                            only_if_running=True,
+                        )
+
+                    if closing:
+                        # Never await while the coroutine is being closed. GC
+                        # can run coro.close() on any thread, including one
+                        # already inside ThreadPoolExecutor.submit holding the
+                        # executor's non-reentrant _shutdown_lock;
+                        # asyncio.to_thread -> run_in_executor -> submit would
+                        # re-acquire it on the same thread (self-deadlock) and
+                        # block every other thread on the global shutdown lock.
+                        _finalize()
+                    else:
+                        await asyncio.to_thread(_finalize)
             except Exception:
                 logger.exception(
                     "Failed to reconcile shell_calls row for job %s (telemetry_id=%s)",
@@ -628,7 +679,13 @@ async def execute_background(
             if event is not None:
                 event.set()
 
-    asyncio.create_task(_watch(), name=f"bg-watch-{job_id}")
+    # Hold a strong reference: the loop only keeps weak refs to tasks, so a
+    # pending watcher could otherwise be garbage collected mid-flight. This
+    # does not help when the loop itself dies with the task pending; the
+    # GeneratorExit handling in _watch() still covers that case.
+    task = asyncio.create_task(_watch(), name=f"bg-watch-{job_id}")
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return job_id
 

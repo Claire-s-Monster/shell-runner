@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import signal
@@ -375,6 +376,95 @@ def test_reload_cwd_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
 
         result = _execute(command="echo hi", cwd=str(sub))
         assert result.exit_code == 0
+
+
+class _FakePersistence:
+    """Minimal Persistence stand-in that records finalize_call invocations."""
+
+    def __init__(self) -> None:
+        self.pid: int | None = None
+        self.finalize_calls: list[tuple[str, dict]] = []
+
+    def create_job(self, **kwargs) -> None:
+        self.pid = kwargs["pid"]
+
+    def get_job(self, job_id: str) -> dict:
+        return {"status": "running", "exit_code": None, "stdout_path": None, "stderr_path": None}
+
+    def update_job_status(self, *args, **kwargs) -> None:
+        pass
+
+    def finalize_call(self, telemetry_id: str, **kwargs) -> None:
+        self.finalize_calls.append((telemetry_id, kwargs))
+
+
+def _start_background_job(
+    loop: asyncio.AbstractEventLoop, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[_FakePersistence, asyncio.Task]:
+    """Run `sleep 5` via execute_background on loop; return once _watch is suspended."""
+    monkeypatch.setenv("SHELL_RUNNER_JOB_DIR", str(tmp_path / "jobs"))
+    persistence = _FakePersistence()
+    loop.run_until_complete(
+        shell_runner.executor.execute_background(
+            command="sleep 5",
+            cwd=str(tmp_path),
+            telemetry_id="tel-1",
+            agent_id="agent",
+            persistence=persistence,  # type: ignore[arg-type]
+        )
+    )
+    # Let _watch start so it is pending at proc.wait(); closing an unstarted
+    # coroutine would never reach its finally block.
+    loop.run_until_complete(asyncio.sleep(0.2))
+    (task,) = [t for t in asyncio.all_tasks(loop) if t.get_name().startswith("bg-watch-")]
+    return persistence, task
+
+
+def test_watch_close_does_not_await_to_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Closing a pending _watch coroutine (GC after its loop died) must not reach
+    asyncio.to_thread: that calls executor.submit synchronously, which can
+    self-deadlock on the non-reentrant executor shutdown lock when GC runs
+    coro.close() inside another thread's ThreadPoolExecutor.submit."""
+    loop = asyncio.new_event_loop()
+    persistence, task = _start_background_job(loop, tmp_path, monkeypatch)
+    try:
+        to_thread_calls: list[object] = []
+
+        def _recorder(func, /, *args, **kwargs):
+            to_thread_calls.append(func)
+            raise RuntimeError("asyncio.to_thread must not be called while closing")
+
+        monkeypatch.setattr(shell_runner.executor.asyncio, "to_thread", _recorder)
+        task.get_coro().close()
+
+        assert to_thread_calls == []
+        assert [tid for tid, _ in persistence.finalize_calls] == ["tel-1"]
+    finally:
+        monkeypatch.undo()
+        assert persistence.pid is not None
+        os.killpg(persistence.pid, signal.SIGKILL)
+        task.cancel()
+        loop.run_until_complete(asyncio.sleep(0))
+        loop.close()
+
+
+def test_background_watcher_task_is_strongly_referenced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The _watch task must be held in _background_tasks while pending (so GC
+    cannot collect it mid-flight) and dropped once it completes."""
+    loop = asyncio.new_event_loop()
+    persistence, task = _start_background_job(loop, tmp_path, monkeypatch)
+    try:
+        assert task in shell_runner.executor._background_tasks
+        assert persistence.pid is not None
+        os.killpg(persistence.pid, signal.SIGKILL)
+        loop.run_until_complete(asyncio.wait_for(task, timeout=5))
+        assert task not in shell_runner.executor._background_tasks
+    finally:
+        loop.close()
 
 
 def test_cwd_roots_default_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -184,6 +184,40 @@ class ClassificationResult:
 # ---------------------------------------------------------------------------
 
 
+_GENERIC_HELP_VERSION_CATEGORY = "generic-help-version"
+
+# Verbs for which `<verb> <subcmd> --help` is known to only print help. Anything
+# that executes its positional argument (sh, python, npx, `pixi exec pkg`, ...)
+# is deliberately absent: with an unknown verb the second token may be code.
+_HELP_SUBCMD_VERBS = (
+    "git|pixi|cargo|uv|gh|conda|mamba|rattler-build|docker|podman|"
+    "systemctl|journalctl|kubectl|rustup|pip"
+)
+
+# The verb is the normalised verb: a bare name, never a path (no '/'). Only the
+# long forms are accepted; -h and -V mean different things across tools.
+#
+# Rule (a) is verb-generic, so it excludes verbs that execute/evaluate their
+# argument or escalate privileges (defense in depth: a shell builtin or wrapper
+# given `--help` may still be parsed or dispatched in surprising ways).
+_HELP_EXCLUDED_VERBS = "source|eval|exec|command|builtin|trap|sudo|doas|su|pkexec"
+
+_GENERIC_HELP_VERSION_RULES = (
+    Rule(
+        pattern=rf"^(?!(?:{_HELP_EXCLUDED_VERBS})\s)[A-Za-z0-9][A-Za-z0-9._+-]*\s+--(?:version|help)$",
+        tier=Tier.AUTO_CAPPED,
+        category=_GENERIC_HELP_VERSION_CATEGORY,
+        reason="bare `<verb> --version|--help` only prints information",
+    ),
+    Rule(
+        pattern=rf"^(?:{_HELP_SUBCMD_VERBS})\s+[a-z][a-z0-9-]*\s+--help$",
+        tier=Tier.AUTO_CAPPED,
+        category=_GENERIC_HELP_VERSION_CATEGORY,
+        reason="`<verb> <subcmd> --help` for allowlisted verbs only prints help",
+    ),
+)
+
+
 def _classify_template(template: str) -> tuple[Tier, Rule | None, str]:
     """Evaluate a normalized template against catalog rules (T0-template, T4, T2, T1).
 
@@ -209,6 +243,12 @@ def _classify_template(template: str) -> tuple[Tier, Rule | None, str]:
     for rule in T1_AUTO_LOG:
         if compiled_for(rule).match(template):
             return Tier.AUTO_LOG, rule, "T1"
+
+    # Generic help/version probes. Only reached when no specific rule matched,
+    # so any T0/T4/T2/T1 rule (including DENY) has already won.
+    for rule in _GENERIC_HELP_VERSION_RULES:
+        if compiled_for(rule).match(template):
+            return Tier.AUTO_CAPPED, rule, "T2"
 
     # No match -> T3 fall-through (unknown command; discovery entry point)
     return Tier.APPROVE_ONCE, None, "T3_fallthrough"

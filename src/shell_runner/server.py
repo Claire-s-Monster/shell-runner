@@ -1312,6 +1312,13 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             category=cls.matched_rule.category if cls.matched_rule else None,
             tier=int(cls.tier),
             why=why,
+            next_steps=(
+                f"A primary session must approve prompt {prompt_id} via shell_approve_pending. "
+                f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
+                "repeatedly until state is 'approved', then re-run shell_execute with the "
+                "identical command, cwd and agent_id plus approve_token. "
+                "Stop if state is 'denied' or 'expired'."
+            ),
         ),
     )
 
@@ -1636,9 +1643,82 @@ def _is_terminal(job: dict) -> bool:
     return job["status"] != "running"
 
 
-def _wait_error(job_id: str, message: str, started: float) -> ShellWaitResponse:
+def _wait_error(
+    job_id: str | None, message: str, started: float, *, prompt_id: str | None = None
+) -> ShellWaitResponse:
     return ShellWaitResponse(
-        job_id=job_id, state="error", elapsed_s=time.monotonic() - started, error=message
+        job_id=job_id,
+        prompt_id=prompt_id,
+        state="error",
+        elapsed_s=time.monotonic() - started,
+        error=message,
+    )
+
+
+def _prompt_wait_state(row: dict) -> Literal["approved", "denied", "expired", "waiting", "error"]:
+    """Where a pending prompt stands for its requester. A spent token is "error"
+    (nothing left to hand out); a denial wins over expiry; expiry gates the
+    token, so an approved-but-expired prompt reports "expired", not "approved"."""
+    if row["approve_decision"] == "deny":
+        return "denied"
+    if row["consumed_at"] is not None:
+        return "error"
+    if row["expires_at"] < _now_iso():
+        return "expired"
+    if row["approve_decision"] is not None and row["approve_token"]:
+        return "approved"
+    return "waiting"
+
+
+async def _wait_for_prompt_decision(prompt_id: str, wait_s: float) -> dict | None:
+    """Poll the prompt row until it leaves "waiting" or *wait_s* elapses; return the last row."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        row = db.get_pending_prompt(prompt_id)
+        if row is None or _prompt_wait_state(row) != "waiting":
+            return row
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return row
+        await asyncio.sleep(min(WAIT_POLL_INTERVAL_S, remaining))
+
+
+async def _wait_for_prompt(
+    prompt_id: str, agent_id: str | None, wait_s: float, started: float
+) -> ShellWaitResponse:
+    """shell_wait prompt mode: report the approval state of *prompt_id* to the
+    agent that created it. The approve_token is only ever returned here, and
+    only to that agent; a missing prompt and someone else's prompt look the same."""
+    not_yours = f"prompt {prompt_id} not found for this agent_id"
+    if not agent_id:
+        return _wait_error(
+            None, "agent_id is required with prompt_id", started, prompt_id=prompt_id
+        )
+    row = db.get_pending_prompt(prompt_id)
+    if row is None or row["agent_id"] != agent_id:
+        return _wait_error(None, not_yours, started, prompt_id=prompt_id)
+
+    # Saturated: do a single check rather than queueing behind other waiters.
+    if _wait_semaphore.locked():
+        row = await _wait_for_prompt_decision(prompt_id, 0.0)
+    else:
+        async with _wait_semaphore:
+            row = await _wait_for_prompt_decision(prompt_id, wait_s)
+    if row is None:  # expired and swept by cleanup while we waited
+        return ShellWaitResponse(
+            prompt_id=prompt_id, state="expired", elapsed_s=time.monotonic() - started
+        )
+
+    state = _prompt_wait_state(row)
+    if state == "error":
+        return _wait_error(
+            None, f"prompt {prompt_id} was already consumed", started, prompt_id=prompt_id
+        )
+    return ShellWaitResponse(
+        prompt_id=prompt_id,
+        state=state,
+        approve_token=row["approve_token"] if state == "approved" else None,
+        elapsed_s=time.monotonic() - started,
     )
 
 
@@ -1680,10 +1760,21 @@ async def _wait_for_terminal(job_id: str, wait_s: float) -> dict | None:
 
 @app.post("/tools/shell_wait", response_model=ShellWaitResponse)
 async def shell_wait_route(body: ShellWaitRequest) -> ShellWaitResponse:
-    """Wait (bounded) for a background job to reach a terminal state; runs no command."""
+    """Wait (bounded) for a background job to reach a terminal state, or (prompt_id
+    mode) for a pending approval to be decided; runs no command."""
     started = time.monotonic()
     wait_s = min(max(body.wait_s, 0.0), float(MAX_WAIT_S))
     max_lines = min(max(body.max_result_lines, 1), MAX_RESULT_LINES_CAP)
+
+    if body.job_id is None and body.prompt_id is not None:
+        return await _wait_for_prompt(body.prompt_id, body.agent_id, wait_s, started)
+    if body.job_id is None or body.prompt_id is not None:
+        return _wait_error(
+            body.job_id,
+            "exactly one of job_id or prompt_id is required",
+            started,
+            prompt_id=body.prompt_id,
+        )
 
     needles: tuple[str, ...] = ()
     if body.result_contains:
