@@ -106,7 +106,7 @@ start_server() {
     cd "$PROJECT_DIR"
     export SHELL_RUNNER_DB SHELL_RUNNER_HOST SHELL_RUNNER_PORT SHELL_RUNNER_MAX_TIMEOUT_S
     export PYTHONPATH="${PROJECT_DIR}/src"
-    nohup "${HOME}/.conda/envs/ClaudeCode/bin/pixi" run --environment ci uvicorn shell_runner.server:app \
+    nohup "${HOME}/.pixi/bin/pixi" run --environment ci uvicorn shell_runner.server:app \
         --host "$SHELL_RUNNER_HOST" \
         --port "$SHELL_RUNNER_PORT" \
         >> "$LOG_FILE" 2>&1 &

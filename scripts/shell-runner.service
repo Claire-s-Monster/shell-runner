@@ -1,12 +1,7 @@
 [Unit]
 Description=Shell Runner MCP HTTP Server
-Documentation=https://github.com/MementoRC/shell-runner
+Documentation=https://github.com/Claire-s-Monster/shell-runner
 After=network.target
-# Tolerate a real crash-loop for a while before systemd gives up and leaves
-# the server down (default StartLimitBurst=5/StartLimitIntervalSec=10s is too
-# tight against RestartSec=5 below and can permanently disable the service).
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -14,15 +9,16 @@ WorkingDirectory=/home/memento/ClaudeCode/Servers/shell-runner/development
 Environment=SHELL_RUNNER_DB=/home/memento/.local/share/shell-runner/telemetry.sqlite3
 Environment=SHELL_RUNNER_HOST=127.0.0.1
 Environment=SHELL_RUNNER_PORT=4111
-# Preferred: edit ~/.config/shell-runner/cwd-roots.toml and send SIGHUP to reload without restart.
-# SHELL_RUNNER_CWD_ROOTS (colon-separated) and SHELL_RUNNER_CWD_ROOT (legacy) are also supported.
-Environment=SHELL_RUNNER_CWD_ROOT=/
-# Subprocess timeout cap in seconds (default: 3600 = 1h). Override to support longer builds.
-Environment=SHELL_RUNNER_MAX_TIMEOUT_S=3600
+# Allowed cwd roots come from ~/.config/shell-runner/cwd-roots.toml (send SIGHUP to
+# reload without restart). Do NOT set SHELL_RUNNER_CWD_ROOT(S) here: all sources are
+# merged, so e.g. SHELL_RUNNER_CWD_ROOT=/ would silently disable the cwd jail.
+# Subprocess timeout cap in seconds (default: 3600 = 1h). Uncomment to raise for longer builds.
+# Environment=SHELL_RUNNER_MAX_TIMEOUT_S=3600
 # Extra user tool dirs appended to the child PATH (only dirs that exist and are not already on PATH).
+# Install CLI tools with `pixi global install <tool>` so they land in ~/.pixi/bin.
 # Environment=SHELL_RUNNER_EXTRA_PATH=%h/.pixi/bin:%h/.local/bin:%h/.cargo/bin  (default; set empty to disable)
 Environment=PYTHONPATH=/home/memento/ClaudeCode/Servers/shell-runner/development/src
-ExecStart=/home/memento/.conda/envs/ClaudeCode/bin/pixi run --manifest-path /home/memento/ClaudeCode/Servers/shell-runner/development/pyproject.toml --environment ci uvicorn shell_runner.server:app --host 127.0.0.1 --port 4111
+ExecStart=/home/memento/.pixi/bin/pixi run --manifest-path /home/memento/ClaudeCode/Servers/shell-runner/development/pyproject.toml --environment ci uvicorn shell_runner.server:app --host 127.0.0.1 --port 4111
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
