@@ -17,11 +17,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_FILE="${SCRIPT_DIR}/shell-runner.service"
+OVERRIDE_DIR="${SCRIPT_DIR}/shell-runner.service.d"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 TARGET="${SYSTEMD_USER_DIR}/shell-runner.service"
+OVERRIDE_TARGET="${SYSTEMD_USER_DIR}/shell-runner.service.d"
 
 if [ ! -f "$SERVICE_FILE" ]; then
     echo "ERROR: Service file not found: $SERVICE_FILE"
+    exit 1
+fi
+
+if [ ! -d "$OVERRIDE_DIR" ]; then
+    echo "ERROR: Override directory not found: $OVERRIDE_DIR"
     exit 1
 fi
 
@@ -29,6 +36,10 @@ echo "Installing shell-runner systemd user service..."
 mkdir -p "$SYSTEMD_USER_DIR"
 cp "$SERVICE_FILE" "$TARGET"
 echo "  Copied: $TARGET"
+
+mkdir -p "$OVERRIDE_TARGET"
+cp -r "$OVERRIDE_DIR"/* "$OVERRIDE_TARGET"
+echo "  Copied: $OVERRIDE_TARGET/*"
 
 echo "Reloading systemd user daemon..."
 systemctl --user daemon-reload
