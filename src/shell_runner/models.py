@@ -196,7 +196,7 @@ class ObserveResponse(BaseModel):
 # Background job models
 # ---------------------------------------------------------------------------
 
-JobStatus = Literal["running", "completed", "failed", "killed", "timed_out"]
+JobStatus = Literal["running", "completed", "failed", "killed", "timed_out", "unit_missing"]
 
 
 class ShellStatusRequest(BaseModel):
@@ -214,6 +214,8 @@ class ShellStatusResponse(BaseModel):
     stderr_tail: str
     stdout_full_path: str | None
     stderr_full_path: str | None
+    # shell_monitor jobs only: the most recent events parsed from events.jsonl.
+    events: list[dict] | None = None
 
 
 class ShellWaitRequest(BaseModel):
@@ -258,6 +260,52 @@ class ShellWaitResponse(BaseModel):
     stdout_full_path: str | None = None
     stderr_full_path: str | None = None
     error: str | None = None
+
+
+class ShellMonitorRequest(BaseModel):
+    agent_id: str = Field(description="Caller identity; logged only, never gated.")
+    unit: str | None = Field(
+        default=None,
+        description="systemd USER unit to watch; '.service' is appended if no suffix is given.",
+    )
+    log_path: str | None = Field(
+        default=None, description="Log file to follow (must be under an allowed root)."
+    )
+    patterns: list[str] = Field(
+        default_factory=list,
+        description="Regexes (max 20, each <= 500 chars); matching log lines become events.",
+    )
+    preset: str | None = Field(default=None, description="Named pattern set added to patterns.")
+    until: str | None = Field(
+        default=None,
+        description=(
+            "'unit_exit' (default when unit is set), 'pattern:<regex>' or 'log_idle:<seconds>'."
+        ),
+    )
+    from_start: bool = Field(
+        default=False,
+        description="Read an already-existing log from its beginning instead of its end.",
+    )
+    timeout_s: int = Field(default=3600, ge=1, le=21600)
+    max_events: int = Field(default=200, ge=1, le=1000)
+    unit_grace_s: int = Field(
+        default=15,
+        ge=0,
+        le=300,
+        description="How long a not-yet-existing unit may be absent before unit_missing.",
+    )
+
+
+class ShellMonitorResponse(BaseModel):
+    job_id: str | None = None
+    status: Literal["running", "error"]
+    log_path_resolved: str | None = None
+    unit_resolved: str | None = None
+    until: str | None = None
+    events_path: str | None = None
+    error: str | None = None
+    # Set when log_path was rejected, so the caller can see where it may point.
+    allowed_roots: list[str] = Field(default_factory=list)
 
 
 class ShellKillRequest(BaseModel):

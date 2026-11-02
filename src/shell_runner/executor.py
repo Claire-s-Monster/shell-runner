@@ -195,6 +195,17 @@ def reload_cwd_roots() -> list[Path]:
     return new_roots
 
 
+def current_cwd_roots() -> list[Path]:
+    """Snapshot of the current allowed cwd roots (shell_monitor's log_path allowlist)."""
+    with _cwd_roots_lock:
+        return list(_CWD_ROOTS)
+
+
+def job_dir_base() -> Path:
+    """Root directory of per-job log dirs (public for shell_monitor)."""
+    return _job_dir_base()
+
+
 # Initialise on import
 _CWD_ROOTS = _load_cwd_roots()
 
