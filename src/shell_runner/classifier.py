@@ -122,7 +122,7 @@ def lookup_agent_cap(agent_id: str | None) -> Tier:
     all resolve to Tier.DENY. Unrecognized agent IDs fall back to
     DEFAULT_AGENT_CAP.
     """
-    if is_reserved_primary_id(agent_id):
+    if agent_id is None or is_reserved_primary_id(agent_id):
         return Tier.DENY
     return KNOWN_AGENT_CAPS.get(agent_id, DEFAULT_AGENT_CAP)
 
