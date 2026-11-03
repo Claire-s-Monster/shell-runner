@@ -69,7 +69,11 @@ The path is resolved with `realpath` and must lie under one of:
 
 The deny-list wins even inside an allowed root: any path component `.ssh`,
 `.gnupg`, `.aws`, `.kube`, `.docker`, `.password-store`, the sequence
-`.config/gh`, and anything under `/etc /proc /sys /dev /root /boot`. The check
+`.config/gh`, and anything under `/etc /proc /sys /dev /root /boot`. Credential
+files are refused by name wherever they sit: `.credentials.json`, `.netrc`,
+`.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `credentials.json`,
+`id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`, any `.env*`, `*.pem` and `*.key`
+(checked on the symlink-resolved path). The check
 is repeated whenever the file is (re)opened, so a symlink created later cannot
 escape. Rejections return `log_path not allowed` plus the allowed roots.
 

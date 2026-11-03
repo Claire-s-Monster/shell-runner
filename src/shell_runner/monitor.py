@@ -63,6 +63,23 @@ BUILTIN_PRESETS: dict[str, list[str]] = {
 # readable through shell_monitor, even when they sit inside an allowed root.
 _DENY_COMPONENTS = frozenset({".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store"})
 _DENY_SEQUENCES = ((".config", "gh"),)
+_DENY_FILE_NAMES = frozenset(
+    {
+        ".credentials.json",
+        ".netrc",
+        ".pgpass",
+        ".git-credentials",
+        ".npmrc",
+        ".pypirc",
+        "credentials.json",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+    }
+)
+_DENY_FILE_PREFIXES = (".env",)
+_DENY_FILE_SUFFIXES = (".pem", ".key")
 _DENY_ROOTS = tuple(Path(p) for p in ("/etc", "/proc", "/sys", "/dev", "/root", "/boot"))
 
 TerminalState = Literal["completed", "failed", "timed_out", "killed", "unit_missing"]
@@ -126,6 +143,13 @@ def allowed_roots(config: dict[str, Any]) -> list[Path]:
 
 def _is_denied(resolved: Path) -> bool:
     if any(resolved.is_relative_to(root) for root in _DENY_ROOTS):
+        return True
+    name = resolved.name
+    if (
+        name in _DENY_FILE_NAMES
+        or name.startswith(_DENY_FILE_PREFIXES)
+        or name.endswith(_DENY_FILE_SUFFIXES)
+    ):
         return True
     parts = resolved.parts
     if any(part in _DENY_COMPONENTS for part in parts):
