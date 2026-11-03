@@ -63,10 +63,10 @@ def test_initialize_sets_protocol_version_header(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tools_list_returns_nine_tools(client: TestClient) -> None:
+def test_tools_list_returns_ten_tools(client: TestClient) -> None:
     resp = _post(client, "tools/list", req_id=2)
     tools = resp["result"]["tools"]
-    assert len(tools) == 9
+    assert len(tools) == 10
     names = {t["name"] for t in tools}
     assert names == {
         "shell_execute",
@@ -76,6 +76,7 @@ def test_tools_list_returns_nine_tools(client: TestClient) -> None:
         "shell_health",
         "shell_status",
         "shell_wait",
+        "shell_monitor",
         "mcp_restart",
         "shell_kill",
     }
@@ -174,6 +175,59 @@ async def test_tools_call_shell_wait_runs_background_job_to_done(
     assert payload["job_status"] == "completed"
     assert payload["exit_code"] == 0
     assert payload["matched_lines"] == ["wait-marker"]
+
+
+async def test_tools_call_shell_monitor_then_shell_wait_matches_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #68: a log monitor is an ordinary job to shell_wait/shell_status."""
+    monkeypatch.setenv("SHELL_RUNNER_JOB_DIR", str(tmp_path / "jobs"))
+    monkeypatch.setenv("SHELL_RUNNER_MONITOR_LOG_DIRS", str(tmp_path))
+    monkeypatch.setattr("shell_runner.monitor.LOG_POLL_INTERVAL_S", 0.05)
+    log = tmp_path / "app.log"
+    log.write_text("starting\nERROR first\nall done\n")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+
+        async def _call(name: str, arguments: dict) -> dict:
+            r = await ac.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "id": 10,
+                    "params": {"name": name, "arguments": arguments},
+                },
+            )
+            return json.loads(r.json()["result"]["content"][0]["text"])
+
+        started = await _call(
+            "shell_monitor",
+            {
+                "agent_id": "focused-ghc-ci-analyzer",
+                "log_path": str(log),
+                "patterns": ["ERROR"],
+                "until": "pattern:all done",
+                "from_start": True,
+            },
+        )
+        assert started["status"] == "running"
+        waited = await _call(
+            "shell_wait",
+            {"job_id": started["job_id"], "wait_s": 10, "result_contains": ["ERROR"]},
+        )
+        status = await _call("shell_status", {"job_id": started["job_id"]})
+        rejected = await _call(
+            "shell_monitor",
+            {"agent_id": "a", "log_path": "/etc/passwd", "until": "log_idle:1"},
+        )
+    assert waited["state"] == "done"
+    assert waited["job_status"] == "completed"
+    assert len(waited["matched_lines"]) == 1
+    assert "ERROR first" in waited["matched_lines"][0]
+    assert status["events"][-1]["kind"] == "terminal"
+    assert status["events"][-1]["reason"] == "pattern_matched"
+    assert rejected["status"] == "error"
+    assert "log_path not allowed" in rejected["error"]
 
 
 def test_tools_call_shell_wait_unknown_job_without_agent_id(client: TestClient) -> None:

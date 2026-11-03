@@ -183,8 +183,9 @@ TOOLS: dict[str, dict[str, Any]] = {
     "shell_status": {
         "description": (
             "Poll the status of a background job started with shell_execute(run_in_background=true). "
-            "Returns status (running|completed|failed|killed|timed_out), exit_code, "
-            "stdout/stderr tails, and full log paths."
+            "Returns status (running|completed|failed|killed|timed_out|unit_missing), exit_code, "
+            "stdout/stderr tails, and full log paths. For shell_monitor jobs, stdout is the "
+            "events.jsonl stream and `events` holds the most recent parsed events."
         ),
         "schema": {
             "type": "object",
@@ -245,6 +246,82 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "integer",
                     "default": 25,
                     "description": "Max matched_lines returned, clamped to [1, 100]",
+                },
+            },
+        },
+    },
+    "shell_monitor": {
+        "description": (
+            "Watch a systemd --user unit and/or follow a log file in the background; read-only, "
+            "auto-executes and never prompts (no command is run, so no approval tier applies). "
+            "Returns a job_id immediately: poll it with shell_wait (result_contains matches "
+            "event lines) or shell_status (events). Events are JSON lines "
+            "(kind line|unit|note|terminal); the terminal event is ALWAYS emitted last, with "
+            "state completed|failed|timed_out|killed|unit_missing and a reason. "
+            "until: 'unit_exit' (default when unit is set), 'pattern:<regex>' (a unit that "
+            "exits first without the pattern is failed, never success) or 'log_idle:<seconds>'. "
+            "log_path must be under a cwd root, /tmp or a configured monitor dir (credential "
+            "dirs are always refused). shell_kill stops a monitor."
+        ),
+        "schema": {
+            "type": "object",
+            "required": ["agent_id"],
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "Caller agent identifier (telemetry only; not gated)",
+                },
+                "unit": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "systemd USER unit; '.service' is appended if no unit suffix is given"
+                    ),
+                },
+                "log_path": {
+                    "type": ["string", "null"],
+                    "description": "Absolute path of a log file to follow (it may not exist yet)",
+                },
+                "patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                    "description": "Regexes (each <= 500 chars); matching log lines become events",
+                },
+                "preset": {
+                    "type": ["string", "null"],
+                    "description": "Named pattern set (built-in: errors, pytest; or from monitor.toml)",
+                },
+                "until": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "unit_exit | pattern:<regex> | log_idle:<seconds>; required without a unit"
+                    ),
+                },
+                "from_start": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Read an already-existing log from its start instead of its end",
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "default": 3600,
+                    "minimum": 1,
+                    "maximum": 21600,
+                    "description": "Stop with state timed_out after this long",
+                },
+                "max_events": {
+                    "type": "integer",
+                    "default": 200,
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Max line events recorded (a note marks truncation)",
+                },
+                "unit_grace_s": {
+                    "type": "integer",
+                    "default": 15,
+                    "minimum": 0,
+                    "maximum": 300,
+                    "description": "How long a not-yet-existing unit may be absent before unit_missing",
                 },
             },
         },

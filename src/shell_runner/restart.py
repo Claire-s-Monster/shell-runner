@@ -179,6 +179,9 @@ def _run(
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
 
+run_argv = _run  # public alias for shell_monitor's systemctl polling
+
+
 def _combined(cp: subprocess.CompletedProcess[str]) -> str:
     return _tail((cp.stdout or "") + (cp.stderr or ""))
 

@@ -998,8 +998,9 @@ class Persistence:
         timeout_s: int,
         stdout_path: str,
         stderr_path: str,
-        pid: int,
+        pid: int | None,
     ) -> None:
+        # pid is None for shell_monitor jobs (an in-process asyncio task, no subprocess).
         started_at = _now_utc()
         with self._write_conn() as conn:
             conn.execute(
@@ -1045,6 +1046,23 @@ class Persistence:
                 f"WHERE job_id = ?{guard}",  # noqa: S608 - constant fragment, no user input
                 (status, exit_code, finished_at, job_id),
             )
+
+    def kill_orphaned_monitor_jobs(self) -> list[dict]:
+        """Mark every 'running' job with no pid (a shell_monitor task) as 'killed'.
+
+        Run at startup: a monitor is an in-process task, so none can have survived a
+        restart. Returns the rows that were changed.
+        """
+        with self._write_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status = 'running' AND pid IS NULL"
+            ).fetchall()
+            conn.execute(
+                "UPDATE jobs SET status = 'killed', finished_at = ? "
+                "WHERE status = 'running' AND pid IS NULL",
+                (_now_utc(),),
+            )
+        return [dict(r) for r in rows]
 
     def get_job(self, job_id: str) -> dict | None:
         with self._conn() as conn:
