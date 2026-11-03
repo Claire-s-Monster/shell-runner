@@ -261,7 +261,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "until: 'unit_exit' (default when unit is set), 'pattern:<regex>' (a unit that "
             "exits first without the pattern is failed, never success) or 'log_idle:<seconds>'. "
             "log_path must be under a cwd root, /tmp or a configured monitor dir (credential "
-            "dirs are always refused). shell_kill stops a monitor."
+            "dirs and files are always refused). shell_kill stops a monitor."
         ),
         "schema": {
             "type": "object",

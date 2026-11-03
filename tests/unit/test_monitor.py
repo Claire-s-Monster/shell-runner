@@ -584,6 +584,56 @@ def test_deny_list_wins_inside_allowed_root(
     assert "not allowed" in err
 
 
+@pytest.mark.parametrize(
+    "rel",
+    [
+        ".claude/.credentials.json",
+        ".netrc",
+        ".pgpass",
+        ".git-credentials",
+        ".npmrc",
+        ".pypirc",
+        "credentials.json",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        ".env",
+        ".env.local",
+        "x.pem",
+        "x.key",
+    ],
+)
+def test_credential_files_denied_inside_allowed_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rel: str
+) -> None:
+    monkeypatch.setenv("SHELL_RUNNER_MONITOR_LOG_DIRS", str(tmp_path))
+    path, err = monitor.check_log_path(str(tmp_path / rel), {})
+    assert path is None
+    assert err is not None
+    assert "not allowed" in err
+
+
+def test_ordinary_log_beside_credential_file_allowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SHELL_RUNNER_MONITOR_LOG_DIRS", str(tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".credentials.json").write_text("{}")
+    assert monitor.check_log_path(str(tmp_path / ".claude" / "app.log"), {})[1] is None
+    assert monitor.check_log_path(str(tmp_path / "environment.log"), {})[1] is None
+
+
+def test_symlink_to_credential_file_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SHELL_RUNNER_MONITOR_LOG_DIRS", str(tmp_path))
+    secret = tmp_path / ".credentials.json"
+    secret.write_text("{}")
+    (tmp_path / "app.log").symlink_to(secret)
+    assert monitor.check_log_path(str(tmp_path / "app.log"), {})[0] is None
+
+
 @pytest.mark.parametrize("path", ["/etc/passwd", "/proc/1/environ", "/root/x.log", "/sys/x"])
 def test_system_dirs_denied_even_if_allowed(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
     monkeypatch.setenv("SHELL_RUNNER_MONITOR_LOG_DIRS", "/")
