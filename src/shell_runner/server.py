@@ -29,7 +29,7 @@ from typing import Any, Literal, cast
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import executor, restart
+from . import executor, monitor, restart
 from .catalog import Tier, all_rules
 from .classifier import (
     PERMISSIVENESS,
@@ -67,6 +67,8 @@ from .models import (
     PendingPromptDetail,
     ShellKillRequest,
     ShellKillResponse,
+    ShellMonitorRequest,
+    ShellMonitorResponse,
     ShellStatusRequest,
     ShellStatusResponse,
     ShellWaitRequest,
@@ -305,9 +307,14 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     await catalog_writer.start()
     application.state.catalog_writer = catalog_writer
 
+    orphaned = await asyncio.to_thread(monitor.reconcile_orphans, db)
+    if orphaned:
+        logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
+
     try:
         yield
     finally:
+        await monitor.shutdown()
         await telemetry_writer.stop()
         await catalog_writer.stop()
         db.close()
@@ -1610,6 +1617,12 @@ async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
     job = db.get_job(body.job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"job {body.job_id} not found")
+    # shell_monitor jobs (pid None) also expose their parsed events.
+    events = (
+        await asyncio.to_thread(monitor.read_events, job["stdout_path"] or "")
+        if job["pid"] is None
+        else None
+    )
     return ShellStatusResponse(
         job_id=job["job_id"],
         status=job["status"],
@@ -1621,7 +1634,17 @@ async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
         stderr_tail=_tail(job["stderr_path"], OUTPUT_TAIL_BYTES),
         stdout_full_path=job["stdout_path"],
         stderr_full_path=job["stderr_path"],
+        events=events,
     )
+
+
+@app.post("/tools/shell_monitor", response_model=ShellMonitorResponse)
+async def shell_monitor_route(body: ShellMonitorRequest) -> ShellMonitorResponse:
+    """Start a read-only monitor of a systemd user unit and/or a log file (issue #68).
+
+    Deliberately not gated: it runs no command, so it does not go through the
+    classifier or the tiers; agent_id is logged only."""
+    return await monitor.start_monitor(body, db)
 
 
 # issue #51 — shell_wait. MAX_WAIT_S stays below the 20s inline budget / MCP
@@ -1811,6 +1834,18 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
     job = db.get_job(body.job_id)
     if not job or job["status"] != "running":
         return ShellKillResponse(killed=False, reason="job not running or not found")
+    if job["pid"] is None:
+        # shell_monitor job: an asyncio task, not a process. The task writes its own
+        # terminal "killed" event; with no live task (e.g. after a restart) just mark it.
+        if not await monitor.cancel_monitor(body.job_id, db):
+            await asyncio.to_thread(
+                db.update_job_status,
+                body.job_id,
+                status="killed",
+                finished_at=_now_iso(),
+                only_if_running=True,
+            )
+        return ShellKillResponse(killed=True, reason="monitor stopped")
     sig = getattr(signal, body.sig, signal.SIGTERM)
     try:
         os.kill(job["pid"], sig)
@@ -2077,6 +2112,14 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
             logger.exception("Invalid arguments for shell_wait")
             return {"error": "invalid arguments"}
         return (await shell_wait_route(wait_req)).model_dump()
+
+    if tool_name == "shell_monitor":
+        try:
+            monitor_req = ShellMonitorRequest(**arguments)
+        except Exception:
+            logger.exception("Invalid arguments for shell_monitor")
+            return {"error": "invalid arguments"}
+        return (await shell_monitor_route(monitor_req)).model_dump()
 
     if tool_name == "mcp_restart":
         return await _mcp_restart_tool(arguments)
