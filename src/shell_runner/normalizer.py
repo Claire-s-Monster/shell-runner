@@ -14,10 +14,12 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from urllib.parse import urlparse
 
-from .executor import trusted_bin_dirs
+from .executor import current_cwd_roots, trusted_bin_dirs
+from .monitor import is_credential_path
 
 # ---------------------------------------------------------------------------
 # Default safe domains for URL classification
@@ -173,6 +175,34 @@ READ_ONLY_FILE_VERBS: frozenset[str] = frozenset(
     }
 )
 
+# Read-only inspection verbs whose bare operands (`Makefile`, `src/x.py`) are file
+# paths. They are classified like `./<operand>` so they resolve (symlinks, `..`)
+# and get credential detection instead of staying an unmatchable literal word.
+_BARE_PATH_VERBS: frozenset[str] = frozenset(
+    {"ls", "stat", "du", "file", "wc", "head", "tail", "diff", "cmp"}
+)
+_BARE_OPERAND_RE = re.compile(r"[\w.@+%-]+(?:/[\w.@+%-]+)*/?")
+
+# Verbs whose operands are write targets (or sources) in the scratch-directory
+# auto-execute rules; /tmp/<name> operands are re-labelled <scratch_path>.
+_SCRATCH_WRITE_VERBS: frozenset[str] = frozenset({"mkdir", "rm", "cp", "mv", "touch", "tar", "ln"})
+
+# Top-level /tmp entries that are never scratch: hidden dirs (.X11-unix), other
+# services' private dirs, and shell-runner's own state.
+_PROTECTED_TMP_RE = re.compile(r"(?:\.|systemd-private-|tmux-|ssh-|snap-private-tmp|shell-runner)")
+# /tmp/claude-<uid> holds every session scratchpad: its children are scratch, it is not.
+_SESSION_ROOT_RE = re.compile(r"claude-\d+")
+
+# Leading `cd DIR <sep>` that can be folded away (see _fold_leading_cd).
+_LEADING_CD_RE = re.compile(
+    r"""^\s*cd\s+
+    (?P<dir>"[^"$`\\\n]+"|'[^'\n]+'|(?:~/)?[^\s;&|<>()$`"'\\*?\[\]{}!#~=%-][^\s;&|<>()$`"'\\*?\[\]{}!#~=%]*|~)
+    \s*(?:&&|\|\|\s*(?:exit|return)(?:\s+\d+)?\s*;)\s*
+    (?P<rest>\S.*)$""",
+    re.VERBOSE | re.DOTALL,
+)
+_MAX_CD_FOLDS = 4
+
 # Maximum subshell recursion depth before truncating
 _MAX_SUBSHELL_DEPTH = 3
 
@@ -207,6 +237,9 @@ class NormalizedCommand:
     placeholders: dict[str, list[str]]
     parse_warnings: tuple[str, ...]
     parse_ok: bool
+    # Command left after folding leading `cd DIR &&` (None when nothing was folded);
+    # the classifier scans it for raw T0 rules, which are anchored at command start.
+    folded_command: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +304,43 @@ def _has_url_scheme(s: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_abs(p: str, cwd: str, home_dir: str) -> str:
+    """Expand ~ / $HOME, anchor at cwd and resolve symlinks and `..` (realpath)."""
+    if p == "~":
+        expanded = home_dir
+    elif p.startswith("~/"):
+        expanded = home_dir + p[1:]
+    elif p.startswith("$HOME"):
+        expanded = home_dir + p[5:]
+    else:
+        expanded = p
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(cwd, expanded)
+    return os.path.realpath(expanded)
+
+
+def is_scratch_path(p: str, cwd: str, env: dict[str, str] | None) -> bool:
+    """True if p really resolves to a strict descendant of /tmp that is safe to
+    create/remove: not /tmp itself, not a hidden or service dir, not the bare
+    /tmp/claude-<uid> session root, and not a credential path.
+
+    Decided on the realpath, never on the textual prefix, so `/tmp/../home/x`
+    and a /tmp symlink pointing elsewhere are not scratch. $TMPDIR is not a
+    scratch root: it is not forwarded to the child environment, so inside the
+    executed command it expands to "" and `$TMPDIR/x` would be `/x`.
+    """
+    env = env or {}
+    abs_p = _resolve_abs(p, cwd, env.get("HOME", os.path.expanduser("~")))
+    parts = abs_p.split("/")  # ["", "tmp", name, ...]
+    if len(parts) < 3 or parts[1] != "tmp" or not parts[2]:
+        return False
+    if _PROTECTED_TMP_RE.match(parts[2]):
+        return False
+    if _SESSION_ROOT_RE.fullmatch(parts[2]) and len(parts) < 4:
+        return False
+    return not is_credential_path(Path(abs_p))
+
+
 def classify_path(p: str, cwd: str, env: dict[str, str] | None) -> str:
     """Classify a path token into a placeholder.
 
@@ -286,26 +356,19 @@ def classify_path(p: str, cwd: str, env: dict[str, str] | None) -> str:
     # Determine whether original token was relative
     is_relative = not p.startswith("/") and not p.startswith("~") and not p.startswith("$HOME")
 
-    # Manually expand ~ using env HOME to avoid using real system HOME
-    if p == "~":
-        expanded = home_dir
-    elif p.startswith("~/"):
-        expanded = home_dir + p[1:]
-    elif p.startswith("$HOME"):
-        expanded = home_dir + p[5:]
-    else:
-        expanded = p  # keep as-is; resolve below
-
-    # Resolve relative to cwd
-    if not os.path.isabs(expanded):
-        expanded = os.path.join(cwd, expanded)
-
-    abs_p = os.path.realpath(expanded)
+    # Expand ~ using env HOME (not the real system HOME) and resolve from cwd
+    abs_p = _resolve_abs(p, cwd, home_dir)
     cwd_real = os.path.realpath(cwd)
 
     # Always match cwd and descendants first
     if abs_p == cwd_real or abs_p.startswith(cwd_real + os.sep):
         return "<cwd_path>"
+
+    # Credential stores (~/.ssh, ~/.aws, .netrc, ...) outside cwd get their own
+    # placeholder so no auto-execute rule that accepts <home_path>/<abs_path>/
+    # <tmp_path> can ever match them. Shares monitor.is_credential_path.
+    if is_credential_path(Path(abs_p)):
+        return "<cred_path>"
 
     # System / sensitive absolute locations always win regardless of relativity
     if abs_p == "/tmp" or abs_p.startswith("/tmp/"):
@@ -367,6 +430,9 @@ PATH_PLACEHOLDERS: tuple[str, ...] = (
     "<system_path>",
     "<home_path>",
     "<abs_path>",
+    "<cred_path>",
+    "<scratch_path>",
+    "<var_path>",
 )
 
 
@@ -460,6 +526,10 @@ def _classify_token(
     ):
         original = tok
         placeholder = classify_path(tok, cwd, env)
+        # A $VAR / $(cmd) inside the path (already swapped for a sentinel) means the
+        # real path is unknown: outside cwd/tmp it must not look like a plain path.
+        if _SENTINEL_PREFIX in tok and placeholder in ("<home_path>", "<abs_path>"):
+            placeholder = "<var_path>"
         # Warn if path traversal was present
         if "../" in tok or tok.startswith(".."):
             state.warn("path_traversal_resolved")
@@ -692,6 +762,33 @@ def _trusted_basename(tok: str) -> str:
     return tok
 
 
+def _refine_operand(
+    verb: str,
+    tok: str,
+    classified: str,
+    cwd: str,
+    env: dict[str, str],
+    state: _NormState,
+) -> str:
+    """Verb-specific operand placeholders (see _BARE_PATH_VERBS, _SCRATCH_WRITE_VERBS)."""
+    if (
+        verb in _BARE_PATH_VERBS
+        and classified == tok
+        and _BARE_OPERAND_RE.fullmatch(tok)
+        and not tok.startswith("-")
+    ):
+        classified = classify_path("./" + tok, cwd, env)
+        state.record(classified, tok)
+    elif (
+        verb in _SCRATCH_WRITE_VERBS
+        and classified == "<tmp_path>"
+        and is_scratch_path(tok, cwd, env)
+    ):
+        classified = "<scratch_path>"
+        state.record(classified, tok)
+    return classified
+
+
 def _normalize_segment(
     raw_tokens: list[str],
     cwd: str,
@@ -785,6 +882,7 @@ def _normalize_segment(
 
         # Classify remaining tokens
         classified = _classify_token(tok, cwd, env, safe_domains, state, depth)
+        classified = _refine_operand(verb, tok, classified, cwd, env, state)
 
         # Warn if glob appears as arg to a destructive verb
         if classified == "<glob>" and verb in _DESTRUCTIVE_VERBS:
@@ -1137,7 +1235,50 @@ def normalize(
     Returns:
         NormalizedCommand with template, segments, placeholders, and warnings.
     """
-    return _normalize_internal(command, cwd, env=env, safe_domains=safe_domains, depth=0)
+    original = command
+    folded_dirs: list[str] = []
+    for _ in range(_MAX_CD_FOLDS):
+        folded = _fold_leading_cd(command, cwd, env)
+        if folded is None:
+            break
+        command, cwd = folded
+        folded_dirs.append(f"cd folded: {cwd}")
+    result = _normalize_internal(command, cwd, env=env, safe_domains=safe_domains, depth=0)
+    if not folded_dirs:
+        return result
+    return replace(
+        result,
+        raw=original,
+        parse_warnings=(*folded_dirs, *result.parse_warnings),
+        folded_command=command,
+    )
+
+
+def _fold_leading_cd(command: str, cwd: str, env: dict[str, str] | None) -> tuple[str, str] | None:
+    """Split a leading `cd DIR && REST` / `cd DIR || exit [n]; REST` (or `|| return`).
+
+    Plain `cd DIR; REST` is never folded: if the cd fails, REST still runs, in the
+    ORIGINAL cwd, so it cannot be classified as if it ran in DIR.
+
+    Returns (REST, resolved DIR) so REST can be classified as if cwd were DIR, or
+    None to leave the command alone. Only folds when DIR is an existing directory
+    that resolves (realpath) inside the configured cwd roots and is not a
+    credential store. Classification only: the full command still runs as written.
+    """
+    m = _LEADING_CD_RE.match(command)
+    if m is None:
+        return None
+    raw_dir = m.group("dir")
+    if raw_dir[0] in "\"'":
+        raw_dir = raw_dir[1:-1]
+    home_dir = (env or {}).get("HOME", os.path.expanduser("~"))
+    resolved = Path(_resolve_abs(raw_dir, cwd, home_dir))
+    roots = current_cwd_roots()
+    if not any(resolved.is_relative_to(r) for r in roots):
+        return None
+    if is_credential_path(resolved) or not resolved.is_dir():
+        return None
+    return m.group("rest"), str(resolved)
 
 
 def describe_template_scope(template: str) -> str | None:
