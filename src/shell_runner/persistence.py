@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS shell_calls (
     output_bytes_stderr INTEGER,
     duration_ms INTEGER,
     decision_path_json TEXT,
-    normalizer_warnings_json TEXT
+    normalizer_warnings_json TEXT,
+    protected_path_match TEXT,
+    flagged INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_shell_calls_ts ON shell_calls(ts);
@@ -151,6 +153,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("pending_prompts", "approver_agent_id", "TEXT"),
     ("template_approvals", "approved_by", "TEXT"),
     ("verb_approvals", "approved_by", "TEXT"),
+    ("shell_calls", "protected_path_match", "TEXT"),
+    ("shell_calls", "flagged", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -350,6 +354,8 @@ class Persistence:
         decision_path: list[str],
         normalizer_warnings: list[str],
         call_id: str | None = None,
+        protected_path_match: str | None = None,
+        flagged: int = 0,
     ) -> str:
         telemetry_id = call_id if call_id is not None else str(uuid.uuid4())
         ts = _now_utc()
@@ -361,8 +367,9 @@ class Persistence:
                     command_tier, final_tier, decision,
                     matched_rule_pattern, matched_rule_category,
                     exit_code, output_bytes_stdout, output_bytes_stderr,
-                    duration_ms, decision_path_json, normalizer_warnings_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    duration_ms, decision_path_json, normalizer_warnings_json,
+                    protected_path_match, flagged
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telemetry_id,
@@ -382,6 +389,8 @@ class Persistence:
                     duration_ms,
                     json.dumps(decision_path),
                     json.dumps(normalizer_warnings),
+                    protected_path_match,
+                    flagged,
                 ),
             )
         return telemetry_id
