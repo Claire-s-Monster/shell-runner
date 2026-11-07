@@ -163,6 +163,22 @@ T0_DENY: list[Rule] = [
 _SD_TOK = r"(?:<\w+>|[^\s<>|;&$`()]+)"
 _SD_VAL = r"(?:<\w+>|[^\s<>|;&$`()-][^\s<>|;&$`()]*)"  # value token: must not start with "-"
 
+# Fragments for the read-only inspection rules below.
+# `cmd 2>&1` normalizes to `cmd <n> >& <n>`: fd duplication only, never a file.
+_FD_DUP = r"(?:\s+<n>\s+>&\s+<n>)?"
+# Any non-credential path the classifier can resolve. Excludes <etc_path>,
+# <system_path>, <cred_path> (credential stores) and <var_path> (path built from $VAR).
+_RO_PATH = r"<(?:cwd|tmp|home|abs)_path>"
+# A bare word operand (grep/pgrep pattern): no leading '-' or '~', no shell syntax.
+_WORD = r"[^\s<>|;&$`()'\"~{}*?\[\]-][^\s<>|;&$`(){}]*"
+_PAT = rf"(?:<arg>|{_WORD})"
+
+# Fragments for the scratch-directory write rules in T2 (and the rm exemption in T4).
+# Sources may come from anywhere except credential/system paths; mv is stricter (T2).
+_ANY_SRC = r"<(?:cwd|tmp|scratch|home|abs)_path>"
+_SRC = rf"(?:{_ANY_SRC}|(?![^\s]*\.\.)[\w@+%][\w.@+%/-]*)"
+_RM_SCRATCH = r"(?:\s+-[rRfvd]+)*(?:\s+<scratch_path>)+"
+
 T1_AUTO_LOG: list[Rule] = [
     # systemd user-scope read-only (anchored; whole template must match)
     Rule(
@@ -187,61 +203,92 @@ T1_AUTO_LOG: list[Rule] = [
     # FS-read
     # <_path> group matches any path placeholder produced by normalizer, including
     # <file_arg> which is emitted by READ_ONLY_FILE_VERBS post-pass.
+    # Read-only inspection verbs. Metadata verbs (ls, stat, du, df, file) take any
+    # non-credential cwd/tmp/home/abs path; content readers (head, tail, wc, grep,
+    # diff, cmp) take the same plus <file_arg>. <cred_path>, <etc_path>,
+    # <system_path> and <var_path> never match any of them.
     Rule(
-        r"^ls(\s+-[a-zA-Z]+)?(\s+<(cwd|tmp)_path>)*$",
+        rf"^ls(\s+-[a-zA-Z]+)?(\s+{_RO_PATH})*{_FD_DUP}$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
     Rule(r"^cat(\s+(<(cwd|tmp)_path>|<file_arg>))+$", Tier.AUTO_LOG, "fs-read"),
     Rule(
-        r"^head(\s+-n\s+<n>|\s+<n>)?(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
+        rf"^head(\s+-n\s+<n>|\s+<n>)?(\s+(<(cwd|tmp)_path>|<file_arg>))+{_FD_DUP}$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
     Rule(
-        r"^tail(\s+-[nf]+\s+<n>)?(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
+        rf"^tail(\s+-[nf]+\s+<n>)?(\s+(<(cwd|tmp)_path>|<file_arg>))+{_FD_DUP}$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
     Rule(
-        r"^wc(\s+-[lwc]+)?(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
+        rf"^wc(\s+-[lwc]+)?(\s+(<(cwd|tmp)_path>|<file_arg>))+{_FD_DUP}$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
-    Rule(r"^stat(\s+<(cwd|tmp)_path>)+$", Tier.AUTO_LOG, "fs-read"),
-    Rule(r"^file(\s+(<(cwd|tmp)_path>|<file_arg>))+$", Tier.AUTO_LOG, "fs-read"),
     Rule(
-        r"^du(\s+-[sh]+)?(\s+<(cwd|tmp)_path>)?$",
+        rf"^stat(\s+-[a-zA-Z]+(\s+<arg>)?)*(\s+{_RO_PATH})+{_FD_DUP}$",
         Tier.AUTO_LOG,
         "fs-read",
     ),
-    Rule(r"^df(\s+-h)?$", Tier.AUTO_LOG, "fs-read"),
+    Rule(
+        rf"^file(\s+-[bhiLNsz]+)*(\s+(?:{_RO_PATH}|<file_arg>))+{_FD_DUP}$",
+        Tier.AUTO_LOG,
+        "fs-read",
+    ),
+    Rule(
+        rf"^du(\s+-[a-zA-Z]+(\s+<n>)?)*(\s+{_RO_PATH})*{_FD_DUP}$",
+        Tier.AUTO_LOG,
+        "fs-read",
+    ),
+    Rule(rf"^df(\s+-[a-zA-Z]+)*(\s+{_RO_PATH})*{_FD_DUP}$", Tier.AUTO_LOG, "fs-read"),
+    # diff/cmp: recursion (-r / --recursive) would walk a whole tree, so it is excluded.
+    Rule(
+        r"^(?:diff|cmp)(?!.*\s(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?:\s|$))"
+        rf"(\s+-{{1,2}}[a-zA-Z][\w=.-]*(\s+<n>)?)*(\s+{_RO_PATH}){{2}}{_FD_DUP}$",
+        Tier.AUTO_LOG,
+        "fs-read",
+    ),
     # FS-search
     Rule(
         r"^find\s+(<(cwd|tmp)_path>|<file_arg>)(\s+-(name|type|iname|maxdepth)\s+(<arg>|<n>|\w+))*$",
         Tier.AUTO_LOG,
         "fs-search",
     ),
+    # grep/rg: the pattern may be quoted (<arg>) or a bare word. Flags are stripped
+    # for grep (so -r is invisible; its file operands were already any path via
+    # <file_arg>). rg recurses by default and keeps its flags, so it only takes
+    # cwd/tmp operands, never home/abs roots.
     Rule(
-        r"^grep(\s+-[a-zA-Z]+)?\s+<arg>(\s+(<(cwd|tmp)_path>|<file_arg>))+$",
+        rf"^grep(\s+-[a-zA-Z]+)?\s+{_PAT}(\s+(<(cwd|tmp)_path>|<file_arg>))+{_FD_DUP}$",
         Tier.AUTO_LOG,
         "fs-search",
     ),
     Rule(
-        r"^rg(\s+-[a-zA-Z]+)?\s+<arg>(\s+<(cwd|tmp)_path>)?$",
+        rf"^rg(\s+-[a-zA-Z]+)*\s+{_PAT}(\s+<(cwd|tmp)_path>)?{_FD_DUP}$",
         Tier.AUTO_LOG,
         "fs-search",
     ),
-    Rule(r"^which\s+\w+$", Tier.AUTO_LOG, "fs-search"),
-    Rule(r"^whereis\s+\w+$", Tier.AUTO_LOG, "fs-search"),
-    Rule(r"^type\s+\w+$", Tier.AUTO_LOG, "fs-search"),
+    Rule(
+        r"^(?:which|type|whereis)(\s+-[a-zA-Z]+)*(\s+(?:\w[\w.+-]*|<cwd_path>))+$",
+        Tier.AUTO_LOG,
+        "fs-search",
+    ),
     # System info
     Rule(r"^pwd$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^whoami$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^hostname$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^uname(\s+-[ar]+)?$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^date(\s+\+<arg>)?$", Tier.AUTO_LOG, "system-info"),
-    Rule(r"^ps(\s+aux)?$", Tier.AUTO_LOG, "system-info"),
+    # ps: BSD `e` (print environment) is not in the allowed words; flags are stripped.
+    Rule(
+        r"^ps(\s+(?:aux|axu|auxf|ax))?(\s+(?:<n>|[a-z0-9]+(?:,[a-z0-9=%]+)+))*" + _FD_DUP + r"$",
+        Tier.AUTO_LOG,
+        "system-info",
+    ),
+    Rule(rf"^pgrep(\s+(?:<arg>|<n>|{_WORD})){{1,3}}{_FD_DUP}$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^echo(\s+\S+)*$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^sleep\s+<n>$", Tier.AUTO_LOG, "process"),
     Rule(r"^env$", Tier.AUTO_LOG, "system-info"),
@@ -297,30 +344,61 @@ T1_AUTO_LOG: list[Rule] = [
 
 T2_AUTO_CAPPED: list[Rule] = [
     # FS-write (cwd/tmp only)
+    # <scratch_path> (normalizer: verified strict descendant of /tmp, never /tmp
+    # itself) is what mkdir/touch/cp/mv/ln/tar/rm see for /tmp/<name> operands.
     Rule(
-        r"^mkdir(\s+-p)?\s+<(cwd|tmp)_path>(\s+<(cwd|tmp)_path>)*$",
+        r"^mkdir(\s+-p)?\s+<(cwd|tmp|scratch)_path>(\s+<(cwd|tmp|scratch)_path>)*$",
         Tier.AUTO_CAPPED,
         "fs-write",
     ),
-    Rule(r"^touch(\s+<(cwd|tmp)_path>)+$", Tier.AUTO_CAPPED, "fs-write"),
+    Rule(r"^touch(\s+<(cwd|tmp|scratch)_path>)+$", Tier.AUTO_CAPPED, "fs-write"),
+    Rule(rf"^rm{_RM_SCRATCH}$", Tier.AUTO_CAPPED, "fs-write"),
+    # tar: extract into a scratch dir (-C) from any non-credential archive, or
+    # create an archive inside scratch. No long options except --strip-components.
+    Rule(
+        rf"^tar\s+-?(?=[xzjJvp]*x)[xzjJvp]+f\s+{_SRC}(\s+--strip-components=\d+)?\s+-C\s+<scratch_path>$",
+        Tier.AUTO_CAPPED,
+        "fs-write",
+    ),
+    Rule(
+        rf"^tar\s+-C\s+<scratch_path>\s+-?(?=[xzjJvp]*x)[xzjJvp]+f\s+{_SRC}(\s+--strip-components=\d+)?$",
+        Tier.AUTO_CAPPED,
+        "fs-write",
+    ),
+    Rule(
+        rf"^tar\s+-?(?=[czjJvp]*c)[czjJvp]+f\s+<scratch_path>(\s+-C\s+{_ANY_SRC})?(\s+{_SRC})+$",
+        Tier.AUTO_CAPPED,
+        "fs-write",
+    ),
+    Rule(
+        rf"^cp(\s+-[rRaApvnf]+)*(\s+{_ANY_SRC})+\s+<scratch_path>$",
+        Tier.AUTO_CAPPED,
+        "fs-write",
+    ),
+    Rule(
+        rf"^ln\s+-s[fnv]*\s+{_ANY_SRC}\s+<scratch_path>$",
+        Tier.AUTO_CAPPED,
+        "fs-write",
+    ),
     Rule(r"^chmod\s+\+x\s+<(cwd|tmp)_path>$", Tier.AUTO_CAPPED, "fs-write"),
     Rule(
         r"^chmod\s+0?[0-7]{3}\s+<(cwd|tmp)_path>$",
         Tier.AUTO_CAPPED,
         "fs-write",
     ),
+    # mv deletes its source, so sources stay cwd/tmp-only (no home/abs sources).
     Rule(
-        r"^mv\s+<(cwd|tmp)_path>\s+<(cwd|tmp)_path>$",
+        r"^mv\s+<(cwd|tmp|scratch)_path>\s+<(cwd|tmp|scratch)_path>$",
         Tier.AUTO_CAPPED,
         "fs-write",
     ),
     Rule(
-        r"^cp(\s+-r)?\s+<(cwd|tmp)_path>\s+<(cwd|tmp)_path>$",
+        r"^cp(\s+-r)?\s+<(cwd|tmp|scratch)_path>\s+<(cwd|tmp|scratch)_path>$",
         Tier.AUTO_CAPPED,
         "fs-write",
     ),
     Rule(
-        r"^ln\s+-s\s+<(cwd|tmp)_path>\s+<(cwd|tmp)_path>$",
+        r"^ln\s+-s\s+<(cwd|tmp|scratch)_path>\s+<(cwd|tmp|scratch)_path>$",
         Tier.AUTO_CAPPED,
         "fs-write",
     ),
@@ -436,14 +514,15 @@ T4_ALWAYS_APPROVE: list[Rule] = [
         reason="system-scope systemctl mutation",
     ),
     # Destructive (allowed but always prompt — not in T0)
-    Rule(r"^rm\b", Tier.ALWAYS_APPROVE, "fs-write"),
+    # Except rm of nothing but <scratch_path> operands (T2 rule above).
+    Rule(rf"^rm\b(?!{_RM_SCRATCH}$)", Tier.ALWAYS_APPROVE, "fs-write"),
     Rule(
-        r"^chmod\s+\+x\s+<(home|etc|abs)_path>$",
+        r"^chmod\s+\+x\s+<(home|etc|abs|cred)_path>$",
         Tier.ALWAYS_APPROVE,
         "fs-write",
     ),
     Rule(
-        r"^chmod\s+0?[0-7]{3}\s+<(home|etc|abs)_path>$",
+        r"^chmod\s+0?[0-7]{3}\s+<(home|etc|abs|cred)_path>$",
         Tier.ALWAYS_APPROVE,
         "fs-write",
     ),

@@ -47,6 +47,9 @@ PATH_PLACEHOLDERS: tuple[str, ...] = (
     "<system_path>",
     "<home_path>",
     "<abs_path>",
+    "<cred_path>",
+    "<scratch_path>",
+    "<var_path>",
 )
 
 

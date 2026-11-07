@@ -144,6 +144,15 @@ def allowed_roots(config: dict[str, Any]) -> list[Path]:
 def _is_denied(resolved: Path) -> bool:
     if any(resolved.is_relative_to(root) for root in _DENY_ROOTS):
         return True
+    return is_credential_path(resolved)
+
+
+def is_credential_path(resolved: Path) -> bool:
+    """True if the (already resolved) path names or sits inside a credential store.
+
+    Shared with the normalizer, which uses it to keep credential paths out of the
+    auto-execute rules. System trees (_DENY_ROOTS) are NOT included here.
+    """
     name = resolved.name
     if (
         name in _DENY_FILE_NAMES
