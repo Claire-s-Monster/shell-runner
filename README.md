@@ -173,7 +173,9 @@ negative value keeps everything forever. The legacy `SHELL_CALLS_RETENTION_S`
 (seconds) is still honoured when the new variable is unset. The effective value
 is logged at startup. It must be at least `SHELL_RUNNER_JOB_RETENTION_S`
 (default 7 days). Audit rows (`executed`, `denied`, `prompt_required`,
-`running`) are never pruned, regardless of this setting. Decided prompts
+`running`) are never pruned, regardless of this setting, and neither are
+`observed_externally` rows with `flagged = 1` (protected-path writes, which are
+trial evidence). Decided prompts
 (those carrying an approver) are also kept forever, independent of this
 window, because the audit rows they explain are never pruned; undecided
 prompts are still removed on expiry.
@@ -197,6 +199,97 @@ and `approve_decision` from the decided prompt with the same
 agent_id + raw_cmd + cwd whose lifetime covers the call (null if none).
 `summary` returns per `agent_id`: `total_calls`, `by_decision`, `denied_count`,
 `prompt_count`, `first_ts`, `last_ts`.
+
+## Rules files
+
+User-configurable deny rules and protected-path rules, loaded from TOML files.
+Intended for agent trials (for example "agents must not edit the acceptance
+specs"): an **accident guardrail** and a **measurement tool**, not enforcement.
+
+Files live under the config dir (`$SHELL_RUNNER_CONFIG_DIR`, else
+`${XDG_CONFIG_HOME:-~/.config}/shell-runner`):
+
+- `rules.toml` — global rules, applied to every command.
+- `projects/*.toml` — project rules; each declares `roots = ["/abs/path", ...]`
+  and applies when `realpath(cwd)` is equal to or under one of the roots.
+  All matching project files are merged with the global file.
+
+Schema (both levels):
+
+```toml
+[[deny]]            # Python regex, searched against the raw command
+pattern = 'pixi\s+run\s+acceptance-record'
+reason  = "acceptance records are frozen"
+
+[[protected]]
+glob   = "tests/acceptance/**"   # ** spans directories; * and ? do not cross /
+mode   = "deny"                  # "deny" (default) | "flag"
+reason = "acceptance specs are frozen"
+```
+
+In a project file, relative globs resolve against the matching root. In the
+global file, globs must be absolute or start with `~` (a relative glob there is
+a config error). The global file may also set `default_agent_cap = "<TIER>"`
+(`DENY`, `AUTO_LOG`, `AUTO_CAPPED`, `APPROVE_ONCE`, `ALWAYS_APPROVE`), which
+replaces the built-in `AUTO_CAPPED` cap for agent ids not in the known-agent
+registry; when absent, behaviour is unchanged.
+
+Example, `projects/myrepo.toml`:
+
+```toml
+roots = ["/home/me/src/myrepo"]
+
+[[protected]]
+glob   = "tests/acceptance/**"
+reason = "acceptance specs are frozen during the trial"
+
+[[protected]]
+glob   = "tests/acceptance.sha256"
+reason = "acceptance hash is frozen during the trial"
+
+[[deny]]
+pattern = 'pixi\s+run\s+acceptance-record'
+reason  = "re-recording acceptance output is not allowed"
+```
+
+Behaviour:
+
+- A `[[deny]]` match behaves like a T0 deny (`matched_rule_category =
+  "config_deny"`, the reason is returned in stderr). Built-in T0 rules win first.
+- Best-effort **write targets** are extracted per command and resolved against
+  the cwd (`~` expanded, `..` normalised, the path need not exist): output
+  redirects, `tee`, `sed -i`, `cp`/`mv`/`install`/`ln` destinations (and `-t`),
+  `rm`/`rmdir`/`truncate`/`touch`/`chmod`/`chown`/`shred`/`unlink`, `dd of=`,
+  `git apply`/`checkout`/`restore`/`rm`/`mv`, and protected-path string literals
+  inside `python`/`perl`/`ruby`/`node`/`sh -c|-e` one-liners. `mv` sources count
+  as writes.
+- A write match with `mode = "deny"` denies the command
+  (`matched_rule_category = "protected_path"`). With `mode = "flag"` the command
+  is classified normally and only flagged.
+- Any other argument matching a protected glob is a **touch** (read or write
+  unknown). Touches are recorded but never deny.
+- Audit: `shell_calls.protected_path_match` holds a JSON list of
+  `{path, glob, mode, kind: "write"|"touch", source_file}` and
+  `shell_calls.flagged` is `1` when the command wrote to a protected path
+  (flag-mode write, or deny-mode write that was denied). Both are populated for
+  every recorded call, including denied ones. Older databases are migrated on
+  startup.
+- Parsed rules are cached; they are reloaded whenever a file's mtime or the set
+  of files changes (no restart or SIGHUP needed).
+
+**Fail closed.** If any rules file fails to parse or validate (bad TOML, bad
+regex, unknown mode or tier name, unknown key, relative glob in the global file,
+missing or relative `roots`), every command is denied with
+`matched_rule_category = "rules_config_error"` and a stderr reason naming the
+file and the error. A missing file or directory simply means no rules.
+
+**Limitations.** Shell parsing is best-effort: `eval`, variables, scripts,
+interpreters and here-docs can evade it (for example `python script.py` where
+the script edits a protected file). The rules cover only commands that go
+through shell-runner, so plain Bash or the Edit/Write tools bypass them. The
+rules files live under the same OS user as the agents, so an agent that can
+write them can change them: this is an accident guardrail and a measurement aid,
+not a security boundary.
 
 ## License
 

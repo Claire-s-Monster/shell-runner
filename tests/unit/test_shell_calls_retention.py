@@ -88,6 +88,20 @@ def test_audit_rows_are_never_deleted_regardless_of_age(tmp_path: Path, decision
     assert _row_exists(db, call_id)
 
 
+def test_flagged_observed_externally_rows_are_kept(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    flagged_id = _record_call(db, decision="observed_externally", flagged=1)
+    plain_id = _record_call(db, decision="observed_externally")
+    _age_row(db, flagged_id, days_ago=400)
+    _age_row(db, plain_id, days_ago=400)
+
+    deleted = db.cleanup_old_shell_calls(retention_seconds=86400)
+
+    assert deleted == 1
+    assert _row_exists(db, flagged_id)
+    assert not _row_exists(db, plain_id)
+
+
 def test_recent_observed_externally_rows_are_not_deleted(tmp_path: Path) -> None:
     db = _make_db(tmp_path)
     call_id = _record_call(db, decision="observed_externally")  # ts = now

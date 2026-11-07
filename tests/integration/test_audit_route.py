@@ -206,6 +206,8 @@ def test_limit_and_cap(client: TestClient) -> None:
 
 
 def test_flagged_only_without_column_returns_note(client: TestClient, seeded: None) -> None:
+    with srv.db._write_conn() as conn:
+        conn.execute("ALTER TABLE shell_calls DROP COLUMN flagged")
     data = _audit(client, flagged_only=True)
     assert data["count"] == 4  # filter not applied
     assert any("flagged" in n for n in data["notes"])
@@ -213,8 +215,6 @@ def test_flagged_only_without_column_returns_note(client: TestClient, seeded: No
 
 
 def test_flagged_only_applies_when_column_exists(client: TestClient) -> None:
-    with srv.db._write_conn() as conn:
-        conn.execute("ALTER TABLE shell_calls ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0")
     call_id = _call("agent-a")
     _call("agent-a")
     with srv.db._write_conn() as conn:
