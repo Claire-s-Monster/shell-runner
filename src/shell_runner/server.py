@@ -1874,8 +1874,9 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
 @app.get("/health", response_model=HealthResponse)
 async def health_route() -> HealthResponse:
     stats = db.health_stats()
+    roots_error = executor.cwd_roots_error()
     return HealthResponse(
-        status="ok",
+        status="degraded" if roots_error else "ok",
         total_calls_24h=stats["total_calls_24h"],
         observed_24h=stats.get("observed_24h", 0),
         denied_rate_24h=stats["denied_rate_24h"],
@@ -1884,7 +1885,7 @@ async def health_route() -> HealthResponse:
         p99_latency_ms=stats.get("p99_latency_ms", 0),
         catalog_size=len(all_rules()),
         pending_prompts=stats.get("pending_prompts_count", 0),
-        last_error=stats.get("last_error"),
+        last_error=roots_error or stats.get("last_error"),
     )
 
 

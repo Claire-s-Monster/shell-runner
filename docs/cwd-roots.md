@@ -49,6 +49,19 @@ export SHELL_RUNNER_CWD_ROOT="/home/you/projects"
 If none of the above are set the server falls back to the process working
 directory at startup time.
 
+### Invalid configuration fails closed
+
+If `cwd-roots.toml` exists but cannot be read or parsed, or `roots` is not a
+list of absolute path strings, or an env root is not an absolute path, shell-runner
+refuses **every** execution (no fallback to defaults or the process cwd). Each
+call is denied with an error naming the file and the problem, e.g.
+`cwd roots config error, refusing all executions: invalid cwd-roots config
+/home/you/.config/shell-runner/cwd-roots.toml: ...`, and is recorded as denied.
+`shell_health` reports `status: "degraded"` with the error in `last_error`.
+
+Fix the file and the next call recovers on its own; no SIGHUP or restart is
+needed. A missing file is not an error.
+
 ## SIGHUP Reload
 
 Send `SIGHUP` to the running daemon to reload the allow-list without

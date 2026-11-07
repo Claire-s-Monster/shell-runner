@@ -132,8 +132,42 @@ _cwd_roots_lock = threading.Lock()
 _CWD_ROOTS: list[Path] = []
 
 
+_CWD_ROOTS_ERROR: str | None = None
+
+
+class CwdRootsConfigError(ValueError):
+    """The cwd-roots configuration exists but is unreadable or invalid."""
+
+
+def _absolute_root(raw: object, source: str) -> Path:
+    if not isinstance(raw, str) or not raw or not os.path.isabs(raw):  # noqa: PTH117
+        raise CwdRootsConfigError(f"{source}: root must be an absolute path string, got {raw!r}")
+    return Path(raw).resolve()
+
+
+def _toml_roots() -> list[Path]:
+    """Roots from cwd-roots.toml. A missing file yields []; an existing file that
+    cannot be read, parsed or validated raises CwdRootsConfigError."""
+    xdg_config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    toml_path = Path(xdg_config) / "shell-runner" / "cwd-roots.toml"
+    if not toml_path.exists():
+        return []
+    try:
+        with toml_path.open("rb") as fh:
+            data = tomllib.load(fh)
+        raw_roots = data.get("roots", [])
+        if not isinstance(raw_roots, list):
+            raise CwdRootsConfigError(f"'roots' must be a list, got {type(raw_roots).__name__}")  # noqa: TRY301
+        return [_absolute_root(raw, "roots") for raw in raw_roots]
+    except Exception as exc:  # noqa: BLE001
+        raise CwdRootsConfigError(f"invalid cwd-roots config {toml_path}: {exc}") from exc
+
+
 def _load_cwd_roots() -> list[Path]:
     """Load the allowed cwd roots from all configured sources and return a deduplicated list.
+
+    Raises CwdRootsConfigError if the TOML file exists but is invalid, or an env
+    value is not an absolute path (fail closed; see reload_cwd_roots).
 
     Precedence (union, later sources do not override — all are merged):
       1. TOML file at ${XDG_CONFIG_HOME:-$HOME/.config}/shell-runner/cwd-roots.toml
@@ -141,19 +175,7 @@ def _load_cwd_roots() -> list[Path]:
       3. SHELL_RUNNER_CWD_ROOT env var (legacy single-path)
       4. Fallback: [cwd] when all three are empty
     """
-    paths: list[Path] = []
-
-    # 1. TOML config file
-    xdg_config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    toml_path = Path(xdg_config) / "shell-runner" / "cwd-roots.toml"
-    if toml_path.exists():
-        try:
-            with toml_path.open("rb") as fh:
-                data = tomllib.load(fh)
-            for raw in data.get("roots", []):
-                paths.append(Path(raw).resolve())
-        except Exception:  # noqa: BLE001
-            logger.warning("Failed to parse cwd-roots TOML at %s; ignoring", toml_path)
+    paths: list[Path] = _toml_roots()
 
     # 2. SHELL_RUNNER_CWD_ROOTS (colon-separated list)
     roots_env = os.environ.get("SHELL_RUNNER_CWD_ROOTS", "")
@@ -161,12 +183,12 @@ def _load_cwd_roots() -> list[Path]:
         for part in roots_env.split(":"):
             part = part.strip()
             if part:
-                paths.append(Path(part).resolve())
+                paths.append(_absolute_root(part, "SHELL_RUNNER_CWD_ROOTS"))
 
     # 3. SHELL_RUNNER_CWD_ROOT (legacy single-path)
     root_env = os.environ.get("SHELL_RUNNER_CWD_ROOT", "")
     if root_env:
-        paths.append(Path(root_env).resolve())
+        paths.append(_absolute_root(root_env, "SHELL_RUNNER_CWD_ROOT"))
 
     # 4. Fallback to cwd when all sources are empty
     if not paths:
@@ -188,11 +210,23 @@ def reload_cwd_roots() -> list[Path]:
     Thread-safe via module-level lock. Safe to call from a signal handler
     dispatched onto the asyncio event loop (not a raw OS signal handler).
     """
-    global _CWD_ROOTS
-    new_roots = _load_cwd_roots()
+    global _CWD_ROOTS, _CWD_ROOTS_ERROR
+    try:
+        new_roots = _load_cwd_roots()
+        error = None
+    except CwdRootsConfigError as exc:
+        logger.error("cwd-roots config invalid; refusing all executions: %s", exc)
+        new_roots, error = [], str(exc)
     with _cwd_roots_lock:
         _CWD_ROOTS = new_roots
+        _CWD_ROOTS_ERROR = error
     return new_roots
+
+
+def cwd_roots_error() -> str | None:
+    """Current cwd-roots config error (None when healthy); surfaced by shell_health."""
+    with _cwd_roots_lock:
+        return _CWD_ROOTS_ERROR
 
 
 def current_cwd_roots() -> list[Path]:
@@ -207,7 +241,7 @@ def job_dir_base() -> Path:
 
 
 # Initialise on import
-_CWD_ROOTS = _load_cwd_roots()
+reload_cwd_roots()
 
 
 @dataclass(frozen=True)
@@ -262,8 +296,13 @@ def resolve_cwd(cwd: str) -> tuple[Path | None, str | None]:
     through is what closes it.
     """
     resolved = Path(os.path.realpath(cwd))  # noqa: PTH113
+    if cwd_roots_error() is not None:
+        reload_cwd_roots()  # config may have been fixed since; recover without a restart
     with _cwd_roots_lock:
+        config_error = _CWD_ROOTS_ERROR
         current_roots = list(_CWD_ROOTS)
+    if config_error is not None:
+        return None, f"cwd roots config error, refusing all executions: {config_error}"
     if not any(resolved.is_relative_to(r) for r in current_roots):
         sorted_roots = sorted(str(r) for r in current_roots)
         return None, f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"

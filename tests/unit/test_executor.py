@@ -331,6 +331,78 @@ def test_cwd_roots_toml_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         assert "escapes allowed root" in result.stderr
 
 
+def _write_roots_toml(tmp_path: Path, text: str) -> Path:
+    config_dir = tmp_path / "shell-runner"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    toml_file = config_dir / "cwd-roots.toml"
+    toml_file.write_text(text, encoding="utf-8")
+    return toml_file
+
+
+@pytest.mark.parametrize(
+    "bad_toml",
+    ["roots = [\n", 'roots = "/tmp"\n', "roots = [1]\n", 'roots = ["relative/dir"]\n'],
+    ids=["malformed", "wrong-type", "wrong-item-type", "non-absolute"],
+)
+def test_cwd_roots_invalid_toml_denies_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_toml: str
+) -> None:
+    """An existing but unparseable/invalid cwd-roots.toml refuses every execution."""
+    toml_file = _write_roots_toml(tmp_path, bad_toml)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    importlib.reload(shell_runner.executor)
+
+    result = shell_runner.executor.execute(command="echo hi", cwd=str(tmp_path))
+    assert result.exit_code == -3
+    assert str(toml_file) in result.stderr
+    assert "refusing all executions" in result.stderr
+    assert shell_runner.executor.validate_cwd(str(tmp_path)) is not None
+    assert shell_runner.executor.cwd_roots_error() is not None
+
+
+def test_cwd_roots_fixed_toml_recovers_without_reload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fixing a broken cwd-roots.toml recovers on the next call (no SIGHUP/restart)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    toml_file = _write_roots_toml(tmp_path, "roots = [\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    importlib.reload(shell_runner.executor)
+    assert shell_runner.executor.execute(command="echo hi", cwd=str(work)).exit_code == -3
+
+    toml_file.write_text(f'roots = ["{tmp_path}"]\n', encoding="utf-8")
+    result = shell_runner.executor.execute(command="echo hi", cwd=str(work))
+    assert result.exit_code == 0
+    assert shell_runner.executor.cwd_roots_error() is None
+
+
+def test_cwd_roots_missing_toml_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No cwd-roots.toml: env roots apply exactly as before and there is no error."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "absent"))
+    importlib.reload(shell_runner.executor)
+    assert shell_runner.executor.cwd_roots_error() is None
+    assert shell_runner.executor.execute(command="echo hi", cwd=str(tmp_path)).exit_code == 0
+
+
+@pytest.mark.parametrize("var", ["SHELL_RUNNER_CWD_ROOTS", "SHELL_RUNNER_CWD_ROOT"])
+def test_cwd_roots_non_absolute_env_denies_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, var: str
+) -> None:
+    """A non-absolute env root fails closed instead of resolving against the process cwd."""
+    monkeypatch.delenv("SHELL_RUNNER_CWD_ROOT", raising=False)
+    monkeypatch.setenv(var, f"{tmp_path}:relative" if var.endswith("ROOTS") else "relative")
+    importlib.reload(shell_runner.executor)
+
+    result = shell_runner.executor.execute(command="echo hi", cwd=str(tmp_path))
+    assert result.exit_code == -3
+    assert var in result.stderr
+
+    monkeypatch.delenv(var)
+    assert shell_runner.executor.reload_cwd_roots() is not None
+    assert shell_runner.executor.cwd_roots_error() is None
+
+
 def test_cwd_roots_dedup_union(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Union of TOML + list env + legacy env is deduplicated."""
     import tempfile
