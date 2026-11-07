@@ -140,10 +140,11 @@ included.
    (cwd/tmp only), on any non-credential path, with `2>&1` and the usual safe
    pipe filters. `/etc`, `/proc`, `/sys`, `/dev`, and paths built from `$VAR`
    still prompt.
-2. **Leading `cd`** (the tier of the rest): `cd DIR && REST`, `cd DIR; REST` and
-   `cd DIR || exit; REST` classify REST as if the cwd were DIR, when DIR exists
+2. **Leading `cd`** (the tier of the rest): `cd DIR && REST` and
+   `cd DIR || exit [n]; REST` (or `|| return`) classify REST as if the cwd were DIR, when DIR exists
    and resolves inside the configured cwd roots (and is not a credential store).
-   Chains (`cd a && cd b && X`) fold each hop. The template, and so approvals,
+   Plain `cd DIR; REST` is never folded (a failed cd would run REST in the original
+   cwd). Chains (`cd a && cd b && X`) fold each hop up to the first non-folding one. The template, and so approvals,
    are REST's; `decision_path` records `cd folded: <dir>`. Execution is unchanged.
 3. **Scratch-directory file management** (AUTO_CAPPED): `mkdir`, `touch`, `rm`
    (incl. `-rf`), `cp`, `mv`, `ln -s` and `tar` create/extract when every write

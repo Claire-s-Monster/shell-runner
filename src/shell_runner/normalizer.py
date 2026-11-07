@@ -197,7 +197,7 @@ _SESSION_ROOT_RE = re.compile(r"claude-\d+")
 _LEADING_CD_RE = re.compile(
     r"""^\s*cd\s+
     (?P<dir>"[^"$`\\\n]+"|'[^'\n]+'|(?:~/)?[^\s;&|<>()$`"'\\*?\[\]{}!#~=%-][^\s;&|<>()$`"'\\*?\[\]{}!#~=%]*|~)
-    \s*(?:&&|;|\|\|\s*exit(?:\s+\d+)?\s*;)\s*
+    \s*(?:&&|\|\|\s*(?:exit|return)(?:\s+\d+)?\s*;)\s*
     (?P<rest>\S.*)$""",
     re.VERBOSE | re.DOTALL,
 )
@@ -1255,14 +1255,15 @@ def normalize(
 
 
 def _fold_leading_cd(command: str, cwd: str, env: dict[str, str] | None) -> tuple[str, str] | None:
-    """Split a leading `cd DIR && REST` / `cd DIR; REST` / `cd DIR || exit; REST`.
+    """Split a leading `cd DIR && REST` / `cd DIR || exit [n]; REST` (or `|| return`).
+
+    Plain `cd DIR; REST` is never folded: if the cd fails, REST still runs, in the
+    ORIGINAL cwd, so it cannot be classified as if it ran in DIR.
 
     Returns (REST, resolved DIR) so REST can be classified as if cwd were DIR, or
     None to leave the command alone. Only folds when DIR is an existing directory
     that resolves (realpath) inside the configured cwd roots and is not a
-    credential store. Classification only: the full command still runs as written,
-    so when `cd` fails under `;` REST runs in the original cwd (also inside the
-    jail) instead.
+    credential store. Classification only: the full command still runs as written.
     """
     m = _LEADING_CD_RE.match(command)
     if m is None:

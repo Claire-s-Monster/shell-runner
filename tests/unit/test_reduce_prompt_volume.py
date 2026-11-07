@@ -160,8 +160,8 @@ def _cd(command: str, jail: Path) -> ClassificationResult:
     "command",
     [
         "cd sub && ls",
-        "cd sub; ls",
         "cd sub || exit; ls",
+        "cd sub || return 2; ls",
         "cd sub || exit 1; ls",
         "cd ./sub/ && ls",
         'cd "sub" && ls',
@@ -232,7 +232,40 @@ def test_cd_outside_roots_leaves_template_untouched(jail: Path) -> None:
 def test_cd_fold_never_hides_t0_rest(jail: Path) -> None:
     assert _cd("cd sub && sudo ls", jail).command_tier == T0
     assert _cd("cd sub && ls | sh", jail).command_tier == T0
-    assert _cd("cd sub; rm -rf /", jail).command_tier == T0
+    assert _cd("cd sub && rm -rf /", jail).command_tier == T0
+
+
+@pytest.mark.parametrize("command", ["cd sub; ls", "cd sub; rm -rf *", "cd sub ; pwd"])
+def test_cd_semicolon_is_never_folded(command: str, jail: Path) -> None:
+    # If the cd fails, REST runs in the original cwd, so it must not be classified in DIR.
+    result = _cd(command, jail)
+    assert result.command_tier in (T3, T4)
+    assert not any(p.startswith("cd folded") for p in result.decision_path)
+
+
+def test_cd_scratch_semicolon_vs_and() -> None:
+    # /tmp/x need not exist for the ';' form: never folded. With '&&' it folds
+    # only if the dir exists and is inside the roots (/tmp is not), so it does not here.
+    assert _tier("cd /tmp/x; rm -rf *") not in AUTO
+    assert _tier("cd /tmp/x && rm -rf *") not in AUTO
+
+
+def test_cd_and_scratch_dir_in_roots_folds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path.resolve()
+    (root / "x").mkdir()
+    monkeypatch.setattr(executor, "_CWD_ROOTS", [root])
+    folded = classify("cd x && ls", str(root), AGENT, env=ENV)
+    assert folded.command_tier == T1
+    assert f"cd folded: {root / 'x'}" in folded.decision_path
+    # rm -rf * is a glob in a destructive position: still prompts after the fold
+    assert classify("cd x && rm -rf *", str(root), AGENT, env=ENV).command_tier == T4
+
+
+def test_cd_chain_stops_at_semicolon_hop(jail: Path) -> None:
+    result = _cd("cd sub && cd deeper; ls", jail)
+    folds = [p for p in result.decision_path if p.startswith("cd folded: ")]
+    assert folds == [f"cd folded: {jail / 'proj' / 'sub'}"]
+    assert result.command_tier == T3  # remaining `cd deeper` is not folded
 
 
 def test_cd_fold_without_roots_does_nothing(monkeypatch: pytest.MonkeyPatch, jail: Path) -> None:
