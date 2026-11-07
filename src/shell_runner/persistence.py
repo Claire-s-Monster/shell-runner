@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS pending_prompts (
 
 CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_prompts(expires_at);
 CREATE INDEX IF NOT EXISTS idx_pending_token ON pending_prompts(approve_token);
+CREATE INDEX IF NOT EXISTS idx_pending_agent_cmd ON pending_prompts(agent_id, raw_cmd, cwd);
 
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,

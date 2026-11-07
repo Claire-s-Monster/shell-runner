@@ -70,6 +70,24 @@ def test_old_schema_is_migrated_and_keeps_rows(tmp_path: Path) -> None:
     assert db.approve_prompt(prompt_id=pid, decision="deny", approver_agent_id="primary") is None
 
 
+def test_approver_lookup_uses_agent_cmd_index(tmp_path: Path) -> None:
+    path = tmp_path / "t.sqlite3"
+    Persistence(db_path=path)
+    conn = sqlite3.connect(path)
+    try:
+        plan = " ".join(
+            str(r[3])
+            for r in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT id FROM pending_prompts "
+                "WHERE agent_id = ? AND raw_cmd = ? AND cwd = ? AND approver_agent_id IS NOT NULL",
+                ("a", "x", "/tmp"),
+            )
+        )
+    finally:
+        conn.close()
+    assert "idx_pending_agent_cmd" in plan
+
+
 def test_migration_is_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "t.sqlite3"
     Persistence(db_path=path)
