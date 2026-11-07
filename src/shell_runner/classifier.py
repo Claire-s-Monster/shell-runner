@@ -332,14 +332,16 @@ def classify(
     # Step 1: Normalize
     normalized = normalize(command, cwd, env=env)
     decision_path.append(f"normalized: {normalized.template!r}")
+    decision_path.extend(w for w in normalized.parse_warnings if w.startswith("cd folded: "))
 
     # Step 2: Resolve agent cap
     agent_cap = lookup_agent_cap(agent_id)
     decision_path.append(f"agent_cap({agent_id!r}) = {agent_cap.name}")
 
     # Step 3: T0 raw scan -- short-circuit on first match
+    raw_scan = (command, normalized.folded_command or command)
     for t0_rule in T0_DENY:
-        if t0_rule.match_target == "raw" and compiled_for(t0_rule).search(command):
+        if t0_rule.match_target == "raw" and any(compiled_for(t0_rule).search(c) for c in raw_scan):
             decision_path.append(f"T0_raw match: {t0_rule.pattern!r}")
             stub = normalized.segments[0] if normalized.segments else _stub_segment(command)
             return ClassificationResult(
