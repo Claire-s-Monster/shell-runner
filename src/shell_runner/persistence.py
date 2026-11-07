@@ -1229,8 +1229,8 @@ class Persistence:
     ) -> int:
         """Delete stale passive /observe telemetry from shell_calls.
 
-        Only rows with decision = 'observed_externally' are eligible for
-        deletion. Audit rows (executed, denied, prompt_required, running)
+        Only rows with decision = 'observed_externally' and flagged = 0 are
+        eligible for deletion (flagged rows are trial evidence). Audit rows (executed, denied, prompt_required, running)
         are NEVER deleted by this method, regardless of age — they are the
         record relied on for approval/denial history and may still be
         referenced by jobs.telemetry_id.
@@ -1260,7 +1260,7 @@ class Persistence:
                     """
                     DELETE FROM shell_calls WHERE id IN (
                         SELECT id FROM shell_calls
-                        WHERE decision = 'observed_externally' AND ts < ?
+                        WHERE decision = 'observed_externally' AND flagged = 0 AND ts < ?
                         LIMIT ?
                     )
                     """,

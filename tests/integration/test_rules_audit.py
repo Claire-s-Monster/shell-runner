@@ -81,6 +81,25 @@ def test_flag_mode_executes_and_records_flag(project: Path, audit_db: Persistenc
     assert json.loads(row["protected_path_match"])[0]["mode"] == "flag"
 
 
+def test_shell_audit_flagged_only_returns_flag_mode_write(
+    project: Path, audit_db: Persistence
+) -> None:
+    (project / "NOTES.md").write_text("hi")
+    _execute("cat NOTES.md", project)
+    _execute("ls", project)
+    _execute("touch NOTES.md", project)
+
+    resp = TestClient(app).post("/audit", json={"flagged_only": True})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["notes"] == []
+    (row,) = data["rows"]
+    assert row["raw_cmd"] == "touch NOTES.md"
+    assert row["flagged"] == 1
+    assert json.loads(row["protected_path_match"])[0]["mode"] == "flag"
+
+
 def test_touch_is_recorded_without_flag(project: Path, audit_db: Persistence) -> None:
     (project / "NOTES.md").write_text("hi")
     body = _execute("cat NOTES.md", project)

@@ -143,7 +143,9 @@ negative value keeps everything forever. The legacy `SHELL_CALLS_RETENTION_S`
 (seconds) is still honoured when the new variable is unset. The effective value
 is logged at startup. It must be at least `SHELL_RUNNER_JOB_RETENTION_S`
 (default 7 days). Audit rows (`executed`, `denied`, `prompt_required`,
-`running`) are never pruned, regardless of this setting. Decided prompts
+`running`) are never pruned, regardless of this setting, and neither are
+`observed_externally` rows with `flagged = 1` (protected-path writes, which are
+trial evidence). Decided prompts
 (those carrying an approver) are also kept forever, independent of this
 window, because the audit rows they explain are never pruned; undecided
 prompts are still removed on expiry.
