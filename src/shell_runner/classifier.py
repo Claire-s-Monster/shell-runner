@@ -11,8 +11,10 @@ Public API:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field, replace
 
+from . import rules
 from .catalog import (
     T0_DENY,
     T1_AUTO_LOG,
@@ -124,7 +126,11 @@ def lookup_agent_cap(agent_id: str | None) -> Tier:
     """
     if agent_id is None or is_reserved_primary_id(agent_id):
         return Tier.DENY
-    return KNOWN_AGENT_CAPS.get(agent_id, DEFAULT_AGENT_CAP)
+    known = KNOWN_AGENT_CAPS.get(agent_id)
+    if known is not None:
+        return known
+    configured = rules.configured_default_agent_cap()
+    return configured if configured is not None else DEFAULT_AGENT_CAP
 
 
 def denial_reason(
@@ -177,6 +183,15 @@ class ClassificationResult:
     segments: tuple[SegmentClassification, ...]
     normalizer_warnings: tuple[str, ...]
     decision_path: tuple[str, ...]
+    protected_matches: tuple[rules.PathMatch, ...] = field(default_factory=tuple)
+    flagged: bool = False  # command wrote to a protected path (denied or flag-only)
+
+    @property
+    def protected_path_json(self) -> str | None:
+        """JSON for shell_calls.protected_path_match, or None when nothing matched."""
+        if not self.protected_matches:
+            return None
+        return json.dumps([m.as_dict() for m in self.protected_matches])
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +324,47 @@ def _stub_segment(command: str) -> Segment:
 # ---------------------------------------------------------------------------
 
 
+def _rules_deny_rule(verdict: rules.RulesVerdict) -> tuple[Rule, str] | None:
+    """Synthetic DENY Rule (and decision-path note) for a deny verdict, else None."""
+    if verdict.config_error is not None:
+        return (
+            Rule(
+                pattern="rules_config_error",
+                tier=Tier.DENY,
+                category="rules_config_error",
+                reason=f"rules config error in {verdict.config_error}",
+            ),
+            "rules_config_error (fail closed)",
+        )
+    if verdict.deny is not None:
+        d = verdict.deny
+        return (
+            Rule(
+                pattern=d.pattern,
+                tier=Tier.DENY,
+                category="config_deny",
+                match_target="raw",
+                source="manual",
+                reason=d.reason or f"denied by rules file {d.source_file}",
+            ),
+            f"config_deny match: {d.pattern!r} ({d.source_file})",
+        )
+    m = verdict.denying_match
+    if m is not None:
+        why = f"; {m.reason}" if m.reason else ""
+        return (
+            Rule(
+                pattern=f"protected_path:{m.glob}",
+                tier=Tier.DENY,
+                category="protected_path",
+                source="manual",
+                reason=f"write to protected path {m.path} (glob {m.glob!r} in {m.source_file}){why}",
+            ),
+            f"protected_path match: {m.path} ({m.glob!r})",
+        )
+    return None
+
+
 def classify(
     command: str,
     cwd: str,
@@ -316,7 +372,44 @@ def classify(
     *,
     env: dict[str, str] | None = None,
 ) -> ClassificationResult:
-    """Classify a shell command and return a ClassificationResult.
+    """Classify a command: catalog rules first, then user rules files (rules.py).
+
+    A rules-file deny (config deny pattern, deny-mode protected write, or a
+    rules config error -- fail closed) forces DENY unless the catalog already
+    denied. Protected-path matches are attached for audit regardless of outcome.
+    """
+    result = _classify_catalog(command, cwd, agent_id, env=env)
+    verdict = rules.evaluate(command, cwd)
+    path = list(result.decision_path)
+    for m in verdict.matches:
+        path.append(f"protected_path {m.kind}: {m.path} ({m.glob!r}, mode={m.mode})")
+    result = replace(
+        result,
+        protected_matches=verdict.matches,
+        flagged=verdict.flagged,
+        decision_path=tuple(path),
+    )
+    deny = None if result.command_tier == Tier.DENY else _rules_deny_rule(verdict)
+    if deny is None:
+        return result
+    rule, note = deny
+    return replace(
+        result,
+        tier=Tier.DENY,
+        command_tier=Tier.DENY,
+        matched_rule=rule,
+        decision_path=(*result.decision_path, note),
+    )
+
+
+def _classify_catalog(
+    command: str,
+    cwd: str,
+    agent_id: str | None,
+    *,
+    env: dict[str, str] | None = None,
+) -> ClassificationResult:
+    """Catalog-only classification (no user rules files).
 
     Steps:
       1. Normalize the command.
