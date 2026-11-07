@@ -153,6 +153,29 @@ class GetPendingResponse(BaseModel):
     prompts: list[PendingPromptDetail]
 
 
+class AuditRequest(BaseModel):
+    """Read-only query over shell_calls (shell_audit). since/until accept
+    ISO-8601 or a relative age such as '24h' / '7d'."""
+
+    agent_id: str | None = None
+    agent_id_prefix: str | None = None
+    since: str | None = None
+    until: str | None = None
+    decision: str | None = None
+    flagged_only: bool = False
+    mode: Literal["rows", "summary"] = "rows"
+    limit: int = 100
+
+
+class AuditResponse(BaseModel):
+    mode: Literal["rows", "summary"]
+    count: int
+    truncated: bool
+    rows: list[dict] | None = None
+    summary: list[dict] | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
 class HealthResponse(BaseModel):
     """Service health snapshot.
 

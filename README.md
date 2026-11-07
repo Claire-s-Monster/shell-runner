@@ -126,6 +126,46 @@ self-approval (approver == the prompt's executing agent) and non-primary
 Full authenticated-identity enforcement of "primary session only" is a known
 limitation tracked in [#29](https://github.com/Claire-s-Monster/shell-runner/issues/29).
 
+## Audit trail: approver columns, retention, `shell_audit`
+
+**Approver columns.** Every approve *and* deny decision stores the supplied
+`approver_agent_id` on the `pending_prompts` row (`approver_agent_id`), and on
+the `template_approvals` / `verb_approvals` row it creates or replaces
+(`approved_by`). Older databases gain these nullable columns automatically at
+startup. Because `approver_agent_id` is self-asserted
+([#29](https://github.com/Claire-s-Monster/shell-runner/issues/29)), these
+columns record the claim, not a verified identity.
+
+**Retention.** `SHELL_RUNNER_RETENTION_DAYS` (integer, default `90`) sets how
+long passive `observed_externally` rows in `shell_calls` are kept; `0` or a
+negative value keeps everything forever. The legacy `SHELL_CALLS_RETENTION_S`
+(seconds) is still honoured when the new variable is unset. The effective value
+is logged at startup. It must be at least `SHELL_RUNNER_JOB_RETENTION_S`
+(default 7 days). Audit rows (`executed`, `denied`, `prompt_required`,
+`running`) are never pruned. Decided prompts (those carrying an approver) are
+kept for the same retention window, so approver info is not purged before the
+shell_calls rows it relates to; undecided prompts are still removed on expiry.
+
+**`shell_audit`** (MCP tool; HTTP `POST /audit`) is a read-only query over
+`shell_calls`. Claude Code caches `tools/list`, so start a new session to see
+the tool after the server is updated.
+
+| Parameter | Meaning |
+|-----------|---------|
+| `agent_id` / `agent_id_prefix` | exact match / case-sensitive prefix |
+| `since` / `until` | ISO-8601 or relative (`30m`, `24h`, `7d`, `2w`) |
+| `decision` | exact match, e.g. `executed`, `denied`, `prompt_required` |
+| `flagged_only` | only flagged calls; needs a `flagged` column, otherwise ignored with a note in `notes` |
+| `mode` | `rows` (default) or `summary` |
+| `limit` | default 100, capped at 1000 (rows, or agents in summary mode) |
+
+`rows` returns `ts, agent_id, cwd, raw_cmd, command_tier, final_tier, decision,
+matched_rule_category, matched_rule_pattern, exit_code` plus `approver_agent_id`
+and `approve_decision` from the decided prompt with the same
+agent_id + raw_cmd + cwd whose lifetime covers the call (null if none).
+`summary` returns per `agent_id`: `total_calls`, `by_decision`, `denied_count`,
+`prompt_count`, `first_ts`, `last_ts`.
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS pending_prompts (
     approve_token TEXT,
     approve_decision TEXT,
     approved_at TEXT,
-    consumed_at TEXT
+    consumed_at TEXT,
+    approver_agent_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_expires ON pending_prompts(expires_at);
@@ -106,7 +108,8 @@ CREATE TABLE IF NOT EXISTS template_approvals (
     agent_id TEXT,
     approved_tier INTEGER NOT NULL,
     approved_at TEXT NOT NULL,
-    approved_via_prompt_id TEXT
+    approved_via_prompt_id TEXT,
+    approved_by TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_template_approvals_unique
@@ -121,7 +124,8 @@ CREATE TABLE IF NOT EXISTS verb_approvals (
     agent_id TEXT,
     approved_tier INTEGER NOT NULL,
     approved_at TEXT NOT NULL,
-    approved_via_prompt_id TEXT
+    approved_via_prompt_id TEXT,
+    approved_by TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_verb_approvals_unique
@@ -138,6 +142,15 @@ APPROVE_ONCE_DURABLE_TTL_S = 3600
 
 
 BUSY_TIMEOUT_MS = 5000
+
+# Columns added after the first release: (table, column, type). CREATE TABLE IF
+# NOT EXISTS leaves an older table untouched, so _migrate_schema adds these
+# idempotently (guarded by PRAGMA table_info).
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("pending_prompts", "approver_agent_id", "TEXT"),
+    ("template_approvals", "approved_by", "TEXT"),
+    ("verb_approvals", "approved_by", "TEXT"),
+)
 
 
 # Issue #53: SQLite's busy handler is unfair, so many threads in this process
@@ -205,6 +218,44 @@ def _now_utc() -> str:
     return datetime.now(UTC).isoformat()
 
 
+MAX_AUDIT_LIMIT = 1000
+
+# Optional shell_calls filters, keyed by request flag: flag -> (column, SQL
+# condition). A filter is applied only if the column exists in the database
+# (another change adds these columns), so supporting a new one is one line here.
+OPTIONAL_AUDIT_FILTERS: dict[str, tuple[str, str]] = {
+    "flagged_only": ("flagged", "c.flagged = 1"),
+}
+# Optional shell_calls columns echoed in audit rows when the database has them.
+OPTIONAL_AUDIT_COLUMNS: tuple[str, ...] = ("protected_path_match", "flagged")
+
+_RELATIVE_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
+_RELATIVE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def parse_time_bound(value: str, now: datetime | None = None) -> str:
+    """Normalize an ISO-8601 timestamp or a relative age ("24h", "7d") to the
+    UTC ISO string format stored in shell_calls.ts. Naive timestamps are UTC.
+
+    Raises ValueError for anything else.
+    """
+    current = now or datetime.now(UTC)
+    match = _RELATIVE_RE.match(value)
+    if match:
+        seconds = int(match.group(1)) * _RELATIVE_UNITS[match.group(2).lower()]
+        return (current - timedelta(seconds=seconds)).isoformat()
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        raise ValueError(
+            f"invalid time {value!r}: use ISO-8601 or a relative age like '24h', '7d' "
+            "(units s, m, h, d, w)"
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
 class Persistence:
     def __init__(self, db_path: Path | str = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
@@ -223,6 +274,16 @@ class Persistence:
     def _init_schema(self) -> None:
         with self._write_conn() as conn:
             conn.executescript(_SCHEMA_SQL)
+            self._migrate_schema(conn)
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        """Add columns introduced after the first release to older databases."""
+        for table, column, col_type in _ADDED_COLUMNS:
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                # table/column/type come from the constant above, never user input.
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")  # noqa: S608
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
@@ -490,7 +551,14 @@ class Persistence:
             )
         return prompt_id
 
-    def approve_prompt(self, *, prompt_id: str, decision: str) -> str | None:
+    def approve_prompt(
+        self, *, prompt_id: str, decision: str, approver_agent_id: str | None = None
+    ) -> str | None:
+        """Record a decision on a prompt (approve or deny) and who made it.
+
+        approver_agent_id is self-asserted by the caller (issue #29): it records
+        the claim, not a verified identity.
+        """
         now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         is_approved = decision in (
@@ -522,10 +590,11 @@ class Persistence:
                         approve_token = ?,
                         approve_decision = ?,
                         approved_at = ?,
-                        expires_at = ?
+                        expires_at = ?,
+                        approver_agent_id = ?
                     WHERE id = ?
                     """,
-                    (token, decision, now, new_expires_at, prompt_id),
+                    (token, decision, now, new_expires_at, approver_agent_id, prompt_id),
                 )
             else:
                 # Allow approving even expired prompts (expiry only gates token consumption)
@@ -534,10 +603,11 @@ class Persistence:
                     UPDATE pending_prompts SET
                         approve_token = ?,
                         approve_decision = ?,
-                        approved_at = ?
+                        approved_at = ?,
+                        approver_agent_id = ?
                     WHERE id = ?
                     """,
-                    (token, decision, now, prompt_id),
+                    (token, decision, now, approver_agent_id, prompt_id),
                 )
         return token
 
@@ -703,10 +773,11 @@ class Persistence:
         agent_id: str | None,
         approved_tier: int,
         approved_via_prompt_id: str | None = None,
+        approved_by: str | None = None,
     ) -> int:
         """Persist a template approval. Replaces any prior approval for the
         same (template, agent_id) pair. agent_id=None means global approval.
-        Returns the row id.
+        approved_by is the (self-asserted) approver identity. Returns the row id.
         """
         now = _now_utc()
         scope_key = agent_id if agent_id is not None else ""
@@ -722,10 +793,11 @@ class Persistence:
             cur = conn.execute(
                 """
                 INSERT INTO template_approvals
-                    (template, agent_id, approved_tier, approved_at, approved_via_prompt_id)
-                VALUES (?, ?, ?, ?, ?)
+                    (template, agent_id, approved_tier, approved_at,
+                     approved_via_prompt_id, approved_by)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (template, agent_id, approved_tier, now, approved_via_prompt_id),
+                (template, agent_id, approved_tier, now, approved_via_prompt_id, approved_by),
             )
             row_id = cur.lastrowid
             if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
@@ -796,6 +868,7 @@ class Persistence:
         agent_id: str | None,
         approved_tier: int,
         approved_via_prompt_id: str | None = None,
+        approved_by: str | None = None,
     ) -> int:
         """Persist a verb-level approval scoped to a cwd subtree.
 
@@ -818,10 +891,19 @@ class Persistence:
             cur = conn.execute(
                 """
                 INSERT INTO verb_approvals
-                    (verb, cwd_prefix, agent_id, approved_tier, approved_at, approved_via_prompt_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (verb, cwd_prefix, agent_id, approved_tier, approved_at,
+                     approved_via_prompt_id, approved_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (verb, cwd_prefix, agent_id, approved_tier, now, approved_via_prompt_id),
+                (
+                    verb,
+                    cwd_prefix,
+                    agent_id,
+                    approved_tier,
+                    now,
+                    approved_via_prompt_id,
+                    approved_by,
+                ),
             )
             conn.execute("COMMIT")
             row_id = cur.lastrowid
@@ -979,10 +1061,34 @@ class Persistence:
 
         return results
 
-    def cleanup_expired_prompts(self) -> int:
+    def cleanup_expired_prompts(self, approver_retention_seconds: float | None = None) -> int:
+        """Delete expired prompts, but keep decided ones as the approver audit trail.
+
+        A prompt that carries approver_agent_id (approved or denied) is the only
+        record of who decided, and the shell_calls audit rows it relates to are
+        never deleted. So it is only purged once older than
+        approver_retention_seconds (pass the shell_calls retention); None keeps
+        it forever. Undecided expired prompts are deleted as soon as they expire.
+        """
         now = _now_utc()
         with self._write_conn() as conn:
-            cursor = conn.execute("DELETE FROM pending_prompts WHERE expires_at < ?", (now,))
+            if approver_retention_seconds is None:
+                cursor = conn.execute(
+                    "DELETE FROM pending_prompts WHERE expires_at < ? AND approver_agent_id IS NULL",
+                    (now,),
+                )
+            else:
+                cutoff = (
+                    datetime.now(UTC) - timedelta(seconds=approver_retention_seconds)
+                ).isoformat()
+                cursor = conn.execute(
+                    """
+                    DELETE FROM pending_prompts
+                    WHERE expires_at < ?
+                      AND (approver_agent_id IS NULL OR created_at < ?)
+                    """,
+                    (now, cutoff),
+                )
             return cursor.rowcount
 
     # --- jobs ---
@@ -1184,6 +1290,137 @@ class Persistence:
                 params,
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def audit_query(
+        self,
+        *,
+        agent_id: str | None = None,
+        agent_id_prefix: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        decision: str | None = None,
+        flagged_only: bool = False,
+        mode: str = "rows",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Read-only audit view of shell_calls (parameterized SQL only).
+
+        since/until must already be ISO-8601 UTC strings (see parse_time_bound).
+        rows mode adds the approver recorded on the matching pending prompt;
+        summary mode aggregates per agent_id (at most `limit` agents, busiest
+        first). Columns that may not exist yet (OPTIONAL_AUDIT_FILTERS) are
+        checked with PRAGMA table_info; when absent the filter is skipped and a
+        note says so.
+        """
+        limit = max(1, min(limit, MAX_AUDIT_LIMIT))
+        notes: list[str] = []
+        with self._conn() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(shell_calls)")}
+            clauses: list[str] = []
+            params: list[Any] = []
+            if agent_id is not None:
+                clauses.append("c.agent_id = ?")
+                params.append(agent_id)
+            if agent_id_prefix:
+                clauses.append("substr(c.agent_id, 1, ?) = ?")
+                params.extend([len(agent_id_prefix), agent_id_prefix])
+            if since is not None:
+                clauses.append("c.ts >= ?")
+                params.append(since)
+            if until is not None:
+                clauses.append("c.ts <= ?")
+                params.append(until)
+            if decision is not None:
+                clauses.append("c.decision = ?")
+                params.append(decision)
+            if flagged_only:
+                column, condition = OPTIONAL_AUDIT_FILTERS["flagged_only"]
+                if column in cols:
+                    clauses.append(condition)
+                else:
+                    notes.append(
+                        f"flagged_only ignored: shell_calls has no '{column}' column in this "
+                        "database, so no rows are flagged and the filter was not applied."
+                    )
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            if mode == "summary":
+                result = self._audit_summary(conn, where, params, limit)
+            else:
+                optional = [c for c in OPTIONAL_AUDIT_COLUMNS if c in cols]
+                result = self._audit_rows(conn, where, params, limit, optional)
+        result["mode"] = mode
+        result["notes"] = notes
+        return result
+
+    @staticmethod
+    def _audit_rows(
+        conn: sqlite3.Connection,
+        where: str,
+        params: list[Any],
+        limit: int,
+        optional_columns: list[str],
+    ) -> dict[str, Any]:
+        extra = "".join(f", c.{col}" for col in optional_columns)  # whitelisted names
+        # Approver: the decided prompt for the same (agent, command, cwd) whose
+        # lifetime covers the call. Prompts live from created_at to expires_at
+        # (approve_once extends it), so a prompt_required row and the later
+        # approved execution both match. 5s of slack covers the telemetry
+        # writer's delay vs. prompt creation.
+        sql = (
+            "SELECT c.ts, c.agent_id, c.cwd, c.raw_cmd, c.command_tier, c.final_tier, "  # noqa: S608
+            "c.decision, c.matched_rule_category, c.matched_rule_pattern, c.exit_code, "
+            "p.approver_agent_id, p.approve_decision"
+            f"{extra} "
+            "FROM shell_calls c LEFT JOIN pending_prompts p ON p.id = ("
+            "SELECT p2.id FROM pending_prompts p2 "
+            "WHERE p2.agent_id = c.agent_id AND p2.raw_cmd = c.raw_cmd AND p2.cwd = c.cwd "
+            "AND p2.approver_agent_id IS NOT NULL "
+            "AND julianday(p2.created_at) <= julianday(c.ts) + 5.0 / 86400 "
+            "AND julianday(c.ts) <= julianday(p2.expires_at) "
+            "ORDER BY p2.created_at DESC LIMIT 1) "
+            f"{where} ORDER BY c.ts DESC LIMIT ?"
+        )
+        fetched = conn.execute(sql, [*params, limit + 1]).fetchall()
+        rows = [dict(r) for r in fetched[:limit]]
+        return {"rows": rows, "count": len(rows), "truncated": len(fetched) > limit}
+
+    @staticmethod
+    def _audit_summary(
+        conn: sqlite3.Connection, where: str, params: list[Any], limit: int
+    ) -> dict[str, Any]:
+        grouped = conn.execute(
+            "SELECT c.agent_id, c.decision, COUNT(*) AS n, MIN(c.ts) AS first_ts, "  # noqa: S608
+            f"MAX(c.ts) AS last_ts FROM shell_calls c {where} "
+            "GROUP BY c.agent_id, c.decision",
+            params,
+        ).fetchall()
+        agents: dict[str, dict[str, Any]] = {}
+        for r in grouped:
+            entry = agents.setdefault(
+                r["agent_id"],
+                {
+                    "agent_id": r["agent_id"],
+                    "total_calls": 0,
+                    "by_decision": {},
+                    "denied_count": 0,
+                    "prompt_count": 0,
+                    "first_ts": r["first_ts"],
+                    "last_ts": r["last_ts"],
+                },
+            )
+            entry["total_calls"] += r["n"]
+            entry["by_decision"][r["decision"]] = r["n"]
+            entry["first_ts"] = min(entry["first_ts"], r["first_ts"])
+            entry["last_ts"] = max(entry["last_ts"], r["last_ts"])
+        for entry in agents.values():
+            entry["denied_count"] = entry["by_decision"].get("denied", 0)
+            entry["prompt_count"] = entry["by_decision"].get("prompt_required", 0)
+        ordered = sorted(agents.values(), key=lambda e: (-e["total_calls"], e["agent_id"]))
+        return {
+            "summary": ordered[:limit],
+            "count": min(len(ordered), limit),
+            "truncated": len(ordered) > limit,
+        }
 
     def health_stats(self) -> dict:
         since_24h = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
