@@ -1068,8 +1068,9 @@ class Persistence:
         A prompt that carries approver_agent_id (approved or denied) is the only
         record of who decided, and the shell_calls audit rows it relates to are
         never deleted. So it is only purged once older than
-        approver_retention_seconds (pass the shell_calls retention); None keeps
-        it forever. Undecided expired prompts are deleted as soon as they expire.
+        approver_retention_seconds; None (what the server passes) keeps it
+        forever, independent of the observed_externally retention window.
+        Undecided expired prompts are deleted as soon as they expire.
         """
         now = _now_utc()
         with self._write_conn() as conn:

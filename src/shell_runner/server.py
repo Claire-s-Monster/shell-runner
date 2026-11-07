@@ -96,11 +96,13 @@ db = Persistence(db_path=_db_path)
 _cleanup_task: asyncio.Task[None] | None = None
 
 RETENTION_S = int(os.environ.get("SHELL_RUNNER_JOB_RETENTION_S", str(7 * 24 * 3600)))
-DEFAULT_RETENTION_DAYS = 90
+DEFAULT_RETENTION_DAYS = 14
 
 
 def resolve_shell_calls_retention_s(environ: Mapping[str, str]) -> float:
-    """Effective shell_calls retention in seconds; math.inf means keep forever.
+    """Effective retention in seconds for passive observed_externally rows in
+    shell_calls; math.inf means keep forever. Audit rows (executed, denied,
+    prompt_required, running) are never pruned, whatever this is set to.
 
     SHELL_RUNNER_RETENTION_DAYS (int days; 0 or negative = keep forever) wins.
     The legacy SHELL_CALLS_RETENTION_S (seconds) is honoured when the new
@@ -277,12 +279,9 @@ async def _periodic_cleanup(interval_s: int = 60) -> None:
     while True:
         await asyncio.sleep(interval_s)
         try:
-            # Decided prompts (they carry approver_agent_id) outlive undecided
-            # ones: kept for the shell_calls retention window, forever if infinite.
-            removed_prompts = await asyncio.to_thread(
-                db.cleanup_expired_prompts,
-                None if math.isinf(SHELL_CALLS_RETENTION_S) else SHELL_CALLS_RETENTION_S,
-            )
+            # Decided prompts (they carry approver_agent_id) are kept forever:
+            # the audit rows they explain are never pruned either.
+            removed_prompts = await asyncio.to_thread(db.cleanup_expired_prompts, None)
             if removed_prompts:
                 logger.debug("Cleaned up %d expired pending prompt(s)", removed_prompts)
         except Exception:
@@ -328,7 +327,8 @@ def _on_sighup() -> None:
 async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     global _cleanup_task
     logger.info(
-        "shell_calls retention: %s",
+        "observed_externally retention: %s (executed/denied/prompt_required/running "
+        "audit rows are never pruned)",
         "keep forever"
         if math.isinf(SHELL_CALLS_RETENTION_S)
         else f"{SHELL_CALLS_RETENTION_S / 86400:g} days ({SHELL_CALLS_RETENTION_S:g}s)",

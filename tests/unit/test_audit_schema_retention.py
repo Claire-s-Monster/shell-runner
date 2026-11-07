@@ -98,8 +98,8 @@ def test_migration_is_idempotent(tmp_path: Path) -> None:
 # --- retention env parsing ---------------------------------------------------
 
 
-def test_retention_default_is_90_days() -> None:
-    assert resolve_shell_calls_retention_s({}) == 90 * 86400
+def test_retention_default_is_14_days() -> None:
+    assert resolve_shell_calls_retention_s({}) == 14 * 86400
 
 
 def test_retention_custom_days() -> None:

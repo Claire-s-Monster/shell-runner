@@ -136,15 +136,17 @@ startup. Because `approver_agent_id` is self-asserted
 ([#29](https://github.com/Claire-s-Monster/shell-runner/issues/29)), these
 columns record the claim, not a verified identity.
 
-**Retention.** `SHELL_RUNNER_RETENTION_DAYS` (integer, default `90`) sets how
-long passive `observed_externally` rows in `shell_calls` are kept; `0` or a
+**Retention.** `SHELL_RUNNER_RETENTION_DAYS` (integer, default `14`) sets how
+long passive `observed_externally` rows in `shell_calls` are kept (these are
+the only rows it prunes, and by far the bulk of the table); `0` or a
 negative value keeps everything forever. The legacy `SHELL_CALLS_RETENTION_S`
 (seconds) is still honoured when the new variable is unset. The effective value
 is logged at startup. It must be at least `SHELL_RUNNER_JOB_RETENTION_S`
 (default 7 days). Audit rows (`executed`, `denied`, `prompt_required`,
-`running`) are never pruned. Decided prompts (those carrying an approver) are
-kept for the same retention window, so approver info is not purged before the
-shell_calls rows it relates to; undecided prompts are still removed on expiry.
+`running`) are never pruned, regardless of this setting. Decided prompts
+(those carrying an approver) are also kept forever, independent of this
+window, because the audit rows they explain are never pruned; undecided
+prompts are still removed on expiry.
 
 **`shell_audit`** (MCP tool; HTTP `POST /audit`) is a read-only query over
 `shell_calls`. Claude Code caches `tools/list`, so start a new session to see
