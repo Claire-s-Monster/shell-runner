@@ -126,6 +126,35 @@ self-approval (approver == the prompt's executing agent) and non-primary
 Full authenticated-identity enforcement of "primary session only" is a known
 limitation tracked in [#29](https://github.com/Claire-s-Monster/shell-runner/issues/29).
 
+## What auto-executes (no prompt)
+
+Beyond the per-tier seed rules in `catalog.py`, three categories run without a
+prompt. In every case a credential path (the `monitor.is_credential_path`
+list: `~/.ssh`, `~/.aws`, `~/.gnupg`, `.netrc`, `~/.claude/.credentials.json`,
+`.env*`, `*.pem`, `*.key`, ...) is classified `<cred_path>` and never matches
+an auto-execute rule, so it keeps prompting for every verb, metadata ones
+included.
+
+1. **Read-only inspection** (AUTO_LOG): `ls`, `stat`, `du`, `df`, `file`, `which`/`type`,
+   `ps`, `pgrep`, `wc`, `head`, `tail`, `grep`, `diff`/`cmp` (not `-r`), `rg`
+   (cwd/tmp only), on any non-credential path, with `2>&1` and the usual safe
+   pipe filters. `/etc`, `/proc`, `/sys`, `/dev`, and paths built from `$VAR`
+   still prompt.
+2. **Leading `cd`** (the tier of the rest): `cd DIR && REST`, `cd DIR; REST` and
+   `cd DIR || exit; REST` classify REST as if the cwd were DIR, when DIR exists
+   and resolves inside the configured cwd roots (and is not a credential store).
+   Chains (`cd a && cd b && X`) fold each hop. The template, and so approvals,
+   are REST's; `decision_path` records `cd folded: <dir>`. Execution is unchanged.
+3. **Scratch-directory file management** (AUTO_CAPPED): `mkdir`, `touch`, `rm`
+   (incl. `-rf`), `cp`, `mv`, `ln -s` and `tar` create/extract when every write
+   target really resolves (realpath, so `/tmp/../x` and symlinks do not count)
+   to a strict descendant of `/tmp`. Not scratch: `/tmp` itself, hidden or
+   service entries (`/tmp/.X11-unix`, `systemd-private-*`, `tmux-*`, `ssh-*`,
+   `shell-runner*`), and the bare `/tmp/claude-<uid>` session root (its children
+   are). `$TMPDIR` is not a scratch root: it is not forwarded to the executed
+   command, where it would expand to an empty string. `cp`/`tar`/`ln` sources may
+   be anywhere except credential paths; `mv` sources stay cwd/tmp (it deletes them).
+
 ## Audit trail: approver columns, retention, `shell_audit`
 
 **Approver columns.** Every approve *and* deny decision stores the supplied
