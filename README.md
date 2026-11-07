@@ -255,7 +255,11 @@ file and the error. A missing file or directory simply means no rules.
 
 **Limitations.** Shell parsing is best-effort: `eval`, variables, scripts,
 interpreters and here-docs can evade it (for example `python script.py` where
-the script edits a protected file). The rules cover only commands that go
+the script edits a protected file). Directory changes are tracked conservatively:
+relative paths are checked against the cwd and every directory introduced by an
+earlier `cd`/`pushd` in the same command, and against `git -C DIR`, so this may
+over-match; `tar -C DIR` counts as a write target. `cd -`, bare `cd`, and
+variable or subshell-computed directories are not tracked. The rules cover only commands that go
 through shell-runner, so plain Bash or the Edit/Write tools bypass them. The
 rules files live under the same OS user as the agents, so an agent that can
 write them can change them: this is an accident guardrail and a measurement aid,

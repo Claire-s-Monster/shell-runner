@@ -33,6 +33,10 @@ class CommandPaths:
     writes: list[str] = field(default_factory=list)
     args: list[str] = field(default_factory=list)  # every non-option argument
     inline_code: list[str] = field(default_factory=list)  # -c/-e one-liner texts
+    # Extra directories (relative to the evaluation cwd, or absolute) that
+    # relative paths may resolve against: earlier cd/pushd targets and git -C.
+    bases: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _tokenize(command: str) -> list[str]:
@@ -167,6 +171,72 @@ def _git_subcommand(args: list[str]) -> tuple[str, list[str]]:
     return "", []
 
 
+def _git_c_dirs(args: list[str]) -> list[str]:
+    """Values of `-C DIR` given before the git subcommand."""
+    dirs: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            if a == "-C" and i + 1 < len(args):
+                dirs.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        break
+    return dirs
+
+
+def _tar_dirs(args: list[str]) -> list[str]:
+    """Directories tar writes into: -C DIR, -CDIR, --directory DIR / =DIR."""
+    dirs: list[str] = []
+    for i, a in enumerate(args):
+        if a in ("-C", "--directory") and i + 1 < len(args):
+            dirs.append(args[i + 1])
+        elif a.startswith("--directory="):
+            dirs.append(a.split("=", 1)[1])
+        elif a.startswith("-C") and len(a) > 2:
+            dirs.append(a[2:])
+    return dirs
+
+
+def _join_base(base: str, directory: str) -> str:
+    if directory.startswith(("/", "~")):
+        return directory
+    return f"{base}/{directory}" if base else directory
+
+
+def _extend_bases(bases: list[str], directory: str) -> list[str]:
+    """Add `directory` under every known base (and the original cwd), chained."""
+    out = list(bases)
+    for b in ["", *bases]:
+        joined = _join_base(b, directory)
+        if joined not in out:
+            out.append(joined)
+    return out
+
+
+def _cd_directory(args: list[str]) -> str | None:
+    """The directory a cd/pushd moves to, or None when it cannot be known."""
+    pos = [a for a in args if a == "-" or not a.startswith(("-", "+"))]
+    if len(pos) != 1:
+        return None
+    target = pos[0]
+    if target == "-" or any(c in target for c in "$`"):
+        return None
+    return target
+
+
+def _track_cd(verb: str, args: list[str], bases: list[str], cp: CommandPaths) -> list[str]:
+    target = _cd_directory(args)
+    if target is None:
+        cp.warnings.append(f"{verb}: target directory not statically known; paths not tracked")
+        return bases
+    return _extend_bases(bases, target)
+
+
 def _git_writes(sub: str, args: list[str]) -> list[str]:
     if sub == "apply":
         directory = [
@@ -227,6 +297,8 @@ def _verb_writes(verb: str, args: list[str]) -> list[str]:
         return [a[3:] for a in args if a.startswith("of=")]
     if verb == "git":
         return _git_writes(*_git_subcommand(args))
+    if verb == "tar":
+        return _tar_dirs(args)
     if verb in ("perl", "ruby") and any(re.match(r"^-[A-Za-z]*i", a) for a in args):
         return _positional(args)
     return []
@@ -235,13 +307,19 @@ def _verb_writes(verb: str, args: list[str]) -> list[str]:
 def analyze(command: str) -> list[CommandPaths]:
     """Return one CommandPaths per simple command found in `command`."""
     results: list[CommandPaths] = []
+    cd_bases: list[str] = []
     for words, redirects in _split(_tokenize(command)):
         words = _strip_prefix(words)
-        cp = CommandPaths(writes=list(redirects))
+        cp = CommandPaths(writes=list(redirects), bases=list(cd_bases))
         if words:
             verb = words[0].rsplit("/", 1)[-1]
             args = words[1:]
             cp.verb = verb
+            if verb in ("cd", "pushd"):
+                cd_bases = _track_cd(verb, args, cd_bases, cp)
+            elif verb == "git":
+                for d in _git_c_dirs(args):
+                    cp.bases = _extend_bases(cp.bases, d)
             cp.args = _positional(args) + _option_values(args)
             cp.writes += _verb_writes(verb, args)
             if _INTERPRETER_RE.match(verb):
