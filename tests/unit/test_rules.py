@@ -464,6 +464,54 @@ def test_deny_mode_is_default(cfg: Path, proj: Path) -> None:
     assert verdict.denying_match.mode == "deny"
 
 
+BASE_DIR_EVASIONS = {
+    "cd_and": "cd tests && rm acceptance/x",
+    "cd_semicolon": "cd tests; echo y > acceptance/x",
+    "pushd": "pushd tests && sed -i s/a/b/ acceptance/x",
+    "git_C": "git -C tests checkout -- acceptance/x",
+    "tar_C": "tar -xf a.tar -C tests/acceptance",
+    "chained_cd": "cd tests && cd acceptance && rm x",
+    "chained_cd_from_parent": "cd a && cd tests && rm acceptance/x",
+    "cd_or_pipe": "false || cd tests | rm acceptance/x",
+    "cd_then_git_C": "cd tests && git -C acceptance checkout -- x",
+}
+
+
+@pytest.mark.parametrize("mode", ["deny", "flag"])
+@pytest.mark.parametrize("name", sorted(BASE_DIR_EVASIONS))
+def test_base_dir_changes_do_not_evade_protection(
+    cfg: Path, proj: Path, name: str, mode: str
+) -> None:
+    toml = f'roots = ["{proj}"]\n[[protected]]\nglob = "tests/acceptance/**"\nmode = "{mode}"\n'
+    write_project(cfg, "p", toml)
+    verdict = rules.evaluate(BASE_DIR_EVASIONS[name], str(proj))
+    assert verdict.flagged
+    assert (verdict.denying_match is not None) == (mode == "deny")
+
+
+def test_make_C_is_only_a_touch(guarded: Path) -> None:
+    verdict = rules.evaluate("make -C tests/acceptance all", str(guarded))
+    assert verdict.matches
+    assert not verdict.write_matches
+
+
+def test_git_C_base_applies_to_its_own_segment_only(guarded: Path) -> None:
+    assert not rules.evaluate("git -C tests status && rm x", str(guarded)).matches
+    assert not rules.evaluate("git -C other checkout -- x", str(guarded)).matches
+
+
+def test_cd_into_unrelated_dir_has_no_false_matches(guarded: Path) -> None:
+    for command in ("cd src && rm foo.py", "cd /tmp && rm acceptance_x", "pushd lib; touch a/b"):
+        assert not rules.evaluate(command, str(guarded)).matches, command
+
+
+@pytest.mark.parametrize("command", ["cd - && rm x", "cd && rm x", "cd $D && rm x"])
+def test_untrackable_cd_warns_without_adding_base(guarded: Path, command: str) -> None:
+    verdict = rules.evaluate(command, str(guarded))
+    assert verdict.warnings
+    assert not verdict.matches
+
+
 def test_protected_path_json_shape(guarded: Path) -> None:
     result = classify(f"rm {A}", str(guarded), AGENT)
     assert result.protected_path_json is not None

@@ -187,6 +187,7 @@ class RulesVerdict:
     config_error: str | None = None
     deny: DenyRule | None = None
     matches: tuple[PathMatch, ...] = field(default_factory=tuple)
+    warnings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def write_matches(self) -> tuple[PathMatch, ...]:
@@ -417,16 +418,19 @@ def _resolve(token: str, real_cwd: str) -> str:
 
 
 def _match_path(
-    token: str, kind: Kind, rules: list[ProtectedRule], real_cwd: str
+    token: str, kind: Kind, rules: list[ProtectedRule], real_cwds: list[str]
 ) -> list[PathMatch]:
+    """Match against every candidate base; a hit on any base counts."""
     if not token:
         return []
-    path = _resolve(token, real_cwd)
-    return [
-        PathMatch(path, r.glob, r.mode, kind, r.source_file, r.reason)
-        for r in rules
-        if r.regex.fullmatch(path)
-    ]
+    found: list[PathMatch] = []
+    for path in dict.fromkeys(_resolve(token, base) for base in real_cwds):
+        found += [
+            PathMatch(path, r.glob, r.mode, kind, r.source_file, r.reason)
+            for r in rules
+            if r.regex.fullmatch(path)
+        ]
+    return found
 
 
 def _inline_candidates(text: str) -> list[str]:
@@ -437,13 +441,14 @@ def _command_matches(
     cp: CommandPaths, rules: list[ProtectedRule], real_cwd: str
 ) -> list[PathMatch]:
     found: list[PathMatch] = []
+    bases = [real_cwd, *(_resolve(b, real_cwd) for b in cp.bases)]
     for token in cp.writes:
-        found += _match_path(token, "write", rules, real_cwd)
+        found += _match_path(token, "write", rules, bases)
     for text in cp.inline_code:
         for cand in _inline_candidates(text):
-            found += _match_path(cand, "write", rules, real_cwd)
+            found += _match_path(cand, "write", rules, bases)
     for token in cp.args:
-        found += _match_path(token, "touch", rules, real_cwd)
+        found += _match_path(token, "touch", rules, bases)
     return found
 
 
@@ -474,7 +479,9 @@ def evaluate(command: str, cwd: str) -> RulesVerdict:
     deny = next((d for f in files for d in f.deny if d.regex.search(command)), None)
     protected = [p for f in files for p in f.protected]
     matches: list[PathMatch] = []
+    warnings: list[str] = []
     if protected:
         for cp in analyze(command):
             matches += _command_matches(cp, protected, real_cwd)
-    return RulesVerdict(deny=deny, matches=_dedupe(matches))
+            warnings += [w for w in cp.warnings if w not in warnings]
+    return RulesVerdict(deny=deny, matches=_dedupe(matches), warnings=tuple(warnings))
