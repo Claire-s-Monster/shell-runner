@@ -63,16 +63,17 @@ def test_initialize_sets_protocol_version_header(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tools_list_returns_ten_tools(client: TestClient) -> None:
+def test_tools_list_returns_eleven_tools(client: TestClient) -> None:
     resp = _post(client, "tools/list", req_id=2)
     tools = resp["result"]["tools"]
-    assert len(tools) == 10
+    assert len(tools) == 11
     names = {t["name"] for t in tools}
     assert names == {
         "shell_execute",
         "shell_classify",
         "shell_approve_pending",
         "shell_get_pending",
+        "shell_audit",
         "shell_health",
         "shell_status",
         "shell_wait",

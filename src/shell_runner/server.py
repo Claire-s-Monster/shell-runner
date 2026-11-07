@@ -6,6 +6,7 @@ Routes:
     POST /observe         — record an externally-executed command for T3 promotion review
     POST /approve_pending — approve or deny a pending prompt
     POST /pending         — read-only inspection of pending prompts
+    POST /audit           — read-only audit query over shell_calls (rows or per-agent summary)
     GET  /health          — service health stats
     POST /mcp             — MCP JSON-RPC 2.0 endpoint (Claude Code "type": "http" transport)
     GET  /mcp             — SSE keepalive stream for MCP server-push notifications
@@ -16,11 +17,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +56,8 @@ from .mcp_wrapper import TOOLS
 from .models import (
     ApproveRequest,
     ApproveResponse,
+    AuditRequest,
+    AuditResponse,
     ClassifyRequest,
     ClassifyResponse,
     ExecutePromptInfo,
@@ -75,7 +79,13 @@ from .models import (
     ShellWaitResponse,
 )
 from .normalizer import describe_template_scope
-from .persistence import DEFAULT_DB_PATH, CatalogWriter, Persistence, TelemetryWriter
+from .persistence import (
+    DEFAULT_DB_PATH,
+    CatalogWriter,
+    Persistence,
+    TelemetryWriter,
+    parse_time_bound,
+)
 from .seeds import DEFAULT_SEED_APPROVALS
 
 logger = logging.getLogger(__name__)
@@ -86,7 +96,34 @@ db = Persistence(db_path=_db_path)
 _cleanup_task: asyncio.Task[None] | None = None
 
 RETENTION_S = int(os.environ.get("SHELL_RUNNER_JOB_RETENTION_S", str(7 * 24 * 3600)))
-SHELL_CALLS_RETENTION_S = int(os.environ.get("SHELL_CALLS_RETENTION_S", str(14 * 24 * 3600)))
+DEFAULT_RETENTION_DAYS = 14
+
+
+def resolve_shell_calls_retention_s(environ: Mapping[str, str]) -> float:
+    """Effective retention in seconds for passive observed_externally rows in
+    shell_calls; math.inf means keep forever. Audit rows (executed, denied,
+    prompt_required, running) are never pruned, whatever this is set to.
+
+    SHELL_RUNNER_RETENTION_DAYS (int days; 0 or negative = keep forever) wins.
+    The legacy SHELL_CALLS_RETENTION_S (seconds) is honoured when the new
+    variable is unset. Default: DEFAULT_RETENTION_DAYS days.
+    """
+    raw_days = environ.get("SHELL_RUNNER_RETENTION_DAYS")
+    if raw_days is not None and raw_days.strip():
+        try:
+            days = int(raw_days)
+        except ValueError:
+            raise RuntimeError(
+                f"SHELL_RUNNER_RETENTION_DAYS must be an integer, got {raw_days!r}"
+            ) from None
+        return days * 86400.0 if days > 0 else math.inf
+    legacy = environ.get("SHELL_CALLS_RETENTION_S")
+    if legacy is not None and legacy.strip():
+        return float(int(legacy))
+    return DEFAULT_RETENTION_DAYS * 86400.0
+
+
+SHELL_CALLS_RETENTION_S = resolve_shell_calls_retention_s(os.environ)
 
 
 def _validate_shell_calls_retention(shell_calls_retention_s: float, job_retention_s: float) -> None:
@@ -242,7 +279,9 @@ async def _periodic_cleanup(interval_s: int = 60) -> None:
     while True:
         await asyncio.sleep(interval_s)
         try:
-            removed_prompts = await asyncio.to_thread(db.cleanup_expired_prompts)
+            # Decided prompts (they carry approver_agent_id) are kept forever:
+            # the audit rows they explain are never pruned either.
+            removed_prompts = await asyncio.to_thread(db.cleanup_expired_prompts, None)
             if removed_prompts:
                 logger.debug("Cleaned up %d expired pending prompt(s)", removed_prompts)
         except Exception:
@@ -266,6 +305,8 @@ async def _periodic_cleanup(interval_s: int = 60) -> None:
                 logger.debug("Cleaned up %d stale job(s)", len(removed_jobs))
         except Exception:
             logger.exception("Error during periodic job cleanup")
+        if math.isinf(SHELL_CALLS_RETENTION_S):
+            continue  # keep-forever: nothing to prune
         try:
             removed_shell_calls = await asyncio.to_thread(
                 db.cleanup_old_shell_calls, SHELL_CALLS_RETENTION_S
@@ -285,6 +326,13 @@ def _on_sighup() -> None:
 @asynccontextmanager
 async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     global _cleanup_task
+    logger.info(
+        "observed_externally retention: %s (executed/denied/prompt_required/running "
+        "audit rows are never pruned)",
+        "keep forever"
+        if math.isinf(SHELL_CALLS_RETENTION_S)
+        else f"{SHELL_CALLS_RETENTION_S / 86400:g} days ({SHELL_CALLS_RETENTION_S:g}s)",
+    )
     _cleanup_task = asyncio.create_task(_periodic_cleanup())
 
     # Register SIGHUP handler for live cwd-roots reload (Linux only).
@@ -1524,8 +1572,12 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             ),
         )
 
+    # approver_agent_id is self-asserted (issue #29): recorded as a claim only.
     token = await asyncio.to_thread(
-        db.approve_prompt, prompt_id=req.prompt_id, decision=req.decision
+        db.approve_prompt,
+        prompt_id=req.prompt_id,
+        decision=req.decision,
+        approver_agent_id=req.approver_agent_id,
     )
     if token is None and req.decision != "deny":
         raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
@@ -1549,6 +1601,7 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             agent_id=agent_scope,
             approved_tier=promoted_tier,
             approved_via_prompt_id=req.prompt_id,
+            approved_by=req.approver_agent_id,
         )
         template_promoted = True
         promoted_tier_out = promoted_tier
@@ -1573,6 +1626,7 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             agent_id=prompt["agent_id"],
             approved_tier=promoted_tier,
             approved_via_prompt_id=req.prompt_id,
+            approved_by=req.approver_agent_id,
         )
         verb_promoted = True
         promoted_tier_out = promoted_tier
@@ -1610,6 +1664,28 @@ async def get_pending_route(body: GetPendingRequest) -> GetPendingResponse:
         return GetPendingResponse(prompts=[_prompt_detail(row)])
     rows = db.list_pending_prompts(include_resolved=body.include_resolved)
     return GetPendingResponse(prompts=[_prompt_detail(r) for r in rows])
+
+
+@app.post("/audit", response_model=AuditResponse)
+async def audit_route(body: AuditRequest) -> AuditResponse:
+    """Read-only audit query over shell_calls (+ approver info from pending_prompts)."""
+    try:
+        since = parse_time_bound(body.since) if body.since else None
+        until = parse_time_bound(body.until) if body.until else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result = await asyncio.to_thread(
+        db.audit_query,
+        agent_id=body.agent_id,
+        agent_id_prefix=body.agent_id_prefix,
+        since=since,
+        until=until,
+        decision=body.decision,
+        flagged_only=body.flagged_only,
+        mode=body.mode,
+        limit=body.limit,
+    )
+    return AuditResponse(**result)
 
 
 @app.post("/tools/shell_status", response_model=ShellStatusResponse)
@@ -2094,6 +2170,14 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
             logger.exception("Invalid arguments for shell_get_pending")
             return {"error": "invalid arguments"}
         return (await get_pending_route(pending_req)).model_dump()
+
+    if tool_name == "shell_audit":
+        try:
+            audit_req = AuditRequest(**arguments)
+        except Exception:
+            logger.exception("Invalid arguments for shell_audit")
+            return {"error": "invalid arguments"}
+        return (await audit_route(audit_req)).model_dump()
 
     if tool_name == "shell_health":
         return (await health_route()).model_dump()

@@ -173,6 +173,62 @@ TOOLS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "shell_audit": {
+        "description": (
+            "Read-only audit query over the shell_calls log, to measure agent behaviour. "
+            "mode='rows' (default) returns newest-first rows: ts, agent_id, cwd, raw_cmd, "
+            "command_tier, final_tier, decision, matched_rule_category, matched_rule_pattern, "
+            "exit_code, plus approver_agent_id/approve_decision when a decided prompt matches "
+            "the same agent_id+raw_cmd+cwd within its lifetime. mode='summary' returns, per "
+            "agent_id: total_calls, by_decision, denied_count, prompt_count, first_ts, last_ts. "
+            "All filters are optional and combine with AND. since/until take ISO-8601 or a "
+            "relative age ('30m', '24h', '7d', '2w'). decision is an exact match, e.g. "
+            "executed|denied|prompt_required|running|observed_externally. flagged_only "
+            "applies only if the database has a 'flagged' column; otherwise it is ignored "
+            "and `notes` says so. Approver identity is self-asserted (issue #29): it records "
+            "a claim, not a verified identity. NOTE: Claude Code caches tools/list, so a "
+            "new session is needed to see this tool after the server gains it."
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": ["string", "null"], "description": "Exact agent_id"},
+                "agent_id_prefix": {
+                    "type": ["string", "null"],
+                    "description": "Match agent_ids starting with this (case-sensitive)",
+                },
+                "since": {
+                    "type": ["string", "null"],
+                    "description": "Inclusive lower bound: ISO-8601 or relative ('24h', '7d')",
+                },
+                "until": {
+                    "type": ["string", "null"],
+                    "description": "Inclusive upper bound: ISO-8601 or relative ('24h', '7d')",
+                },
+                "decision": {
+                    "type": ["string", "null"],
+                    "description": "Exact decision, e.g. executed|denied|prompt_required",
+                },
+                "flagged_only": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Only flagged calls (needs a 'flagged' column; else ignored)",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["rows", "summary"],
+                    "default": "rows",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 100,
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Max rows (rows mode) or agents (summary mode); capped at 1000",
+                },
+            },
+        },
+    },
     "shell_health": {
         "description": (
             "Get shell-runner server health: total/denied/prompt rates, latency, "
