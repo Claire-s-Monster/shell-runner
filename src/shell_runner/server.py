@@ -15,6 +15,7 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -262,14 +263,10 @@ def _apply_template_approval(
     if new_final_tier != approved_tier:
         new_path.append(f"agent cap applied: {approved_tier.name} -> {new_final_tier.name}")
 
-    return ClassificationResult(
+    return dataclasses.replace(
+        cls,
         tier=new_final_tier,
         command_tier=approved_tier,
-        agent_cap=cls.agent_cap,
-        matched_rule=cls.matched_rule,
-        template=cls.template,
-        segments=cls.segments,
-        normalizer_warnings=cls.normalizer_warnings,
         decision_path=tuple(new_path),
     )
 
@@ -411,6 +408,8 @@ async def _prewrite_inline_budget_telemetry(
     matched_rule_category: str | None,
     decision_path: list[str],
     duration_ms: int,
+    protected_path_match: str | None = None,
+    flagged: int = 0,
 ) -> None:
     """Write the shell_calls row for telemetry_id BEFORE a call to
     _run_with_inline_budget may reach execute_background() (issue #46).
@@ -449,6 +448,8 @@ async def _prewrite_inline_budget_telemetry(
             duration_ms=duration_ms,
             decision_path=decision_path,
             normalizer_warnings=[],
+            protected_path_match=protected_path_match,
+            flagged=flagged,
             wait=True,
         )
     else:
@@ -470,6 +471,8 @@ async def _prewrite_inline_budget_telemetry(
             duration_ms=duration_ms,
             decision_path=decision_path,
             normalizer_warnings=[],
+            protected_path_match=protected_path_match,
+            flagged=flagged,
         )
     if catalog_writer is not None:
         await catalog_writer.submit(
@@ -581,6 +584,8 @@ async def _execute_approved_command(
                 duration_ms=duration_ms,
                 decision_path=[consumed_via, "execution_recheck_deny"],
                 normalizer_warnings=list(recheck_cls.normalizer_warnings),
+                protected_path_match=recheck_cls.protected_path_json,
+                flagged=int(recheck_cls.flagged),
             )
         else:
             await asyncio.to_thread(
@@ -605,6 +610,8 @@ async def _execute_approved_command(
                 duration_ms=duration_ms,
                 decision_path=[consumed_via, "execution_recheck_deny"],
                 normalizer_warnings=list(recheck_cls.normalizer_warnings),
+                protected_path_match=recheck_cls.protected_path_json,
+                flagged=int(recheck_cls.flagged),
             )
         if catalog_writer is not None:
             await catalog_writer.submit(
@@ -654,6 +661,8 @@ async def _execute_approved_command(
                 duration_ms=int((time.monotonic() - t0) * 1000),
                 decision_path=[consumed_via, "background"],
                 normalizer_warnings=[],
+                protected_path_match=recheck_cls.protected_path_json,
+                flagged=int(recheck_cls.flagged),
                 wait=True,
             )
         else:
@@ -675,6 +684,8 @@ async def _execute_approved_command(
                 duration_ms=int((time.monotonic() - t0) * 1000),
                 decision_path=[consumed_via, "background"],
                 normalizer_warnings=[],
+                protected_path_match=recheck_cls.protected_path_json,
+                flagged=int(recheck_cls.flagged),
             )
         if catalog_writer is not None:
             await catalog_writer.submit(
@@ -731,6 +742,8 @@ async def _execute_approved_command(
             matched_rule_category=prompt["matched_rule_category"],
             decision_path=[consumed_via, "background", "inline_budget_divert"],
             duration_ms=int((time.monotonic() - t0) * 1000),
+            protected_path_match=recheck_cls.protected_path_json,
+            flagged=int(recheck_cls.flagged),
         )
 
     exec_result, diverted_job_id = await _run_with_inline_budget(req=req, telemetry_id=telemetry_id)
@@ -798,6 +811,8 @@ async def _execute_approved_command(
                 duration_ms=duration_ms,
                 decision_path=decision_path,
                 normalizer_warnings=[],
+                protected_path_match=recheck_cls.protected_path_json,
+                flagged=int(recheck_cls.flagged),
             )
         else:
             await asyncio.to_thread(
@@ -818,6 +833,8 @@ async def _execute_approved_command(
                 duration_ms=duration_ms,
                 decision_path=decision_path,
                 normalizer_warnings=[],
+                protected_path_match=recheck_cls.protected_path_json,
+                flagged=int(recheck_cls.flagged),
             )
         if catalog_writer is not None:
             await catalog_writer.submit(
@@ -943,6 +960,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 duration_ms=duration_ms,
                 decision_path=list(cls.decision_path),
                 normalizer_warnings=list(cls.normalizer_warnings),
+                protected_path_match=cls.protected_path_json,
+                flagged=int(cls.flagged),
             )
         else:
             await asyncio.to_thread(
@@ -963,6 +982,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 duration_ms=duration_ms,
                 decision_path=list(cls.decision_path),
                 normalizer_warnings=list(cls.normalizer_warnings),
+                protected_path_match=cls.protected_path_json,
+                flagged=int(cls.flagged),
             )
         if catalog_writer is not None:
             await catalog_writer.submit(
@@ -1015,6 +1036,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     duration_ms=int((time.monotonic() - t0) * 1000),
                     decision_path=list(cls.decision_path) + ["background"],
                     normalizer_warnings=list(cls.normalizer_warnings),
+                    protected_path_match=cls.protected_path_json,
+                    flagged=int(cls.flagged),
                     wait=True,
                 )
             else:
@@ -1036,6 +1059,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     duration_ms=int((time.monotonic() - t0) * 1000),
                     decision_path=list(cls.decision_path) + ["background"],
                     normalizer_warnings=list(cls.normalizer_warnings),
+                    protected_path_match=cls.protected_path_json,
+                    flagged=int(cls.flagged),
                 )
             if catalog_writer is not None:
                 await catalog_writer.submit(
@@ -1092,6 +1117,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
                 decision_path=[*cls.decision_path, "background", "inline_budget_divert"],
                 duration_ms=int((time.monotonic() - t0) * 1000),
+                protected_path_match=cls.protected_path_json,
+                flagged=int(cls.flagged),
             )
 
         exec_result, diverted_job_id = await _run_with_inline_budget(
@@ -1145,6 +1172,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     duration_ms=duration_ms,
                     decision_path=list(cls.decision_path),
                     normalizer_warnings=list(cls.normalizer_warnings),
+                    protected_path_match=cls.protected_path_json,
+                    flagged=int(cls.flagged),
                 )
             else:
                 await asyncio.to_thread(
@@ -1165,6 +1194,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                     duration_ms=duration_ms,
                     decision_path=list(cls.decision_path),
                     normalizer_warnings=list(cls.normalizer_warnings),
+                    protected_path_match=cls.protected_path_json,
+                    flagged=int(cls.flagged),
                 )
             if catalog_writer is not None:
                 await catalog_writer.submit(
@@ -1258,6 +1289,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 duration_ms=duration_ms,
                 decision_path=list(cls.decision_path) + ["invalid_cwd"],
                 normalizer_warnings=list(cls.normalizer_warnings),
+                protected_path_match=cls.protected_path_json,
+                flagged=int(cls.flagged),
             )
         else:
             await asyncio.to_thread(
@@ -1278,6 +1311,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 duration_ms=duration_ms,
                 decision_path=list(cls.decision_path) + ["invalid_cwd"],
                 normalizer_warnings=list(cls.normalizer_warnings),
+                protected_path_match=cls.protected_path_json,
+                flagged=int(cls.flagged),
             )
         return ExecuteResponse(
             decision="denied",
@@ -1323,6 +1358,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             duration_ms=duration_ms,
             decision_path=list(cls.decision_path),
             normalizer_warnings=list(cls.normalizer_warnings),
+            protected_path_match=cls.protected_path_json,
+            flagged=int(cls.flagged),
         )
     else:
         await asyncio.to_thread(
@@ -1343,6 +1380,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             duration_ms=duration_ms,
             decision_path=list(cls.decision_path),
             normalizer_warnings=list(cls.normalizer_warnings),
+            protected_path_match=cls.protected_path_json,
+            flagged=int(cls.flagged),
         )
     why = (
         f"command tier={cls.command_tier.name} after agent_cap={cls.agent_cap.name}"
@@ -1432,6 +1471,8 @@ async def observe_route(request: Request, req: ObserveRequest) -> ObserveRespons
             duration_ms=req.duration_ms,
             decision_path=["observe_endpoint"],
             normalizer_warnings=list(cls.normalizer_warnings),
+            protected_path_match=cls.protected_path_json,
+            flagged=int(cls.flagged),
         )
     if catalog_writer is not None:
         await catalog_writer.submit(
