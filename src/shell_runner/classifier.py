@@ -185,6 +185,8 @@ class ClassificationResult:
     decision_path: tuple[str, ...]
     protected_matches: tuple[rules.PathMatch, ...] = field(default_factory=tuple)
     flagged: bool = False  # command wrote to a protected path (denied or flag-only)
+    # path_guard flagged the command: persisted template/verb approvals must not lower it
+    path_guarded: bool = False
 
     @property
     def protected_path_json(self) -> str | None:
@@ -407,7 +409,12 @@ def _apply_path_guard(
 ) -> ClassificationResult:
     """Tighten (never loosen) the tier for redirects / recursive search (issue #75)."""
     finding = path_guard.evaluate(command, cwd, env)
-    if finding is None or PERMISSIVENESS[result.command_tier] <= PERMISSIVENESS[finding.tier]:
+    if finding is None:
+        return result
+    # Marked even when the catalog was already as strict: persisted approvals key on
+    # the shared template and must never lower a guarded command.
+    result = replace(result, path_guarded=True)
+    if PERMISSIVENESS[result.command_tier] <= PERMISSIVENESS[finding.tier]:
         return result
     rule = Rule(
         pattern=f"path_guard:{finding.category}",
