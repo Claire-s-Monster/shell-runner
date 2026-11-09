@@ -183,6 +183,11 @@ _BARE_PATH_VERBS: frozenset[str] = frozenset(
 )
 _BARE_OPERAND_RE = re.compile(r"[\w.@+%-]+(?:/[\w.@+%-]+)*/?")
 
+# Interpreters whose exact `-n FILE...` / `-I|-P -m py_compile FILE...` syntax-check
+# segments get bare operands resolved (see _is_syntax_check).
+_SYNTAX_CHECK_SHELLS: frozenset[str] = frozenset({"bash", "sh", "dash"})
+_SYNTAX_CHECK_PYTHONS: frozenset[str] = frozenset({"python", "python3"})
+
 # Verbs whose operands are write targets (or sources) in the scratch-directory
 # auto-execute rules; /tmp/<name> operands are re-labelled <scratch_path>.
 _SCRATCH_WRITE_VERBS: frozenset[str] = frozenset({"mkdir", "rm", "cp", "mv", "touch", "tar", "ln"})
@@ -762,6 +767,34 @@ def _trusted_basename(tok: str) -> str:
     return tok
 
 
+def _syntax_check_prefix(tokens: list[str]) -> int:
+    """Index of the first FILE operand when the segment is exactly
+    `(ba|da)?sh -n FILE...` or `python3? -I|-P -m py_compile FILE...` (no
+    assignments, no other flags); otherwise `len(tokens)` (no operand qualifies).
+
+    Only those operands resolve as bare paths (see _refine_operand); every other
+    bash/sh/python command keeps its existing template.
+    """
+    none = len(tokens)
+    if len(tokens) < 3:
+        return none
+    head = _trusted_basename(tokens[0])
+    if head in _SYNTAX_CHECK_SHELLS and tokens[1] == "-n":
+        prefix = 2
+    elif (
+        head in _SYNTAX_CHECK_PYTHONS
+        and tokens[1] in ("-I", "-P")
+        and tokens[2:4] == ["-m", "py_compile"]
+    ):
+        prefix = 4
+    else:
+        return none
+    operands = tokens[prefix:]
+    if not operands or any(t.startswith("-") for t in operands):
+        return none
+    return prefix
+
+
 def _refine_operand(
     verb: str,
     tok: str,
@@ -769,10 +802,16 @@ def _refine_operand(
     cwd: str,
     env: dict[str, str],
     state: _NormState,
+    *,
+    syntax_check: bool = False,
 ) -> str:
     """Verb-specific operand placeholders (see _BARE_PATH_VERBS, _SCRATCH_WRITE_VERBS)."""
+    if syntax_check and ".." in tok.split("/"):
+        # Parent-directory hops can leave the cwd while still looking cwd-relative:
+        # keep the literal token so no syntax-check rule matches it.
+        return tok
     if (
-        verb in _BARE_PATH_VERBS
+        (verb in _BARE_PATH_VERBS or syntax_check)
         and classified == tok
         and _BARE_OPERAND_RE.fullmatch(tok)
         and not tok.startswith("-")
@@ -815,6 +854,7 @@ def _normalize_segment(
     while tokens and tokens[-1] == "&":
         is_background = True
         tokens.pop()
+    operands_from = _syntax_check_prefix(tokens)
 
     i = 0
     while i < len(tokens):
@@ -882,7 +922,9 @@ def _normalize_segment(
 
         # Classify remaining tokens
         classified = _classify_token(tok, cwd, env, safe_domains, state, depth)
-        classified = _refine_operand(verb, tok, classified, cwd, env, state)
+        classified = _refine_operand(
+            verb, tok, classified, cwd, env, state, syntax_check=i >= operands_from
+        )
 
         # Warn if glob appears as arg to a destructive verb
         if classified == "<glob>" and verb in _DESTRUCTIVE_VERBS:

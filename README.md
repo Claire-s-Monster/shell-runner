@@ -128,7 +128,7 @@ limitation tracked in [#29](https://github.com/Claire-s-Monster/shell-runner/iss
 
 ## What auto-executes (no prompt)
 
-Beyond the per-tier seed rules in `catalog.py`, three categories run without a
+Beyond the per-tier seed rules in `catalog.py`, four categories run without a
 prompt. In every case a credential path (the `monitor.is_credential_path`
 list: `~/.ssh`, `~/.aws`, `~/.gnupg`, `.netrc`, `~/.claude/.credentials.json`,
 `.env*`, `*.pem`, `*.key`, ...) is classified `<cred_path>` and never matches
@@ -155,6 +155,11 @@ included.
    are). `$TMPDIR` is not a scratch root: it is not forwarded to the executed
    command, where it would expand to an empty string. `cp`/`tar`/`ln` sources may
    be anywhere except credential paths; `mv` sources stay cwd/tmp (it deletes them).
+4. **Syntax checks** (AUTO_LOG): `bash|sh|dash -n FILE...` and
+   `python[3] -I|-P -m py_compile FILE...`, with no other flags, when every FILE
+   resolves to the cwd or `/tmp` (incl. scratchpads). Home, `/etc`, credential
+   paths, globs and `$VAR` operands still prompt, as do `zsh -n` and `ksh -n`
+   (their startup-file handling under `-n` is unverified). `py_compile` writes `__pycache__/*.pyc` next to the source.
 
 ## Audit trail: approver columns, retention, `shell_audit`
 

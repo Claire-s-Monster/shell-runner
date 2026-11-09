@@ -276,6 +276,22 @@ T1_AUTO_LOG: list[Rule] = [
         Tier.AUTO_LOG,
         "fs-search",
     ),
+    # Syntax checks: parse only, never run the file. Exact flag set, operands are
+    # cwd/tmp/scratch paths only. zsh/ksh are excluded (startup-file behaviour under -n unverified: not installed);
+    # bash/dash do not source BASH_ENV/ENV/rc files under -n (verified), and the
+    # executor strips those variables anyway. py_compile writes __pycache__/*.pyc.
+    Rule(
+        r"^(?:ba|da)?sh -n(?: <(?:cwd|tmp|scratch)_path>)+$",
+        Tier.AUTO_LOG,
+        "fs-read",
+        reason="shell syntax check (-n), cwd/tmp operands only",
+    ),
+    Rule(
+        r"^python3? -[IP] -m py_compile(?: <(?:cwd|tmp|scratch)_path>)+$",
+        Tier.AUTO_LOG,
+        "fs-read",
+        reason="python py_compile (isolated), cwd/tmp operands only",
+    ),
     # System info
     Rule(r"^pwd$", Tier.AUTO_LOG, "system-info"),
     Rule(r"^whoami$", Tier.AUTO_LOG, "system-info"),
@@ -531,6 +547,7 @@ T4_ALWAYS_APPROVE: list[Rule] = [
     # Process / code exec
     Rule(r"^bash\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
     Rule(r"^sh\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
+    Rule(r"^(?:z|da|k)sh\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
     Rule(r"^python3?\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
     Rule(r"^source\s+\S+$", Tier.ALWAYS_APPROVE, "process"),
 ]
