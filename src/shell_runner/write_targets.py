@@ -31,6 +31,8 @@ class CommandPaths:
 
     verb: str = ""
     writes: list[str] = field(default_factory=list)
+    redirects: list[str] = field(default_factory=list)  # output redirect targets only
+    options: list[str] = field(default_factory=list)  # option words (before `--`)
     args: list[str] = field(default_factory=list)  # every non-option argument
     inline_code: list[str] = field(default_factory=list)  # -c/-e one-liner texts
     # Extra directories (relative to the evaluation cwd, or absolute) that
@@ -310,7 +312,7 @@ def analyze(command: str) -> list[CommandPaths]:
     cd_bases: list[str] = []
     for words, redirects in _split(_tokenize(command)):
         words = _strip_prefix(words)
-        cp = CommandPaths(writes=list(redirects), bases=list(cd_bases))
+        cp = CommandPaths(writes=list(redirects), redirects=list(redirects), bases=list(cd_bases))
         if words:
             verb = words[0].rsplit("/", 1)[-1]
             args = words[1:]
@@ -320,6 +322,8 @@ def analyze(command: str) -> list[CommandPaths]:
             elif verb == "git":
                 for d in _git_c_dirs(args):
                     cp.bases = _extend_bases(cp.bases, d)
+            before_dd = args[: args.index("--")] if "--" in args else args
+            cp.options = [a for a in before_dd if a.startswith("-") and a != "-"]
             cp.args = _positional(args) + _option_values(args)
             cp.writes += _verb_writes(verb, args)
             if _INTERPRETER_RE.match(verb):

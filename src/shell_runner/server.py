@@ -32,7 +32,7 @@ from typing import Any, Literal, cast
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import executor, monitor, restart
+from . import executor, monitor, path_guard, restart
 from .catalog import Tier, all_rules
 from .classifier import (
     PERMISSIVENESS,
@@ -231,6 +231,11 @@ def _apply_template_approval(
     """
     # 1. DENY always wins — never consult or apply any promotion.
     if cls.command_tier == Tier.DENY:
+        return cls
+
+    # 1b. Path-guarded commands (redirect / broad grep, issue #75) share their
+    # template with harmless in-cwd variants: only a one-shot token may run them.
+    if cls.path_guarded:
         return cls
 
     # 2. Exact-template promotion first.
@@ -1628,7 +1633,20 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     catalog_entry_id: str | None = None
     promoted_tier_out: int | None = None
 
-    if req.decision in ("approve_template", "approve_template_global"):
+    reusable = req.decision in ("approve_template", "approve_template_global", "approve_verb")
+    guarded_note: str | None = None
+    if reusable:
+        pending = db.get_pending_prompt(req.prompt_id)
+        if pending is not None and path_guard.evaluate(pending["raw_cmd"], pending["cwd"]):
+            guarded_note = (
+                f"{req.decision} downgraded to a one-shot approval: this command redirects "
+                "outside the cwd or searches a broad/credential path, and a reusable approval "
+                "would also match harmless in-cwd variants of the same template"
+            )
+
+    if guarded_note is not None:
+        pass
+    elif req.decision in ("approve_template", "approve_template_global"):
         prompt = db.get_pending_prompt(req.prompt_id)
         if prompt is None:
             raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
@@ -1686,7 +1704,7 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         verb_promoted=verb_promoted,
         promoted_tier=promoted_tier_out,
         approved=detail,
-        scope_warning=detail.scope_warning if detail is not None else None,
+        scope_warning=guarded_note or (detail.scope_warning if detail is not None else None),
     )
 
 
