@@ -238,6 +238,11 @@ def _apply_template_approval(
     if cls.path_guarded:
         return cls
 
+    # 1c. Inline code (`-c`, `source`) is never promotable, in any segment: rows
+    # created while the shape was still T3 no longer apply.
+    if cls.non_promotable:
+        return cls
+
     # 2. Exact-template promotion first.
     approved_int = db.get_template_approved_tier(cls.template, agent_id)
     promotion_label = "approved_template"
@@ -1642,6 +1647,14 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
                 f"{req.decision} downgraded to a one-shot approval: this command redirects "
                 "outside the cwd or searches a broad/credential path, and a reusable approval "
                 "would also match harmless in-cwd variants of the same template"
+            )
+        elif (
+            pending is not None
+            and classify(pending["raw_cmd"], pending["cwd"], pending["agent_id"]).non_promotable
+        ):
+            guarded_note = (
+                f"{req.decision} downgraded to a one-shot approval: inline code "
+                "(-c, source) is never promotable"
             )
 
     if guarded_note is not None:

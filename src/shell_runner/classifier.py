@@ -12,6 +12,7 @@ Public API:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, replace
 
 from . import path_guard, rules
@@ -187,6 +188,9 @@ class ClassificationResult:
     flagged: bool = False  # command wrote to a protected path (denied or flag-only)
     # path_guard flagged the command: persisted template/verb approvals must not lower it
     path_guarded: bool = False
+    # some segment matched a non-promotable (inline code) rule: persisted approvals
+    # must not lower it and reusable approval decisions degrade to one-shot
+    non_promotable: bool = False
 
     @property
     def protected_path_json(self) -> str | None:
@@ -271,6 +275,54 @@ def _classify_template(template: str) -> tuple[Tier, Rule | None, str]:
     return Tier.APPROVE_ONCE, None, "T3_fallthrough"
 
 
+# Wrapper verbs that exec their trailing command, mapped to the options that
+# consume a following value token (so the value is not mistaken for the command).
+_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "-C", "-S", "--unset", "--chdir", "--split-string"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "nohup": frozenset(),
+    "timeout": frozenset({"-s", "-k", "--signal", "--kill-after"}),
+    "exec": frozenset({"-a"}),
+    "command": frozenset(),
+    "xargs": frozenset({"-n", "-I", "-P", "-L", "-s", "-d", "-E", "-a"}),
+}
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_]\w*=")
+_TIMEOUT_DURATION_RE = re.compile(r"^(?:<n>|\d[\d.]*[smhd]?)$")
+
+
+def _wrapped_command(parts: list[str]) -> str | None:
+    """Template of the command a wrapper verb executes, or None.
+
+    Skips the wrapper's own options (and their values), `VAR=<arg>` assignments
+    for env, and the duration for timeout. `env -S <string>` is not parsed.
+    """
+    if len(parts) < 2 or parts[0] not in _WRAPPER_VALUE_OPTS:
+        return None
+    wrapper, value_opts = parts[0], _WRAPPER_VALUE_OPTS[parts[0]]
+    need_duration = wrapper == "timeout"
+    i = 1
+    while i < len(parts):
+        tok = parts[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok in value_opts:
+            # The normalizer splits the usual `-I {}` replace-str into `{` `}`.
+            braces = tok == "-I" and parts[i + 1 : i + 3] == ["{", "}"]
+            i += 3 if braces else 2
+        elif tok.startswith("-") or (wrapper == "env" and _ENV_ASSIGNMENT_RE.match(tok)):
+            i += 1
+        elif need_duration and _TIMEOUT_DURATION_RE.match(tok):
+            need_duration = False
+            i += 1
+        elif tok == "<n>":
+            # Numeric flag the normalizer folded: `xargs -0`, legacy `nice -5`.
+            i += 1
+        else:
+            break
+    return " ".join(parts[i:]) or None
+
+
 def _classify_segment(template: str) -> tuple[Tier, Rule | None, str]:
     """Classify a single normalized segment template.
 
@@ -287,10 +339,20 @@ def _classify_segment(template: str) -> tuple[Tier, Rule | None, str]:
         if rule.match_target == "raw" and compiled_for(rule).search(template):
             return Tier.DENY, rule, "T0_raw"
 
+    parts = template.split()
+
+    # Wrapper escalation: `env|nice|nohup|timeout|exec|command|xargs ... <cmd>`
+    # runs <cmd>; if <cmd> is itself T4 (e.g. `python3 -c`), so is the wrapper.
+    # Only escalates -- a wrapped command never gets a more permissive tier.
+    inner = _wrapped_command(parts)
+    if inner is not None:
+        inner_tier, inner_rule, inner_step = _classify_segment(inner)
+        if inner_tier in (Tier.ALWAYS_APPROVE, Tier.DENY):
+            return inner_tier, inner_rule, inner_step
+
     # xargs sub-command escalation: `xargs <verb> [args]` -- classify the
     # sub-verb to determine the effective tier of the composed command.
     # Without this, `xargs rm` would match T1 `^xargs\s+\S+$` (too permissive).
-    parts = template.split()
     if parts and parts[0] == "xargs" and len(parts) >= 2:
         sub_verb = parts[1]
         sub_tier, sub_rule, sub_step = _classify_template(sub_verb)
@@ -527,4 +589,8 @@ def _classify_catalog(
         segments=tuple(seg_classifications),
         normalizer_warnings=normalized.parse_warnings,
         decision_path=tuple(decision_path),
+        non_promotable=any(
+            s.matched_rule is not None and not s.matched_rule.promotable
+            for s in seg_classifications
+        ),
     )
