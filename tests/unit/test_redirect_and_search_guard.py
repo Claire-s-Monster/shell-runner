@@ -168,6 +168,92 @@ def test_guard_decision_is_recorded() -> None:
     assert any("path_guard" in d for d in res.decision_path)
 
 
+@pytest.fixture
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """cwd roots: a ~/.claude-like dir, repo1 (.git dir), repo2 (.git file), plain."""
+    base = tmp_path.resolve()
+    for name in ("dotclaude", "repo1/sub/deeper", "repo2", "plain/sub"):
+        (base / name).mkdir(parents=True)
+    (base / "repo1" / ".git").mkdir()
+    (base / "repo2" / ".git").write_text("gitdir: /elsewhere\n")
+    (base / ".git").mkdir()  # above every root: must never be found
+    roots = [base / n for n in ("dotclaude", "repo1", "repo2", "plain")]
+    monkeypatch.setattr(executor, "_CWD_ROOTS", roots)
+    monkeypatch.setattr(path_guard, "_TMP_ROOT", "/nonexistent-tmp")
+    return base
+
+
+def _guard(command: str, cwd: Path) -> object:
+    return path_guard.evaluate(command, str(cwd), ENV)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x > notes.txt",
+        "echo x > ../README.md",
+        "echo x >> ../top.txt",
+        "echo x > ../../repo1/sub/deeper/f",
+        "cd .. && echo x > README.md",
+    ],
+)
+def test_in_repo_writes_from_subdir_stay_inside(world: Path, command: str) -> None:
+    assert _guard(command, world / "repo1" / "sub") is None
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["dotclaude/settings.json", "repo2/foo", "plain/f", "repo2/.git"],
+)
+def test_other_cwd_roots_are_outside(world: Path, target: str) -> None:
+    f = path_guard.evaluate(f"echo x > {world / target}", str(world / "repo1" / "sub"), ENV)
+    assert f is not None
+    assert f.tier == T3
+
+
+def test_relative_escape_into_sibling_root_prompts(world: Path) -> None:
+    f = path_guard.evaluate("echo x > ../../../dotclaude/s.json", str(world / "repo1/sub"), ENV)
+    assert f is not None
+    assert f.tier == T3
+
+
+def test_git_file_worktree_counts_as_repo(world: Path) -> None:
+    assert path_guard.evaluate("echo x > ../top.txt", str(world / "repo2"), ENV) is not None
+    (world / "repo2" / "wt").mkdir()
+    assert path_guard.evaluate("echo x > ../top.txt", str(world / "repo2" / "wt"), ENV) is None
+
+
+def test_no_repo_means_cwd_only_and_never_walks_above_root(world: Path) -> None:
+    # plain has no .git and tmp_path/.git sits above every root
+    cwd = world / "plain" / "sub"
+    assert path_guard.evaluate("echo x > f", str(cwd), ENV) is None
+    assert path_guard.evaluate("echo x > ../f", str(cwd), ENV) is not None
+
+
+def test_tmp_still_inside(world: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(path_guard, "_TMP_ROOT", "/tmp")
+    assert path_guard.evaluate("echo x > /tmp/foo.txt", str(world / "repo1"), ENV) is None
+
+
+def test_credential_redirect_still_denied_inside_repo(world: Path) -> None:
+    f = path_guard.evaluate("echo x > /home/test/.ssh/id_rsa", str(world / "repo1"), ENV)
+    assert f is not None
+    assert f.tier == T0
+
+
+def test_classified_tier_into_other_root(world: Path) -> None:
+    res = classify(f"echo x > {world}/repo2/foo", str(world / "repo1"), AGENT, env=ENV)
+    assert res.command_tier == T3
+    assert res.path_guarded
+    res = classify("echo x > ../README.md", str(world / "repo1" / "sub"), AGENT, env=ENV)
+    assert res.command_tier == T1
+    assert not res.path_guarded
+
+
+def test_recursive_grep_in_repo_unchanged(world: Path) -> None:
+    assert _guard("grep -rn foo ../sub", world / "repo1" / "sub") is None
+
+
 def test_directory_holding_credentials_is_broad(tmp_path: Path) -> None:
     (tmp_path / ".ssh").mkdir()
     assert path_guard._holds_credentials(tmp_path)

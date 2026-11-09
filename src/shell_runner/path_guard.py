@@ -7,7 +7,7 @@ or `grep -rn foo src` from `grep -r password ~`. This module re-reads the raw
 command (via write_targets.analyze) and resolves the real paths:
 
   * output redirect to a credential path          -> DENY
-  * output redirect outside cwd, cwd roots, /tmp  -> APPROVE_ONCE
+  * output redirect outside cwd / its git repo / /tmp -> APPROVE_ONCE
   * grep/rg/ag on a credential path               -> APPROVE_ONCE
   * recursive search rooted at $HOME, `/`, an ancestor of $HOME, or a directory
     that directly holds credential files          -> APPROVE_ONCE
@@ -29,6 +29,7 @@ from .monitor import is_credential_path
 from .normalizer import _resolve_abs, classify_path
 from .write_targets import CommandPaths, _join_base, analyze
 
+_TMP_ROOT = "/tmp"
 _SAFE_DEVICES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 _SEARCH_VERBS = frozenset({"grep", "egrep", "fgrep", "rgrep", "rg", "ag"})
 _ALWAYS_RECURSIVE = frozenset({"rg", "ag"})
@@ -49,13 +50,28 @@ def _candidates(path: str, cp: CommandPaths) -> list[str]:
     return [_join_base(b, path) for b in ["", *cp.bases]]
 
 
+def _repo_top(cwd_real: Path) -> Path | None:
+    """Nearest ancestor-or-self of cwd holding `.git`, never above a cwd root."""
+    roots = current_cwd_roots()
+    for d in (cwd_real, *cwd_real.parents):
+        if not any(d.is_relative_to(r) for r in roots):
+            return None
+        if (d / ".git").exists():
+            return d
+    return None
+
+
 def _inside_safe_area(abs_p: str, cwd: str) -> bool:
+    """cwd, its enclosing git repo (within the cwd roots) or /tmp. Other cwd roots
+    (~/.claude, a sibling repo) are deliberately NOT safe."""
     p = Path(abs_p)
-    if p.is_relative_to(os.path.realpath(cwd)):
+    cwd_real = Path(os.path.realpath(cwd))
+    if p.is_relative_to(cwd_real):
         return True
-    if abs_p == "/tmp" or abs_p.startswith("/tmp/"):
+    if abs_p == _TMP_ROOT or abs_p.startswith(_TMP_ROOT + "/"):
         return True
-    return any(p.is_relative_to(r) for r in current_cwd_roots())
+    top = _repo_top(cwd_real)
+    return top is not None and p.is_relative_to(top)
 
 
 def _redirect_tier(path: str, cwd: str, env: dict[str, str], home: str) -> Tier | None:
