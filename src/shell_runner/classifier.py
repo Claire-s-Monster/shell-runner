@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, replace
 
-from . import rules
+from . import path_guard, rules
 from .catalog import (
     T0_DENY,
     T1_AUTO_LOG,
@@ -390,15 +390,44 @@ def classify(
         decision_path=tuple(path),
     )
     deny = None if result.command_tier == Tier.DENY else _rules_deny_rule(verdict)
-    if deny is None:
+    if deny is not None:
+        rule, note = deny
+        result = replace(
+            result,
+            tier=Tier.DENY,
+            command_tier=Tier.DENY,
+            matched_rule=rule,
+            decision_path=(*result.decision_path, note),
+        )
+    return _apply_path_guard(result, command, cwd, env)
+
+
+def _apply_path_guard(
+    result: ClassificationResult, command: str, cwd: str, env: dict[str, str] | None
+) -> ClassificationResult:
+    """Tighten (never loosen) the tier for redirects / recursive search (issue #75)."""
+    finding = path_guard.evaluate(command, cwd, env)
+    if finding is None or PERMISSIVENESS[result.command_tier] <= PERMISSIVENESS[finding.tier]:
         return result
-    rule, note = deny
+    rule = Rule(
+        pattern=f"path_guard:{finding.category}",
+        tier=finding.tier,
+        category=finding.category,
+        source="manual",
+        reason=finding.reason,
+    )
+    tier = finding.tier
+    if PERMISSIVENESS[result.tier] < PERMISSIVENESS[tier]:
+        tier = result.tier
     return replace(
         result,
-        tier=Tier.DENY,
-        command_tier=Tier.DENY,
+        tier=tier,
+        command_tier=finding.tier,
         matched_rule=rule,
-        decision_path=(*result.decision_path, note),
+        decision_path=(
+            *result.decision_path,
+            f"path_guard: {finding.reason} -> {finding.tier.name}",
+        ),
     )
 
 
