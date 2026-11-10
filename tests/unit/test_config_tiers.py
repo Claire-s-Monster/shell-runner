@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from shell_runner import executor, rules
+from shell_runner import executor, rules, worktree_git
 from shell_runner.catalog import Tier
 from shell_runner.classifier import PERMISSIVENESS, ClassificationResult, classify
 
@@ -49,13 +49,17 @@ def lay(monkeypatch: pytest.MonkeyPatch) -> Iterator[Layout]:
     cache = Path.home() / ".cache"
     cache.mkdir(exist_ok=True)
     root = Path(os.path.realpath(tempfile.mkdtemp(prefix="sr-config-tiers-", dir=cache)))
-    home = root / "home"
+    home = root  # worktree roots must lie strictly inside $HOME
     repo = root / "proj" / "development"
     wts = root / "proj" / "worktrees"
-    for d in (home / ".ssh", repo / ".git", repo / "src", wts / "existing", root / "cfg"):
+    reg = repo / ".git" / "worktrees" / "existing"
+    for d in (home / ".ssh", reg, repo / "src", wts / "existing", root / "cfg"):
         d.mkdir(parents=True)
+    (reg / "gitdir").write_text(f"{wts / 'existing' / '.git'}\n")
     monkeypatch.setattr(executor, "_CWD_ROOTS", [root])
     monkeypatch.setenv(rules.CONFIG_DIR_ENV, str(root / "cfg"))
+    for var in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(var, raising=False)
     try:
         yield Layout(root, home, repo, wts)
     finally:
@@ -108,9 +112,7 @@ ADD_OK = [
     "git worktree add ../worktrees/feat",
     "git worktree add ../worktrees/feat -b feat/x",
     "git worktree add -b feat/x ../worktrees/feat origin/development",
-    "git worktree add -B feat/x ../worktrees/feat",
     "git worktree add --detach ../worktrees/feat HEAD",
-    "git worktree add ../worktrees/feat/nested",
     "git worktree add ./../worktrees/./feat",
     "git worktree add .claude/worktrees/agent-1",
     "git worktree add -q --no-checkout ../worktrees/feat",
@@ -137,7 +139,9 @@ def test_worktree_absolute_target_inside_root_is_t2(lay: Layout) -> None:
 
 def test_worktree_from_repo_subdir_and_from_a_worktree(lay: Layout) -> None:
     assert lay.tier("git worktree add ../../worktrees/x", cwd=lay.repo / "src") == T2
-    (lay.worktrees / "existing" / ".git").write_text("gitdir: x\n")
+    priv = lay.repo / ".git" / "worktrees" / "existing"
+    (priv / "commondir").write_text("../..\n")
+    (lay.worktrees / "existing" / ".git").write_text(f"gitdir: {priv}\n")
     assert lay.tier("git worktree add ../sibling", cwd=lay.worktrees / "existing") == T2
     assert lay.tier("git worktree add ../../elsewhere", cwd=lay.worktrees / "existing") == T3
 
@@ -227,6 +231,26 @@ ADD_BAD = [
     "git worktree move ../worktrees/a ../worktrees/b",
     "git worktree lock ../worktrees/existing",
     "git worktree repair",
+    # -B resets an existing branch
+    "git worktree add -B feat/x ../worktrees/feat",
+    # nested: must be a direct child of the allowed root
+    "git worktree add ../worktrees/feat/nested",
+    "git worktree add .claude/worktrees/a/b",
+    "git worktree remove ../worktrees/existing/sub",
+    # hooks / env / global options that could change hook behaviour
+    "git -c core.hooksPath=x worktree add ../worktrees/feat",
+    "git -c core.hooksPath=/tmp/h worktree add ../worktrees/feat",
+    "git --git-dir=/x/.git worktree add ../worktrees/feat",
+    "git --git-dir=/x/.git worktree remove ../worktrees/existing",
+    "GIT_DIR=/x git worktree add ../worktrees/feat",
+    "GIT_COMMON_DIR=/x git worktree add ../worktrees/feat",
+    "GIT_CONFIG_COUNT=1 git worktree add ../worktrees/feat",
+    "GIT_CONFIG_GLOBAL=/x git worktree add ../worktrees/feat",
+    "env GIT_DIR=/x git worktree add ../worktrees/feat",
+    "git worktree add ../worktrees/feat $GIT_DIR",
+    # remove of an unregistered path / bare suffix names
+    "git worktree remove ../worktrees/unregistered",
+    "git worktree remove existing",
 ]
 
 
@@ -293,6 +317,204 @@ def test_worktree_t2_does_not_touch_approval_templates(lay: Layout) -> None:
     assert ok.path_guarded
     assert bad.path_guarded
     assert bad.command_tier == T3
+
+
+# ---------------------------------------------------------------------------
+# 2b. hardening: hooks, -B, remove suffix match, direct child, repo root
+# ---------------------------------------------------------------------------
+
+ADD = "git worktree add ../worktrees/feat"
+
+
+def _hook(lay: Layout) -> Path:
+    hooks = lay.repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    return hooks / "post-checkout"
+
+
+def test_worktree_add_without_hook_or_config_is_t2(lay: Layout) -> None:
+    assert lay.tier(ADD) == T2
+    assert lay.tier("git worktree add -b feat/x ../worktrees/feat") == T2
+
+
+def test_worktree_add_with_post_checkout_hook_stays_t3(lay: Layout) -> None:
+    hook = _hook(lay)
+    hook.write_text("#!/bin/sh\necho pwned\n")
+    assert lay.tier(ADD) == T3  # non-executable counts as present
+    hook.chmod(0o755)
+    assert lay.tier(ADD) == T3
+    # remove runs no post-checkout hook
+    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+
+
+def test_worktree_add_with_dangling_symlink_hook_stays_t3(lay: Layout) -> None:
+    _hook(lay).symlink_to(lay.root / "nonexistent")
+    assert lay.tier(ADD) == T3
+
+
+def test_worktree_add_hook_planted_through_the_runner_is_caught(lay: Layout) -> None:
+    # the escalation: write the hook, chmod it, then worktree add
+    assert lay.tier(ADD) == T2
+    _hook(lay).write_text("x")
+    assert lay.tier(ADD) == T3
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        ".git/config",
+        ".git/config.worktree",
+        ".gitconfig",
+        ".config/git/config",
+    ],
+)
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[core]\n\thooksPath = /evil\n",
+        "[core]\n\thookspath=/evil\n",
+        "[CORE]\n\tHOOKSPATH = x\n",
+        "[include]\n\tpath = /x\n",
+        '[includeIf "gitdir:~/"]\n\tpath = /x\n',
+        "[ include ]\n\tpath = /x\n",
+    ],
+)
+def test_worktree_add_hookspath_or_include_in_any_config_stays_t3(
+    lay: Layout, where: str, content: str
+) -> None:
+    base = lay.repo if where.startswith(".git/") else lay.home
+    target = base / where
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    assert lay.tier(ADD) == T3
+    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+
+
+def test_worktree_add_with_harmless_config_is_t2(lay: Layout) -> None:
+    (lay.repo / ".git" / "config").write_text("[core]\n\tbare = false\n[user]\n\tname = x\n")
+    (lay.home / ".gitconfig").write_text("[user]\n\temail = a@b\n")
+    assert lay.tier(ADD) == T2
+
+
+def test_worktree_add_xdg_config_home_is_honoured(
+    lay: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    xdg = lay.root / "xdg"
+    (xdg / "git").mkdir(parents=True)
+    (xdg / "git" / "config").write_text("[core]\nhooksPath = x\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    assert lay.tier(ADD) == T3
+
+
+def test_worktree_add_unreadable_config_stays_t3(lay: Layout) -> None:
+    (lay.repo / ".git" / "config").mkdir()  # a directory: read error, not "missing"
+    assert lay.tier(ADD) == T3
+
+
+@pytest.mark.parametrize("var", ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL"])
+def test_worktree_add_git_env_in_server_environment_stays_t3(
+    lay: Layout, monkeypatch: pytest.MonkeyPatch, var: str
+) -> None:
+    monkeypatch.setenv(var, "/x")
+    assert lay.tier(ADD) == T3
+
+
+def test_worktree_add_from_linked_worktree_follows_commondir(lay: Layout) -> None:
+    priv = lay.repo / ".git" / "worktrees" / "existing"
+    (priv / "commondir").write_text("../..\n")
+    (lay.worktrees / "existing" / ".git").write_text(f"gitdir: {priv}\n")
+    wt = lay.worktrees / "existing"
+    assert lay.tier("git worktree add ../sibling", cwd=wt) == T2
+    hooks = lay.repo / ".git" / "hooks"
+    hooks.mkdir()
+    (hooks / "post-checkout").write_text("x")  # hook lives in the COMMON dir
+    assert lay.tier("git worktree add ../sibling", cwd=wt) == T3
+    (hooks / "post-checkout").unlink()
+    (priv / "config.worktree").write_text("[core]\nhooksPath = x\n")
+    assert lay.tier("git worktree add ../sibling", cwd=wt) == T3
+
+
+def test_worktree_linked_checkout_with_bad_gitfile_stays_t3(lay: Layout) -> None:
+    (lay.worktrees / "existing" / ".git").write_text("garbage\n")
+    assert lay.tier("git worktree add ../sibling", cwd=lay.worktrees / "existing") == T3
+    (lay.worktrees / "existing" / ".git").write_text(f"gitdir: {lay.root}/missing\n")
+    assert lay.tier("git worktree add ../sibling", cwd=lay.worktrees / "existing") == T3
+
+
+def test_worktree_remove_requires_a_registered_worktree(lay: Layout) -> None:
+    (lay.worktrees / "stray").mkdir()
+    assert lay.tier("git worktree remove ../worktrees/stray") == T3
+    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+
+
+def test_worktree_remove_unreadable_registration_stays_t3(lay: Layout) -> None:
+    (lay.repo / ".git" / "worktrees" / "existing" / "gitdir").unlink()
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
+    (lay.repo / ".git" / "worktrees" / "existing" / "gitdir").write_text("\n")
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
+
+
+def test_worktree_remove_with_no_registrations_stays_t3(lay: Layout) -> None:
+    shutil.rmtree(lay.repo / ".git" / "worktrees")
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
+
+
+def test_remove_suffix_ambiguity_helper(lay: Layout) -> None:
+    other = lay.root / "work" / "worktrees" / "existing"
+    reg = lay.repo / ".git" / "worktrees" / "other"
+    reg.mkdir()
+    (reg / "gitdir").write_text(f"{other / '.git'}\n")
+    target = lay.worktrees / "existing"
+    cands = (str(target), str(target))
+    common = lay.repo / ".git"
+    # git would match `worktrees/existing` as a suffix of BOTH registered worktrees
+    assert not worktree_git.remove_target_unambiguous(common, "worktrees/existing", cands)
+    assert not worktree_git.remove_target_unambiguous(common, "existing", cands)
+    # a fully qualified argument is unambiguous
+    assert worktree_git.remove_target_unambiguous(common, str(target), cands)
+    assert worktree_git.remove_target_unambiguous(common, "../worktrees/existing", cands)
+    # not registered at all
+    assert not worktree_git.remove_target_unambiguous(common, "x", (str(lay.root / "nope"),) * 2)
+
+
+def test_worktree_target_must_be_direct_child_of_root(lay: Layout) -> None:
+    assert lay.tier("git worktree add ../worktrees/a") == T2
+    assert lay.tier("git worktree add ../worktrees/a/b") == T3
+    assert lay.tier("git worktree add .claude/worktrees/a") == T2
+    assert lay.tier("git worktree add .claude/worktrees/a/b") == T3
+
+
+def test_worktree_b_upper_keeps_tier_lower_b_is_t2(lay: Layout) -> None:
+    assert lay.tier("git worktree add -b x ../worktrees/a") == T2
+    assert lay.tier("git worktree add -B x ../worktrees/a") == T3
+    assert lay.tier("git worktree add ../worktrees/a -B x") == T3
+
+
+def test_worktree_repo_top_is_home_or_ancestor_stays_t3(lay: Layout) -> None:
+    home_repo = lay.root / "home_is_repo"
+    (home_repo / ".git").mkdir(parents=True)
+    env = {"HOME": str(home_repo)}
+    for cwd in (home_repo, home_repo / ".git"):
+        r = classify("git worktree add ../worktrees/a", str(cwd), AGENT, env=env)
+        assert PERMISSIVENESS[r.command_tier] <= PERMISSIVENESS[T3]
+    # repo top is an ancestor of $HOME
+    env = {"HOME": str(lay.repo / "src")}
+    r = classify(ADD, str(lay.repo), AGENT, env=env)
+    assert PERMISSIVENESS[r.command_tier] <= PERMISSIVENESS[T3]
+
+
+def test_worktree_roots_outside_home_stay_t3(lay: Layout) -> None:
+    # repo outside $HOME: its worktrees/ root is outside HOME's subtree
+    r = classify(ADD, str(lay.repo), AGENT, env={"HOME": str(lay.root / "elsewhere")})
+    assert PERMISSIVENESS[r.command_tier] <= PERMISSIVENESS[T3]
+
+
+def test_worktree_root_equal_to_home_stays_t3(lay: Layout) -> None:
+    # root <repo parent>/worktrees == $HOME
+    (lay.worktrees / "existing" / ".git").mkdir()
+    env = {"HOME": str(lay.worktrees)}
+    r = classify("git worktree add ../x", str(lay.worktrees / "existing"), AGENT, env=env)
+    assert PERMISSIVENESS[r.command_tier] <= PERMISSIVENESS[T3]
 
 
 # ---------------------------------------------------------------------------

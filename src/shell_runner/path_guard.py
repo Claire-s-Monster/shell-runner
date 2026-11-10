@@ -26,7 +26,7 @@ import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import exec_guard, rules
+from . import exec_guard, rules, worktree_git
 from .catalog import Tier
 from .executor import current_cwd_roots
 from .monitor import is_credential_path
@@ -435,7 +435,7 @@ def evaluate(
 # catalog tier, T3 or higher):
 #   * the whole command is exactly one plain `git worktree add|remove ...` (no `-C`,
 #     cd, env prefix, pipe, `;`/`&&`, redirect, variable, glob or substitution)
-#   * only these options: add -b/-B <branch>, --detach/-d, -q/--quiet, --checkout,
+#   * only these options: add -b <branch>, --detach/-d, -q/--quiet, --checkout,
 #     --no-checkout, --track, --no-track; remove takes none. Never --force/-f/--lock.
 #   * the target, resolved against the real cwd both lexically (`..` collapsed) and
 #     through symlinks, is a strict descendant of an allowed `worktrees/` root, which is
@@ -453,7 +453,7 @@ def evaluate(
 _WT_SAFE_FLAGS = frozenset(
     {"--detach", "-d", "-q", "--quiet", "--checkout", "--no-checkout", "--track", "--no-track"}
 )
-_WT_BRANCH_OPTS = frozenset({"-b", "-B"})
+_WT_BRANCH_OPTS = frozenset({"-b"})
 _WT_META_CHARS = frozenset("$`;&|<>()*?[]{}!~\\\n\r#")
 _WT_SYSTEM_PREFIXES = (
     "/etc",
@@ -472,6 +472,7 @@ _WT_SYSTEM_PREFIXES = (
 )
 
 
+<<<<<<< HEAD
 def _plain_words(command: str) -> list[str] | None:
     """Words of `command` when, after the shared shellprep preprocessing, it is exactly one
     simple command with no redirect (so no cd, env prefix, pipe, list or hidden substitution)."""
@@ -484,8 +485,9 @@ def _plain_words(command: str) -> list[str] | None:
     return segments[0][0]
 
 
-def _worktree_target(command: str) -> str | None:
-    """Target path of a plain `git worktree add|remove` using only safe options."""
+def _worktree_target(command: str) -> tuple[str, str] | None:
+    """(subcommand, target path) of a plain `git worktree add|remove` using only safe
+    options; `-b <branch>` only (`-B` resets an existing branch, so it keeps its tier)."""
     tokens = _plain_words(command)
     if tokens is None:
         return None
@@ -512,17 +514,15 @@ def _worktree_target(command: str) -> str | None:
         i += 1
     if not 1 <= len(positional) <= (2 if sub == "add" else 1):
         return None
-    return positional[0]
+    return sub, positional[0]
 
 
-def _worktree_roots(cwd_real: Path) -> list[Path]:
-    top = _repo_top(cwd_real)
-    if top is None:
-        return []
+def _worktree_roots(top: Path, home_real: Path) -> list[Path]:
+    """Allowed worktrees/ roots for repo `top`, only those strictly inside $HOME."""
     roots = [top.parent / "worktrees", top / ".claude" / "worktrees"]
     if top.parent.name == "worktrees":
         roots.append(top.parent)
-    return roots
+    return [r for r in roots if r != home_real and r.is_relative_to(home_real)]
 
 
 def _worktree_path_ok(
@@ -533,24 +533,36 @@ def _worktree_path_ok(
     if classify_path(path, cwd, env) in ("<cred_path>", "<etc_path>", "<system_path>"):
         return False
     p = Path(path)
-    if not any(p != r and p.is_relative_to(r) for r in roots):
+    if p.parent not in roots:  # direct child of an allowed root, no nesting
         return False
     verdict = rules.evaluate(f"touch {shlex.quote(path)}", cwd)
     return verdict.config_error is None and not verdict.matches
 
 
 def worktree_target_allowed(command: str, cwd: str, env: dict[str, str] | None = None) -> bool:
-    """True iff `command` is a plain `git worktree add|remove` passing the path check."""
+    """True iff `command` is a plain `git worktree add|remove` passing every check:
+    direct child of an allowed root, repo top not $HOME/ancestor, no post-checkout hook
+    possible (add), unambiguous registered worktree (remove). Fail closed on any doubt."""
     env = env or {}
     home = env.get("HOME", os.path.expanduser("~"))
-    target = _worktree_target(command)
-    if target is None:
+    parsed = _worktree_target(command)
+    if parsed is None:
         return False
+    sub, target = parsed
     cwd_real = os.path.realpath(cwd)
-    roots = _worktree_roots(Path(cwd_real))
+    top = _repo_top(Path(cwd_real))
+    home_real = Path(os.path.realpath(home))
+    if top is None or top == home_real or top in home_real.parents:
+        return False
+    roots = _worktree_roots(top, home_real)
     joined = os.path.join(cwd_real, target)
     candidates = (os.path.normpath(joined), os.path.realpath(joined))
-    return all(_worktree_path_ok(c, roots, cwd_real, env, home) for c in candidates)
+    if not all(_worktree_path_ok(c, roots, cwd_real, env, home) for c in candidates):
+        return False
+    if sub == "add":
+        return not worktree_git.post_checkout_hook_possible(top, home, env)
+    dirs = worktree_git.git_dirs(top)
+    return dirs is not None and worktree_git.remove_target_unambiguous(dirs[1], target, candidates)
 
 
 def _worktree_finding(
