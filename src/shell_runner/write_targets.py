@@ -34,6 +34,7 @@ class CommandPaths:
     redirects: list[str] = field(default_factory=list)  # output redirect targets only
     options: list[str] = field(default_factory=list)  # option words (before `--`)
     args: list[str] = field(default_factory=list)  # every non-option argument
+    words: list[str] = field(default_factory=list)  # every argument word, in order
     inline_code: list[str] = field(default_factory=list)  # -c/-e one-liner texts
     # Extra directories (relative to the evaluation cwd, or absolute) that
     # relative paths may resolve against: earlier cd/pushd targets and git -C.
@@ -239,7 +240,29 @@ def _track_cd(verb: str, args: list[str], bases: list[str], cp: CommandPaths) ->
     return _extend_bases(bases, target)
 
 
+def _git_output_files(args: list[str]) -> list[str]:
+    """Targets of `--output=F` / `--output F` (git accepts unique prefixes, `--ou`...)."""
+    out: list[str] = []
+    for i, a in enumerate(args):
+        if a == "--":
+            break
+        if not a.startswith("--"):
+            continue
+        name, eq, value = a.partition("=")
+        if len(name) < 4 or not "--output".startswith(name):
+            continue
+        if eq:
+            out.append(value)
+        elif i + 1 < len(args):
+            out.append(args[i + 1])
+    return out
+
+
 def _git_writes(sub: str, args: list[str]) -> list[str]:
+    return _git_output_files(args) + _git_sub_writes(sub, args)
+
+
+def _git_sub_writes(sub: str, args: list[str]) -> list[str]:
     if sub == "apply":
         directory = [
             args[i + 1] for i, a in enumerate(args) if a == "--directory" and i + 1 < len(args)
@@ -317,6 +340,7 @@ def analyze(command: str) -> list[CommandPaths]:
             verb = words[0].rsplit("/", 1)[-1]
             args = words[1:]
             cp.verb = verb
+            cp.words = list(args)
             if verb in ("cd", "pushd"):
                 cd_bases = _track_cd(verb, args, cd_bases, cp)
             elif verb == "git":

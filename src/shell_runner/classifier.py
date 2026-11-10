@@ -475,7 +475,7 @@ def _apply_path_guard(
         return result
     # Marked even when the catalog was already as strict: persisted approvals key on
     # the shared template and must never lower a guarded command.
-    result = replace(result, path_guarded=True)
+    result = replace(result, path_guarded=result.path_guarded or finding.guarded)
     if finding.git_matches:
         result = replace(
             result,

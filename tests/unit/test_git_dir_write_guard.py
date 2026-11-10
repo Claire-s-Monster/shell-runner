@@ -14,7 +14,7 @@ import pytest
 
 from shell_runner import executor, path_guard
 from shell_runner.catalog import Tier
-from shell_runner.classifier import _classify_catalog, classify
+from shell_runner.classifier import PERMISSIVENESS, _classify_catalog, classify
 from shell_runner.write_targets import analyze
 
 AGENT = "some-agent"
@@ -252,7 +252,7 @@ def test_dynamic_targets_fall_back_not_lower(repo: Path) -> None:
     ):
         cls = _cls(command, repo)
         was = _classify_catalog(command, str(repo), AGENT).command_tier
-        assert cls.command_tier == was, command
+        assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[was], command
 
 
 def test_resolution_failure_is_skipped_not_raised(repo: Path) -> None:
@@ -289,6 +289,134 @@ def test_credential_deny_still_wins(repo: Path) -> None:
         env={"HOME": "/home/t"},
     )
     assert cls.command_tier == Tier.DENY
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git log --output=.git/config",
+        "git show --output .git/hooks/pre-commit HEAD",
+        "git diff --output=.git/config",
+        "git diff --outp=.git/config",
+        "git log --oneline --output=.git/config -5",
+    ],
+)
+def test_git_output_option_is_a_write_target(repo: Path, command: str) -> None:
+    _assert_guarded(command, repo)
+
+
+def test_git_output_target_is_extracted() -> None:
+    assert "out.txt" in analyze("git log --output=out.txt")[0].writes
+    assert "out.txt" in analyze("git show --output out.txt HEAD")[0].writes
+    assert analyze("git log --oneline -5")[0].writes == []
+
+
+@pytest.fixture
+def bare(tmp_path: Path) -> Path:
+    root = (tmp_path / "bare").resolve()
+    (root / "objects").mkdir(parents=True)
+    (root / "refs").mkdir()
+    (root / "hooks").mkdir()
+    (root / "HEAD").write_text("ref: refs/heads/main\n")
+    return root
+
+
+def test_bare_repo_targets_and_cwd(bare: Path) -> None:
+    _assert_guarded("echo x >> config", bare)
+    _assert_guarded("echo x > hooks/pre-receive", bare)
+    _assert_guarded("echo x >> ../config", bare / "hooks")
+    _assert_guarded(f"echo x >> {bare}/config", bare.parent)
+    _assert_guarded(f"echo x > {bare}/hooks/post-receive", bare.parent)
+    _assert_guarded("cp x bare/hooks/h", bare.parent)
+
+
+def test_partial_signature_is_not_a_git_dir(tmp_path: Path) -> None:
+    d = (tmp_path / "partial").resolve()
+    (d / "objects").mkdir(parents=True)
+    (d / "HEAD").write_text("x")  # no refs/
+    cls = _cls("echo x > config", d)
+    assert not cls.flagged
+    assert not cls.path_guarded
+
+
+UNRESOLVED = [
+    "echo x > $TMPDIR/f",
+    "echo x > $HOME/notes.txt",
+    "echo x > out-*.txt",
+    "echo x > f{1,2}",
+    "echo x > f?",
+    "echo x > f[12]",
+    "echo x > `pwd`/f",
+    "touch $D/a",
+    "mkdir -p $TMPDIR/x",
+    "cp a $D/b",
+    "mv a $D/b",
+    "ln -s a $L/x",
+    "dd if=a of=$TMPDIR/o",
+    "sed -i s/a/b/ $D/f",
+    "truncate -s 0 $D/f",
+    "echo x | tee -a $D/f",
+]
+# the whole path is an expansion: it could spell a `.git` path, so it is also guarded
+UNRESOLVED_WHOLE = [
+    "echo x >> $OUT",
+    "tee $F",
+    "dd if=a of=$O",
+    "sed -i s/a/b/ $F",
+    "truncate -s 0 $F",
+    "echo x > $(mktemp)",
+]
+
+
+@pytest.mark.parametrize("command", UNRESOLVED)
+def test_unresolvable_write_target_is_at_least_t3(repo: Path, command: str) -> None:
+    cls = _cls(command, repo)
+    assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3], command
+    assert not cls.path_guarded, command  # approvals may still apply
+
+
+@pytest.mark.parametrize("command", UNRESOLVED_WHOLE)
+def test_whole_expansion_target_is_at_least_t3(repo: Path, command: str) -> None:
+    cls = _cls(command, repo)
+    assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3], command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["echo x > $TMPDIR/f", "echo x > out-*.txt", "echo x > `pwd`/f", "echo x >> $OUT"],
+)
+def test_unresolvable_echo_redirect_was_auto_and_is_now_t3(repo: Path, command: str) -> None:
+    was = _classify_catalog(command, str(repo), AGENT).command_tier
+    assert PERMISSIVENESS[was] > PERMISSIVENESS[T3]
+    assert _cls(command, repo).command_tier == T3
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x > .git/c*",
+        "echo x > .g*/config",
+        "echo x > .gi?/config",
+        "echo x > ./$D/../.git/config",
+        "echo x > *git/config",
+        "echo x > sub/$D/config",
+    ],
+)
+def test_unresolvable_target_that_could_match_dot_git_is_guarded(repo: Path, command: str) -> None:
+    cls = _cls(command, repo)
+    assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3]
+    assert cls.path_guarded, command
+    assert cls.flagged, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["echo x > notes.txt", "echo x > /dev/null", "echo x 2>&1", "cat $F", "ls $D"],
+)
+def test_dynamic_reads_and_plain_writes_are_not_newly_raised(repo: Path, command: str) -> None:
+    cls = _cls(command, repo)
+    was = _classify_catalog(command, str(repo), AGENT).command_tier
+    assert cls.command_tier == was
 
 
 def test_realpath_vs_normpath_both_checked(repo: Path) -> None:
