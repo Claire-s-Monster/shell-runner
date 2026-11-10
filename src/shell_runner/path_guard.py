@@ -336,13 +336,63 @@ def _git_dir_matches(cp: CommandPaths, cwd: str, home: str) -> list[PathMatch]:
     return found
 
 
-def evaluate(command: str, cwd: str, env: dict[str, str] | None = None) -> GuardFinding | None:
-    """Most restrictive finding for `command`, or None when nothing is flagged."""
+def _bare_repo_finding(cp: CommandPaths, cwd: str) -> GuardFinding | None:
+    """git run where its repo dir (cwd, after cd / `git -C` bases) has no `.git` component
+    but sits inside a structural git dir (HEAD + objects/ + refs/): git can discover it as
+    a bare repo and run config planted before the structure existed. Every subcommand is
+    guarded T3 (narrow: agents rarely work in bare repos)."""
+    if cp.verb != "git":
+        return None
+    cwd_real = os.path.realpath(cwd)
+    for base in dict.fromkeys(
+        os.path.join(cwd_real, b) if b else cwd_real for b in ["", *cp.bases]
+    ):
+        for repo_dir in (os.path.normpath(base), os.path.realpath(base)):
+            p = Path(repo_dir)
+            if ".git" not in p.parts and any(_is_git_structure(a) for a in (p, *p.parents)):
+                return GuardFinding(
+                    Tier.APPROVE_ONCE,
+                    "git_in_bare_repo",
+                    f"git run inside a bare/structural git directory ({repo_dir})",
+                )
+    return None
+
+
+def _unparseable_finding(cps: list[CommandPaths], segment_count: int | None) -> GuardFinding | None:
+    """The command could not be tokenized, or write_targets and the normalizer disagree on
+    how many commands it holds: neither view can be trusted (fail closed, approval-proof)."""
+    if any(cp.unparseable for cp in cps):
+        reason = "command could not be parsed (unbalanced quote/heredoc)"
+    elif segment_count is not None and len(cps) != segment_count:
+        reason = f"segment count mismatch ({len(cps)} vs {segment_count} in the normalizer)"
+    else:
+        return None
+    return GuardFinding(Tier.APPROVE_ONCE, "unparseable", reason)
+
+
+def evaluate(
+    command: str,
+    cwd: str,
+    env: dict[str, str] | None = None,
+    *,
+    segment_count: int | None = None,
+    folded_command: str | None = None,
+) -> GuardFinding | None:
+    """Most restrictive finding for `command`, or None when nothing is flagged.
+
+    `segment_count` is the number of simple commands the normalizer found, in
+    `folded_command` when it folded a leading `cd DIR &&` away; a mismatch with
+    write_targets' count is an `unparseable` finding."""
     env = env or {}
     home = env.get("HOME", os.path.expanduser("~"))
     findings: list[GuardFinding] = []
     git_matches: list[PathMatch] = []
-    for cp in analyze(command):
+    cps = analyze(command)
+    counted = analyze(folded_command) if folded_command else cps
+    unparseable = _unparseable_finding(counted, segment_count)
+    if unparseable is not None:
+        findings.append(unparseable)
+    for cp in cps:
         git_matches += _git_dir_matches(cp, cwd, home)
         findings += [
             f
@@ -351,6 +401,7 @@ def evaluate(command: str, cwd: str, env: dict[str, str] | None = None) -> Guard
                 _search_finding(cp, cwd, env, home),
                 _unresolved_finding(cp),
                 _exec_finding(cp),
+                _bare_repo_finding(cp, cwd),
             )
             if f is not None
         ]

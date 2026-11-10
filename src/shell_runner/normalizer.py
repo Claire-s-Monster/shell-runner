@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 from .executor import current_cwd_roots, trusted_bin_dirs
 from .monitor import is_credential_path
+from .shellprep import SENTINEL_PREFIX, prepare
 
 # ---------------------------------------------------------------------------
 # Default safe domains for URL classification
@@ -562,69 +563,6 @@ def _classify_token(
 
 
 # ---------------------------------------------------------------------------
-# Heredoc pre-processing
-# ---------------------------------------------------------------------------
-
-# Linear-time heredoc detection: scan line by line without DOTALL .*? backtracking.
-# _HEREDOC_OPEN_RE matches the opening line of a heredoc or here-string.
-# All alternatives use anchored or negated-class patterns — no backtracking.
-_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*(\w+)")  # captures delimiter word
-
-
-def _preprocess_heredocs(cmd: str, state: _NormState, sentinel_map: dict[str, str]) -> str:
-    """Replace heredoc/here-string constructs with shlex-safe sentinels.
-
-    Uses a line-by-line scanner instead of a DOTALL regex to guarantee O(n)
-    time on all inputs, including adversarial ones.
-    """
-    existing_ids = (int(k.split("_")[-1]) for k in sentinel_map if k.startswith(_SENTINEL_PREFIX))
-    counter = [max(existing_ids, default=-1) + 1]
-
-    def _next_sentinel() -> str:
-        s = f"{_SENTINEL_PREFIX}{counter[0]}"
-        counter[0] += 1
-        return s
-
-    lines = cmd.split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        # Here-string: <<< value  (single-line, no closing delimiter needed)
-        if "<<<" in line:
-            idx = line.index("<<<")
-            sentinel = _next_sentinel()
-            sentinel_map[sentinel] = "<heredoc>"
-            out.append(line[:idx] + sentinel)
-            i += 1
-            continue
-        # Heredoc: <<[-]WORD on this line; body follows until a line == WORD
-        m = _HEREDOC_OPEN_RE.search(line)
-        if m is not None:
-            delimiter = m.group(1)
-            # Consume body lines until closing delimiter
-            j = i + 1
-            while j < len(lines) and lines[j].strip() != delimiter:
-                j += 1
-            # Replace the entire heredoc span with a single sentinel
-            sentinel = _next_sentinel()
-            sentinel_map[sentinel] = "<heredoc>"
-            prefix = line[: m.start()]
-            out.append(prefix + sentinel)
-            if j < len(lines):
-                # Skip body + closing delimiter line; continue after it
-                i = j + 1
-            else:
-                state.warn("unterminated_heredoc")
-                i = j  # consumed to end of input
-            continue
-        out.append(line)
-        i += 1
-
-    return "\n".join(out)
-
-
-# ---------------------------------------------------------------------------
 # Process substitution pre-processing
 # ---------------------------------------------------------------------------
 
@@ -985,7 +923,7 @@ _BACKTICK_RE = re.compile(r"`[^`]*`")  # `cmd`
 _BRACE_VAR_RE = re.compile(r"\$\{\w+\}")  # ${VAR}
 _SIMPLE_VAR_RE = re.compile(r"\$\w+")  # $VAR
 
-_SENTINEL_PREFIX = "__TKSENTINEL_"
+_SENTINEL_PREFIX = SENTINEL_PREFIX
 
 # Ordered tuple for sequential regex application (URLs handled separately below).
 _TOKEN_PROTECT_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -1117,9 +1055,12 @@ def _normalize_internal(
     # Step 1: Pre-processing
     # -------------------------------------------------------------------------
 
-    # Collapse line continuations
-    cmd = re.sub(r"\\\n", " ", command)
-    cmd = cmd.strip()
+    # Shared preprocessing (also used by write_targets): line continuations (bash joins
+    # them with no space), comments, ANSI-C quotes, heredoc bodies, newline separators.
+    prepared = prepare(command, keep_heredoc_tail=False)
+    for warning in prepared.warnings:
+        state.warn(warning)
+    cmd = prepared.text
 
     # Detect bash function definition syntax (e.g. forkbomb :(){ :|:& };:).
     # These contain { } and are not parseable as normal commands; return raw
@@ -1144,10 +1085,8 @@ def _normalize_internal(
 
     # Shared sentinel map: all pre-processing steps register sentinels here.
     # After tokenization the sentinels are restored to their full forms.
-    sentinel_map: dict[str, str] = {}
-
-    # Detect and replace heredocs with shlex-safe sentinels
-    cmd = _preprocess_heredocs(cmd, state, sentinel_map)
+    # Heredoc sentinels were already registered by the shared preprocessing.
+    sentinel_map: dict[str, str] = dict(prepared.sentinels)
 
     # Detect and replace process substitutions with shlex-safe sentinels
     cmd = _preprocess_process_subst(cmd, cwd, env, safe_domains, state, depth, sentinel_map)
@@ -1162,6 +1101,8 @@ def _normalize_internal(
     # -------------------------------------------------------------------------
 
     try:
+        if not prepared.ok:
+            raise ValueError("unterminated quote")
         # posix=False preserves quote characters in tokens so we can detect
         # quoted strings in _classify_token (e.g. 'foo bar' stays as one token
         # with quotes intact → <arg>). With posix=True shlex strips quotes,

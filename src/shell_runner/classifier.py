@@ -191,6 +191,8 @@ class ClassificationResult:
     # some segment matched a non-promotable (inline code) rule: persisted approvals
     # must not lower it and reusable approval decisions degrade to one-shot
     non_promotable: bool = False
+    # the command left after folding a leading `cd DIR &&` (what `segments` describes)
+    folded_command: str | None = None
 
     @property
     def protected_path_json(self) -> str | None:
@@ -470,7 +472,13 @@ def _apply_path_guard(
     result: ClassificationResult, command: str, cwd: str, env: dict[str, str] | None
 ) -> ClassificationResult:
     """Tighten (never loosen) the tier for redirects / recursive search (issue #75)."""
-    finding = path_guard.evaluate(command, cwd, env)
+    finding = path_guard.evaluate(
+        command,
+        cwd,
+        env,
+        segment_count=len(result.segments),
+        folded_command=result.folded_command,
+    )
     if finding is None:
         return result
     # Marked even when the catalog was already as strict: persisted approvals key on
@@ -608,4 +616,5 @@ def _classify_catalog(
             s.matched_rule is not None and not s.matched_rule.promotable
             for s in seg_classifications
         ),
+        folded_command=normalized.folded_command,
     )
