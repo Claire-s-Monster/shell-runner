@@ -58,8 +58,14 @@ def lay(monkeypatch: pytest.MonkeyPatch) -> Iterator[Layout]:
     (reg / "gitdir").write_text(f"{wts / 'existing' / '.git'}\n")
     monkeypatch.setattr(executor, "_CWD_ROOTS", [root])
     monkeypatch.setenv(rules.CONFIG_DIR_ENV, str(root / "cfg"))
-    for var in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "XDG_CONFIG_HOME"):
+    # isolate from the host: HOME/XDG in tmp, a nonexistent system gitconfig, no GIT_* env
+    for var in [k for k in os.environ if k.startswith("GIT_CONFIG")]:
+        monkeypatch.delenv(var)
+    for var in ("GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root / ".config"))
+    monkeypatch.setattr(worktree_git, "SYSTEM_GITCONFIG", root / "no-such-system-gitconfig")
     try:
         yield Layout(root, home, repo, wts)
     finally:
@@ -404,6 +410,15 @@ def test_worktree_add_xdg_config_home_is_honoured(
     (xdg / "git" / "config").write_text("[core]\nhooksPath = x\n")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
     assert lay.tier(ADD) == T3
+
+
+@pytest.mark.parametrize(
+    "content", ["[core]\nhooksPath = x\n", "[include]\npath = /x\n", '[includeIf "gitdir:/"]\n']
+)
+def test_worktree_add_system_gitconfig_stays_t3(lay: Layout, content: str) -> None:
+    worktree_git.SYSTEM_GITCONFIG.write_text(content)
+    assert lay.tier(ADD) == T3
+    assert lay.tier("git worktree remove ../worktrees/existing") == T2
 
 
 def test_worktree_add_unreadable_config_stays_t3(lay: Layout) -> None:

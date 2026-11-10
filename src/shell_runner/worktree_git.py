@@ -13,6 +13,9 @@ from pathlib import Path
 
 _INCLUDE_RE = re.compile(r"\[\s*include")
 
+# Patched by tests only; deliberately not configurable from the environment.
+SYSTEM_GITCONFIG = Path("/etc/gitconfig")
+
 
 def git_dirs(top: Path) -> tuple[Path, Path] | None:
     """(private gitdir, common dir) of the checkout rooted at `top`, or None.
@@ -81,7 +84,7 @@ def post_checkout_hook_possible(top: Path, home: str, env: dict[str, str]) -> bo
             priv / "config.worktree",
             Path(home) / ".gitconfig",
             Path(xdg) / "git" / "config",
-            Path("/etc/gitconfig"),
+            SYSTEM_GITCONFIG,
         ]
     )
 
