@@ -190,6 +190,18 @@ log|show|diff ... --output=F` (or `--output F`, or a unique prefix such as
 unchanged. Not covered: `.gitattributes` (outside `.git`), inline interpreter
 code, and `git config` itself.
 
+**One preprocessing for every detector** (`shellprep.py`). The normalizer and the guards
+(`write_targets`) read the same text: backslash-newline is joined as bash does (no space; literal
+inside single quotes), comments end at the newline, `$'..'` is decoded (so `sys\x74em` reads
+`system`), heredoc/here-string openers outside quotes become a sentinel and their bodies are
+dropped, and a newline outside quotes is a command separator (`a\nb` is two commands; a
+newline inside quotes stays data for multi-line sed/awk scripts). There is no whitespace-split
+fallback: a command that cannot be tokenized, or whose command count differs between the two
+views, is a guarded T3 (`path_guard:unparseable`). Also guarded T3: `git` run where the repo
+dir has no `.git` component but sits inside a `HEAD`+`objects/`+`refs/` directory
+(`git_in_bare_repo`), `git --exec-path|--super-prefix|--list-cmds|-p|--paginate`, and every
+awk `-W` option.
+
 **awk, sed and git argument guard** ([#85](https://github.com/Claire-s-Monster/shell-runner/issues/85),
 `exec_guard.py`; raw words, because the normalizer collapses scripts to `<arg>`;
 raw words, because the normalizer collapses scripts to `<arg>`). Approval-proofing

@@ -49,7 +49,9 @@ def _prefix_of(name: str, options: tuple[str, ...], *, min_len: int = 3) -> bool
 
 _AWK_VERBS = frozenset({"awk", "gawk", "mawk", "nawk"})
 _AWK_HAZARD_LONG = ("--file", "--include", "--load", "--exec")
-_AWK_HAZARD_SHORT = frozenset("filE")
+# -W is the mawk/gawk long-option form (`-W exec FILE`, `-W source=..`, `-Wfile=..`): every
+# -W is guarded, recognised or not, and its value is never read as the program text.
+_AWK_HAZARD_SHORT = frozenset("filEW")
 _AWK_SYSTEM_RE = re.compile(r"(?<![A-Za-z0-9_])system(?![A-Za-z0-9_])")
 _AWK_HAZARD_TEXT = ("system", "getline", "close", "fflush", "|", ">", "@")
 
@@ -404,6 +406,9 @@ _GIT_HAZARD_LONG = (
     "--work-tree",
     "--namespace",
 )
+# Global options git matches exactly (no abbreviations); `--list` is a different option
+# of branch/tag, so these must not be prefix-matched.
+_GIT_HAZARD_EXACT = frozenset({"--exec-path", "--super-prefix", "--list-cmds"})
 _GIT_U_SUBCOMMANDS = frozenset({"fetch", "ls-remote"})
 _GIT_REF_SUBCOMMANDS = frozenset({"branch", "tag"})  # -c/-C/-u are ref operations there
 _GIT_REF_WRITE_LONG = (
@@ -432,7 +437,11 @@ def _git_subcommand_index(words: list[str]) -> int:
 def _git_hazard_option(word: str, *, in_global: bool, sub: str) -> str | None:
     if word.startswith("--"):
         name = word.partition("=")[0]
+        if name in _GIT_HAZARD_EXACT or (in_global and name == "--paginate"):
+            return name
         return name if _prefix_of(name, _GIT_HAZARD_LONG) else None
+    if in_global and word == "-p":
+        return word  # -p/--paginate: the pager comes from config (a global option only)
     if in_global and word.startswith("-c"):
         return "-c"
     if word == "-c" and sub not in _GIT_REF_SUBCOMMANDS:
@@ -477,8 +486,9 @@ def _git_ref_write(rest: list[str]) -> bool:
 
 
 def _git_stash_safe(rest: list[str]) -> bool:
-    action = next((w for w in rest if not w.startswith("-")), "")
-    return action in _GIT_STASH_READ
+    """git takes the stash subcommand from the FIRST word only; leading options (or
+    nothing) mean `stash push`, so `stash -m list` and `stash -- show` are pushes."""
+    return bool(rest) and rest[0] in _GIT_STASH_READ
 
 
 def _git(words: list[str]) -> Verdict | None:

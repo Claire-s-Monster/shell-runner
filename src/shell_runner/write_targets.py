@@ -15,6 +15,8 @@ import re
 import shlex
 from dataclasses import dataclass, field
 
+from .shellprep import prepare
+
 _PUNCT = frozenset("();<>|&")
 _WRAPPERS = frozenset({"env", "nohup", "time", "command", "exec", "nice", "sudo", "doas"})
 _ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
@@ -35,6 +37,8 @@ class CommandPaths:
     options: list[str] = field(default_factory=list)  # option words (before `--`)
     args: list[str] = field(default_factory=list)  # every non-option argument
     words: list[str] = field(default_factory=list)  # every argument word, in order
+    # the command could not be tokenized: no segment information is trustworthy
+    unparseable: bool = False
     inline_code: list[str] = field(default_factory=list)  # -c/-e one-liner texts
     # Extra directories (relative to the evaluation cwd, or absolute) that
     # relative paths may resolve against: earlier cd/pushd targets and git -C.
@@ -42,38 +46,21 @@ class CommandPaths:
     warnings: list[str] = field(default_factory=list)
 
 
-def _newlines_to_separators(command: str) -> str:
-    """Replace command-separating newlines with `;`. A newline inside quotes is data
-    (a multi-line sed/awk script) and is kept, so the script words stay faithful."""
-    out: list[str] = []
-    quote = ""
-    i = 0
-    while i < len(command):
-        c = command[i]
-        if c == "\\" and quote != "'" and i + 1 < len(command):
-            out.append(command[i : i + 2])
-            i += 2
-            continue
-        if quote:
-            quote = "" if c == quote else quote
-        elif c in "'\"":
-            quote = c
-        elif c == "\n":
-            c = " ; "
-        out.append(c)
-        i += 1
-    return "".join(out)
+def _tokenize(command: str) -> list[str] | None:
+    """Tokens of the shared-preprocessed command, or None when it cannot be parsed.
 
-
-def _tokenize(command: str) -> list[str]:
-    text = _newlines_to_separators(command)
+    There is deliberately no whitespace-split fallback: a command that shlex rejects
+    would lose every separator, so callers must treat None as unparseable (fail closed)."""
+    prepared = prepare(command, keep_heredoc_tail=True)
+    if not prepared.ok:
+        return None
     try:
-        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(prepared.text, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         lex.commenters = ""
         return list(lex)
     except ValueError:
-        return text.split()
+        return None
 
 
 def _is_punct(tok: str) -> bool:
@@ -354,9 +341,12 @@ def _verb_writes(verb: str, args: list[str]) -> list[str]:
 
 def analyze(command: str) -> list[CommandPaths]:
     """Return one CommandPaths per simple command found in `command`."""
+    tokens = _tokenize(command)
+    if tokens is None:
+        return [CommandPaths(unparseable=True, warnings=["command could not be tokenized"])]
     results: list[CommandPaths] = []
     cd_bases: list[str] = []
-    for words, redirects in _split(_tokenize(command)):
+    for words, redirects in _split(tokens):
         words = _strip_prefix(words)
         cp = CommandPaths(writes=list(redirects), redirects=list(redirects), bases=list(cd_bases))
         if words:
