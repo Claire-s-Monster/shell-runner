@@ -476,7 +476,22 @@ def _apply_path_guard(
     # Marked even when the catalog was already as strict: persisted approvals key on
     # the shared template and must never lower a guarded command.
     result = replace(result, path_guarded=True)
-    if PERMISSIVENESS[result.command_tier] <= PERMISSIVENESS[finding.tier]:
+    if finding.git_matches:
+        result = replace(
+            result,
+            flagged=True,
+            protected_matches=(*result.protected_matches, *finding.git_matches),
+            decision_path=(
+                *result.decision_path,
+                *(
+                    f"protected_path write: {m.path} ({m.glob!r}, builtin)"
+                    for m in finding.git_matches
+                ),
+            ),
+        )
+    stricter = PERMISSIVENESS[result.command_tier] - PERMISSIVENESS[finding.tier]
+    # a git-dir write always carries its own matched_rule, even at an equal tier
+    if stricter < 0 or (stricter == 0 and not finding.git_matches):
         return result
     rule = Rule(
         pattern=f"path_guard:{finding.category}",

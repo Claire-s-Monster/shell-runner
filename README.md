@@ -169,6 +169,25 @@ included.
    paths, globs and `$VAR` operands still prompt, as do `zsh -n` and `ksh -n`
    (their startup-file handling under `-n` is unverified). `py_compile` writes `__pycache__/*.pyc` next to the source.
 
+**Git-directory write guard** ([#84](https://github.com/Claire-s-Monster/shell-runner/issues/84)).
+Planting `core.fsmonitor`, `core.pager`, `diff.external`, a `filter.*.smudge`,
+`core.hooksPath`, `include.path` or a hook under `.git/` makes the next
+auto-executed `git status` run attacker code, so none of the rules above apply
+to such a write. Built in (no rules file needed): a command with ANY write
+target (`>`, `>>`, `&>`, `2>f`, `>|`, `tee`, `cp`, `mv`, `install`, `ln`,
+`touch`, `mkdir`, `rm`, `truncate`, `sed -i`, `dd of=`, `chmod`/`chown`, `git
+checkout|restore|rm|mv|apply` paths, `tar -C`) inside a git directory is T3 at
+least, immune to template/verb/global approvals (`path_guard:git_dir_write`),
+and flagged (`protected_path_match` glob `builtin:.git`, found by
+`shell_audit(flagged_only=true)`). It is never a DENY. A git directory is any path
+with a `.git` component, plus the target of a `.git` file's `gitdir:` line and
+that directory's `commondir` (found by walking up from the cwd; git is not
+run). Targets are checked both normalized and symlink-resolved; `$VAR`, globs
+and command substitutions in a target are not resolved and keep their previous
+tier. Reads (`cat .git/config`, `git status`) are unchanged. Not covered:
+`.gitattributes` (outside `.git`), inline interpreter code, `git config`
+itself, and writes through a variable or glob.
+
 ## Audit trail: approver columns, retention, `shell_audit`
 
 **Approver columns.** Every approve *and* deny decision stores the supplied
