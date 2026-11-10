@@ -396,6 +396,115 @@ def test_worktree_add_hookspath_or_include_in_any_config_stays_t3(
     assert lay.tier("git worktree remove ../worktrees/existing") == T2
 
 
+def test_worktree_add_sample_only_hooks_dir_is_t2(lay: Layout) -> None:
+    hooks = lay.repo / ".git" / "hooks"
+    hooks.mkdir()
+    for name in ("pre-commit.sample", "post-checkout.sample", "reference-transaction.sample"):
+        (hooks / name).write_text("#!/bin/sh\n")
+    assert lay.tier(ADD) == T2
+    (hooks / "empty-dir-not-allowed").mkdir()
+    assert lay.tier(ADD) == T3
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["reference-transaction", "post-index-change", "pre-commit", "x", "sample", "a.sample.sh"],
+)
+def test_worktree_add_any_non_sample_hook_stays_t3(lay: Layout, name: str) -> None:
+    hooks = lay.repo / ".git" / "hooks"
+    hooks.mkdir()
+    (hooks / "ok.sample").write_text("x")
+    (hooks / name).write_text("x")
+    assert lay.tier(ADD) == T3
+
+
+def test_worktree_add_sample_symlink_or_subdir_stays_t3(lay: Layout) -> None:
+    hooks = lay.repo / ".git" / "hooks"
+    hooks.mkdir()
+    (lay.root / "real").write_text("x")
+    (hooks / "evil.sample").symlink_to(lay.root / "real")  # symlink named *.sample
+    assert lay.tier(ADD) == T3
+    (hooks / "evil.sample").unlink()
+    (hooks / "dir.sample").mkdir()  # subdirectory named *.sample
+    assert lay.tier(ADD) == T3
+
+
+def test_worktree_add_hooks_dir_listing_error_or_symlink_stays_t3(lay: Layout) -> None:
+    (lay.repo / ".git" / "hooks").write_text("not a dir")
+    assert lay.tier(ADD) == T3
+    (lay.repo / ".git" / "hooks").unlink()
+    (lay.root / "elsewhere").mkdir()
+    (lay.repo / ".git" / "hooks").symlink_to(lay.root / "elsewhere")
+    assert lay.tier(ADD) == T3
+
+
+def test_worktree_add_private_hooks_dir_is_checked_too(lay: Layout) -> None:
+    priv = lay.repo / ".git" / "worktrees" / "existing"
+    (priv / "commondir").write_text("../..\n")
+    (lay.worktrees / "existing" / ".git").write_text(f"gitdir: {priv}\n")
+    wt = lay.worktrees / "existing"
+    assert lay.tier("git worktree add ../sibling", cwd=wt) == T2
+    (priv / "hooks").mkdir()
+    (priv / "hooks" / "post-checkout.sample").write_text("x")
+    assert lay.tier("git worktree add ../sibling", cwd=wt) == T2
+    (priv / "hooks" / "reference-transaction").write_text("x")
+    assert lay.tier("git worktree add ../sibling", cwd=wt) == T3
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '[filter "lfs"]\n\tsmudge = x\n',
+        "[FILTER]\n\tclean = x\n",
+        "[core]\n\tfsmonitor = /x\n",
+        "[core]\n\tFsMonitor = true\n",
+        "[core]\n\tattributesFile = /x\n",
+        "[core]\n\tsshCommand = x\n",
+        "[core]\n\tpager = x\n",
+        "[core]\n\teditor = vim\n",
+        "[core]\n\taskpass = x\n",
+        '[diff "x"]\n\tcommand = /x\n',
+        '[diff "x"]\n\texternal = /x\n',
+        '[merge "x"]\n\tdriver = /x\n',
+        "[diff]\n\tdriver = x\n",
+        "[core] fsmonitor = x\n",
+        "[user]\n\tname = x\n\tfilter.lfs.clean = y\n",
+    ],
+)
+def test_worktree_add_risky_config_stays_t3(lay: Layout, content: str) -> None:
+    (lay.home / ".gitconfig").write_text(content)
+    assert lay.tier(ADD) == T3
+    (lay.home / ".gitconfig").unlink()
+    (lay.repo / ".git" / "config").write_text(content)
+    assert lay.tier(ADD) == T3
+    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[core]\n\tbare = false\n\tfilemode = true\n",
+        "# comment\n; another\n[user]\n\tname = x\n\temail = a@b\n",
+        '[remote "origin"]\n\turl = git@example.com:x/y.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n',
+        '[diff "x"]\n\tcolormoved = default\n',
+        "[merge]\n\tconflictstyle = diff3\n\n",
+        "",
+    ],
+)
+def test_worktree_add_inert_config_is_t2(lay: Layout, content: str) -> None:
+    (lay.repo / ".git" / "config").write_text(content)
+    assert lay.tier(ADD) == T2
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["garbage line here\n", "[core\nbare = false\n", "[user]\n\tname = a \\\n\tb\n", "= x\n"],
+)
+def test_worktree_add_unparseable_config_stays_t3(lay: Layout, content: str) -> None:
+    (lay.repo / ".git" / "config").write_text(content)
+    assert lay.tier(ADD) == T3
+
+
 def test_worktree_add_with_harmless_config_is_t2(lay: Layout) -> None:
     (lay.repo / ".git" / "config").write_text("[core]\n\tbare = false\n[user]\n\tname = x\n")
     (lay.home / ".gitconfig").write_text("[user]\n\temail = a@b\n")

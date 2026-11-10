@@ -11,7 +11,13 @@ import os
 import re
 from pathlib import Path
 
-_INCLUDE_RE = re.compile(r"\[\s*include")
+_FORBIDDEN_RE = re.compile(
+    r"hookspath|\[\s*include|\[\s*filter|filter\.|fsmonitor|attributesfile|sshcommand"
+    r"|pager|editor|askpass"
+)
+_SECTION_RE = re.compile(r"^\[\s*([a-z0-9.-]+)(?:\s+\"[^\"]*\")?\s*\](.*)$")
+_KEY_RE = re.compile(r"^([a-z][a-z0-9-]*)\s*(?:=.*)?$")
+_DRIVER_KEYS = frozenset({"driver", "command", "external"})
 
 # Patched by tests only; deliberately not configurable from the environment.
 SYSTEM_GITCONFIG = Path("/etc/gitconfig")
@@ -40,10 +46,40 @@ def git_dirs(top: Path) -> tuple[Path, Path] | None:
         return None
 
 
-def _config_unsafe(files: list[Path]) -> bool:
-    """True when any config file sets/might set core.hooksPath (or can't be read).
+def _line_unsafe(line: str, section: str) -> tuple[bool, str]:
+    """(unsafe, section) for one stripped config line, handling `[sec] key = v` forms."""
+    while line and line[0] not in "#;":
+        m = _SECTION_RE.match(line)
+        if m:
+            section, line = m.group(1).split(".")[0], m.group(2).strip()
+            continue
+        k = _KEY_RE.match(line)
+        if k is None or line.endswith("\\"):
+            return True, section  # not cleanly parseable (or a continued value)
+        return section in ("diff", "merge") and k.group(1) in _DRIVER_KEYS, section
+    return False, section
 
-    Plain text scan: any `hookspath` (case-insensitive) or `[include*]` section counts.
+
+def _text_unsafe(low: str) -> bool:
+    """Lower-cased git config text that could make checkout/worktree-add run something.
+
+    Substring hits (hooksPath, includes, filters, fsmonitor, attributesFile, sshCommand,
+    pager, editor, askpass) anywhere, a diff/merge section with driver/command/external,
+    or any line that is not cleanly `[section]` / `key` / `key = value` / comment.
+    """
+    if _FORBIDDEN_RE.search(low):
+        return True
+    section = ""
+    for raw in low.splitlines():
+        bad, section = _line_unsafe(raw.strip(), section)
+        if bad:
+            return True
+    return False
+
+
+def _config_unsafe(files: list[Path]) -> bool:
+    """True when any config file is risky (see _text_unsafe) or can't be read.
+
     A missing file is fine; any other read error is unsafe.
     """
     for f in files:
@@ -53,9 +89,22 @@ def _config_unsafe(files: list[Path]) -> bool:
             continue
         except OSError:
             return True
-        if "hookspath" in low or _INCLUDE_RE.search(low):
+        if _text_unsafe(low):
             return True
     return False
+
+
+def _hooks_dir_unsafe(hooks: Path) -> bool:
+    """True unless `hooks` is missing or holds only regular `*.sample` files."""
+    try:
+        if hooks.is_symlink():
+            return True
+        entries = list(hooks.iterdir())
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return any(e.is_symlink() or not e.is_file() or not e.name.endswith(".sample") for e in entries)
 
 
 def _git_env_set() -> bool:
@@ -65,16 +114,20 @@ def _git_env_set() -> bool:
     )
 
 
-def post_checkout_hook_possible(top: Path, home: str, env: dict[str, str]) -> bool:
-    """True unless NO post-checkout hook can run for `git worktree add` from `top`."""
+def hooks_or_config_possible(top: Path, home: str, env: dict[str, str]) -> bool:
+    """True unless NOTHING configured can run code during `git worktree add` from `top`.
+
+    Safe means: `<common>/hooks` (and `<private>/hooks`) missing or only regular
+    `*.sample` files (any other entry, symlink or listing error is unsafe), and every
+    scanned config clean (see _text_unsafe). Defense in depth; fails closed.
+    """
     if _git_env_set():
         return True
     dirs = git_dirs(top)
     if dirs is None:
         return True
     priv, common = dirs
-    # lexists: a non-executable file or a dangling symlink counts as present
-    if os.path.lexists(common / "hooks" / "post-checkout"):
+    if any(_hooks_dir_unsafe(d / "hooks") for d in {priv, common}):
         return True
     xdg = env.get("XDG_CONFIG_HOME") or os.environ.get("XDG_CONFIG_HOME") or f"{home}/.config"
     return _config_unsafe(

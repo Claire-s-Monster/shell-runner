@@ -560,7 +560,7 @@ def worktree_target_allowed(command: str, cwd: str, env: dict[str, str] | None =
     if not all(_worktree_path_ok(c, roots, cwd_real, env, home) for c in candidates):
         return False
     if sub == "add":
-        return not worktree_git.post_checkout_hook_possible(top, home, env)
+        return not worktree_git.hooks_or_config_possible(top, home, env)
     dirs = worktree_git.git_dirs(top)
     return dirs is not None and worktree_git.remove_target_unambiguous(dirs[1], target, candidates)
 
