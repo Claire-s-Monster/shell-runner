@@ -505,6 +505,90 @@ def test_worktree_add_unparseable_config_stays_t3(lay: Layout, content: str) -> 
     assert lay.tier(ADD) == T3
 
 
+STOCK_LFS = (
+    '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n'
+    "\tprocess = git-lfs filter-process\n\trequired = true\n"
+)
+
+
+def _user_sources(lay: Layout) -> list[Path]:
+    xdg = lay.root / ".config" / "git"
+    xdg.mkdir(parents=True, exist_ok=True)
+    return [lay.home / ".gitconfig", xdg / "config", worktree_git.SYSTEM_GITCONFIG]
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2], ids=["gitconfig", "xdg", "system"])
+def test_stock_lfs_filter_in_user_or_system_config_is_t2(lay: Layout, idx: int) -> None:
+    _user_sources(lay)[idx].write_text(STOCK_LFS)
+    assert lay.tier(ADD) == T2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        STOCK_LFS.replace("\t", "    "),
+        STOCK_LFS.replace(" = ", "="),
+        STOCK_LFS.replace("\tclean =", "\tCLEAN =").replace("\trequired", "\tRequired"),
+        '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n',  # missing keys are fine
+        '[filter "lfs"]\n',
+        STOCK_LFS + STOCK_LFS,  # identical duplicate
+        "[user]\n\tname = x\n" + STOCK_LFS + "[core]\n\tbare = false\n",
+    ],
+)
+def test_stock_lfs_filter_variants_that_stay_inert(lay: Layout, text: str) -> None:
+    (lay.home / ".gitconfig").write_text(text)
+    assert lay.tier(ADD) == T2
+
+
+@pytest.mark.parametrize("where", [".git/config", ".git/config.worktree"])
+def test_stock_lfs_filter_in_repo_config_stays_t3(lay: Layout, where: str) -> None:
+    (lay.repo / where).write_text(STOCK_LFS)
+    assert lay.tier(ADD) == T3
+
+
+def test_stock_lfs_filter_in_private_worktree_config_stays_t3(lay: Layout) -> None:
+    priv = lay.repo / ".git" / "worktrees" / "existing"
+    (priv / "commondir").write_text("../..\n")
+    (priv / "config.worktree").write_text(STOCK_LFS)
+    wt = lay.worktrees / "existing"
+    (wt / ".git").write_text(f"gitdir: {priv}\n")
+    assert lay.tier("git worktree add ../sibling", cwd=wt) == T3
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        STOCK_LFS.replace("git-lfs smudge -- %f", "git-lfs smudge -- %f; touch x"),
+        STOCK_LFS.replace("git-lfs smudge", "Git-LFS smudge"),
+        STOCK_LFS.replace("filter-process", "filter-process --x"),
+        STOCK_LFS.replace("required = true", "required = false"),
+        STOCK_LFS + "\tsshcommand = x\n",
+        STOCK_LFS + "\textra = 1\n",
+        STOCK_LFS + "\t# comment\n",
+        STOCK_LFS.replace("clean = git-lfs clean -- %f", "clean = git-lfs clean -- %f \\"),
+        STOCK_LFS + '[filter "lfs"]\n\tsmudge = evil\n',  # duplicate, different content
+        STOCK_LFS.replace('"lfs"', '"lfsx"'),
+        STOCK_LFS.replace('"lfs"', '"LFS"'),
+        STOCK_LFS + '[filter "x"]\n\tclean = y\n',
+        '[filter "x"]\n\tclean = y\n' + STOCK_LFS,
+        STOCK_LFS + "[core]\n\thooksPath = x\n",
+        STOCK_LFS + "[core]\n\tfsmonitor = x\n",
+        STOCK_LFS + "[include]\n\tpath = x\n",
+        '[filter "lfs"] clean = git-lfs clean -- %f\n',
+        "[filter]\n\tclean = x\n",
+    ],
+)
+def test_modified_lfs_or_other_filters_stay_t3(lay: Layout, text: str) -> None:
+    (lay.home / ".gitconfig").write_text(text)
+    assert lay.tier(ADD) == T3
+
+
+def test_stock_lfs_in_user_config_does_not_excuse_repo_filter(lay: Layout) -> None:
+    (lay.home / ".gitconfig").write_text(STOCK_LFS)
+    (lay.repo / ".git" / "config").write_text('[filter "x"]\n\tclean = y\n')
+    assert lay.tier(ADD) == T3
+
+
 def test_worktree_add_with_harmless_config_is_t2(lay: Layout) -> None:
     (lay.repo / ".git" / "config").write_text("[core]\n\tbare = false\n[user]\n\tname = x\n")
     (lay.home / ".gitconfig").write_text("[user]\n\temail = a@b\n")

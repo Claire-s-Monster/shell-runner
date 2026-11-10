@@ -18,6 +18,15 @@ _FORBIDDEN_RE = re.compile(
 _SECTION_RE = re.compile(r"^\[\s*([a-z0-9.-]+)(?:\s+\"[^\"]*\")?\s*\](.*)$")
 _KEY_RE = re.compile(r"^([a-z][a-z0-9-]*)\s*(?:=.*)?$")
 _DRIVER_KEYS = frozenset({"driver", "command", "external"})
+_LFS_HEADER_RE = re.compile(r'^\[\s*(?i:filter)\s+"lfs"\s*\]$')
+_LFS_KEY_RE = re.compile(r"^([A-Za-z]+)\s*=\s*(.*?)\s*$")
+# the lines `git lfs install` writes; keys are case-insensitive, values exact
+_STOCK_LFS = {
+    "clean": "git-lfs clean -- %f",
+    "smudge": "git-lfs smudge -- %f",
+    "process": "git-lfs filter-process",
+    "required": "true",
+}
 
 # Patched by tests only; deliberately not configurable from the environment.
 SYSTEM_GITCONFIG = Path("/etc/gitconfig")
@@ -60,13 +69,44 @@ def _line_unsafe(line: str, section: str) -> tuple[bool, str]:
     return False, section
 
 
-def _text_unsafe(low: str) -> bool:
-    """Lower-cased git config text that could make checkout/worktree-add run something.
+def _strip_stock_lfs(text: str) -> str | None:
+    """`text` without `[filter "lfs"]` sections, or None unless each is the stock
+    `git lfs install` section (only the four stock key/value lines, nothing else)."""
+    out: list[str] = []
+    in_lfs = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if _LFS_HEADER_RE.match(line):
+            in_lfs = True
+            continue
+        if in_lfs and line.startswith("["):
+            in_lfs = False
+        if in_lfs:
+            m = _LFS_KEY_RE.match(line) if line else None
+            if m is None and line:
+                return None
+            if m is not None and _STOCK_LFS.get(m.group(1).lower()) != m.group(2):
+                return None
+            continue
+        out.append(raw)
+    return "\n".join(out)
+
+
+def _text_unsafe(text: str, *, user_level: bool = False) -> bool:
+    """Git config text that could make checkout/worktree-add run something.
 
     Substring hits (hooksPath, includes, filters, fsmonitor, attributesFile, sshCommand,
     pager, editor, askpass) anywhere, a diff/merge section with driver/command/external,
     or any line that is not cleanly `[section]` / `key` / `key = value` / comment.
+    The one exception: in user/system-level config (never the repo's), the exact stock
+    git-lfs `[filter "lfs"]` section is inert and ignored.
     """
+    if user_level:
+        stripped = _strip_stock_lfs(text)
+        if stripped is None:
+            return True
+        text = stripped
+    low = text.lower()
     if _FORBIDDEN_RE.search(low):
         return True
     section = ""
@@ -77,20 +117,21 @@ def _text_unsafe(low: str) -> bool:
     return False
 
 
-def _config_unsafe(files: list[Path]) -> bool:
+def _config_unsafe(repo_files: list[Path], user_files: list[Path]) -> bool:
     """True when any config file is risky (see _text_unsafe) or can't be read.
 
     A missing file is fine; any other read error is unsafe.
     """
-    for f in files:
-        try:
-            low = f.read_text(errors="replace").lower()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return True
-        if _text_unsafe(low):
-            return True
+    for user_level, files in ((False, repo_files), (True, user_files)):
+        for f in files:
+            try:
+                text = f.read_text(errors="replace")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            if _text_unsafe(text, user_level=user_level):
+                return True
     return False
 
 
@@ -131,14 +172,8 @@ def hooks_or_config_possible(top: Path, home: str, env: dict[str, str]) -> bool:
         return True
     xdg = env.get("XDG_CONFIG_HOME") or os.environ.get("XDG_CONFIG_HOME") or f"{home}/.config"
     return _config_unsafe(
-        [
-            common / "config",
-            common / "config.worktree",
-            priv / "config.worktree",
-            Path(home) / ".gitconfig",
-            Path(xdg) / "git" / "config",
-            SYSTEM_GITCONFIG,
-        ]
+        [common / "config", common / "config.worktree", priv / "config.worktree"],
+        [Path(home) / ".gitconfig", Path(xdg) / "git" / "config", SYSTEM_GITCONFIG],
     )
 
 
