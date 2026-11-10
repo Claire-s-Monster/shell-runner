@@ -372,7 +372,8 @@ UNRESOLVED_WHOLE = [
 def test_unresolvable_write_target_is_at_least_t3(repo: Path, command: str) -> None:
     cls = _cls(command, repo)
     assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3], command
-    assert not cls.path_guarded, command  # approvals may still apply
+    assert cls.path_guarded, command  # approval-proof (template shared with resolvable targets)
+    assert not cls.flagged, command  # flagged only when the target could be a .git path
 
 
 @pytest.mark.parametrize("command", UNRESOLVED_WHOLE)

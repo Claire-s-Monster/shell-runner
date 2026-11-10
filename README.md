@@ -192,35 +192,46 @@ code, and `git config` itself.
 
 **awk, sed and git argument guard** ([#85](https://github.com/Claire-s-Monster/shell-runner/issues/85),
 `exec_guard.py`; raw words, because the normalizer collapses scripts to `<arg>`;
-approval-proof like the other path guards).
-- *awk* (`awk|gawk|mawk|nawk`): T4 if the program calls `system`; otherwise T3 if
-  it contains `|`, `>`, `@`, `getline`, `close` or `fflush`, or the command has
+raw words, because the normalizer collapses scripts to `<arg>`). Approval-proofing
+is scoped by risk: *guarded* findings can only be run with a one-shot approval
+(`approve_template`/`approve_verb` degrade to once); *ordinary* T3 findings are
+approvable like any other T3 command.
+- *awk* (`awk|gawk|mawk|nawk`), guarded: T4 if the program calls `system`; otherwise
+  T3 if it contains `|`, `>`, `@`, `getline`, `close` or `fflush`, or the command has
   `-f`/`-i`/`-l`/`-E` or `--file/--include/--load/--exec` (or a prefix of them).
   Everything else (`awk '{print $1}' f`, `-F:`, `-v`) keeps its tier.
-- *sed*: stays as before only when every script (`-e`/`--expression` values, else
-  the first non-option word) is `[addr[,addr]][!]cmd` items joined by `;`/newline,
-  addr = `N`, `$`, `/re/[I]`; cmd = `s<d>..<d>..<d>[gpIi0-9]*`, `y<d>..<d>..<d>`, or
-  one of `p d q Q n N =`. Anything else is T3: `e`, `w W r R`, the `w`/`e` s-flag,
-  `a i c`, `{}`, `G h H x`, comments, unparseable scripts, `-f/--file`, `-s`, `-z`,
-  unknown options. This also applies to `sed -i`.
-- *git*: T3 if any argument is `--upload-pack`, `--receive-pack`, `--exec`,
+- *sed*: the script (`-e`/`--expression` fragments joined by newlines, as GNU does,
+  else the first non-option word) must parse in the safe grammar, else guarded T3.
+  Items are separated by `;`/newline: `[addr[,addr]][!]cmd`, addr = `N`, `$`, `/re/[I]`;
+  cmd = `s<d>..<d>..<d>[gpIi0-9]*`, `y<d>..<d>..<d>`, one of `p d q Q n N g G h H x l z F =`
+  (`q Q l` take an optional number), `a`/`i`/`c` text (`a text`, `a\text`, `a\`+newline+text;
+  text ends at a newline or the end of the script, any other backslash is ambiguous),
+  `b|t|T [label]`, `{ ... }` blocks of these, plus `:label` and `#` comments. `w W r R e`
+  never parse (also inside blocks or after `;`), nor the `w`/`e` s-flag, `-f/--file`, `-s`,
+  `-z`, unknown options; an unclosed block or ambiguous text is guarded T3. Applies to `sed -i` too.
+- *git*, guarded: T3 if any argument is `--upload-pack`, `--receive-pack`, `--exec`,
   `--output`, `--ext-diff`, `--textconv`, `--config-env`, `--git-dir`,
-  `--work-tree`, `--namespace` (or any prefix of a length of 3+, e.g. `--upload-p`),
-  `-c` (also attached before the subcommand), or `-u` for fetch/ls-remote/branch/tag.
-  `git remote` is T2 only as `remote`, `remote -v`, `remote show <n>`, `remote get-url <n>`.
-  `git branch|tag` with `-d -D -f -m -M -c -C -u -F` or `--delete --force --move --copy
-  --set-upstream-to --unset-upstream --edit-description` is T3. `git stash` is T2 only for
-  `list`/`show` (bare `git stash`, `push`, `pop`, `apply`, `drop`, `clear`, `save` are T3).
-Previously auto-executing shapes that now need approval: `awk '$1 > 5' f`,
-`awk '{print > "f"}'`, any awk `getline`/`close`/`fflush`/pipe; `sed` with `a i c`
-text, `{...}` blocks, `G h x`, `w`/`r`/`e`; `git log -c`, `git -c k=v ...`,
-`git --git-dir=D ...`, `git --work-tree=D ...`, `git remote add|set-url|rename|remove|prune|update`,
-`git branch -d|-D|-m|-f|-u`, `git tag -d|-f|-m|-u`, bare `git stash`, `git stash push|pop|apply|drop|clear|save`.
-Plain `git branch NAME` / `git tag NAME` (create) keep their tier.
+  `--work-tree`, `--namespace` (or any prefix of 3+ chars, e.g. `--upload-p`),
+  `-c` (also attached before the subcommand; for `branch|tag` `-c` is a copy, see below),
+  or `-u` for fetch/ls-remote.
+- *git*, ordinary T3 (approvable, unless a hazard option above is also present): `remote`
+  other than `remote`, `remote -v`, `remote show <n>`, `remote get-url <n>`; `branch|tag`
+  with `-d -D -f -m -M -c -C -F -u` or `--delete --force --move --copy --set-upstream-to
+  --unset-upstream --edit-description`; `stash` other than `list`/`show` (bare `git stash`,
+  `push`, `pop`, `apply`, `drop`, `clear`, `save`).
+
+Still needs a one-shot approval every time (guarded): `awk '$1 > 5' f`, any awk
+`>`/`|`/`getline`/`close`/`fflush`/`system`/`-f`; `sed` with `w`/`r`/`e` (or the `w`/`e` flag),
+`-f`/`-s`/`-z`, or an unparseable script; `git log -c`, `git -c k=v ...`, `git --git-dir=D ...`,
+`git --work-tree=D ...`, `git --output`, `--upload-pack`, `--ext-diff`, `--textconv`;
+unresolvable write targets; every git-dir write. Newly ordinary T3 (previously T2; approvable):
+`git remote add|set-url|rename|remove|prune|update`, `git branch|tag -d|-D|-m|-f|-u`, bare
+`git stash`, `git stash push|pop|apply|drop|clear|save`. Plain `git branch NAME` /
+`git tag NAME` (create) keep their tier.
 
 **Unresolvable write targets are T3.** A write target containing `$`, a
 backtick, `*`, `?`, `[` or `{` cannot be resolved statically, so the command is
-at least T3 (it is not approval-proof unless the target could name a `.git`
+at least T3 and approval-proof (and flagged when the target could name a `.git`
 component, e.g. `.git/c*` or `$D` alone). This changes previously auto-executing
 shapes such as `echo x > $TMPDIR/f`, `echo x >> $OUT`, `echo x > out-*.txt`,
 ``echo x > `pwd`/f``, `echo x > f{1,2}`, and the same targets for `tee`, `touch`,

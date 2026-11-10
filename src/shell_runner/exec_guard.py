@@ -17,7 +17,10 @@ import re
 from .catalog import Tier
 from .write_targets import CommandPaths
 
-Verdict = tuple[Tier, str, str]
+# (tier, category, reason, guarded). guarded=True: persisted template/verb approvals must
+# not lower the tier (the approved template is shared with a code-executing variant).
+# guarded=False: an ordinary T3, approvable like any other (git remote/branch/tag/stash writes).
+Verdict = tuple[Tier, str, str, bool]
 
 _T3 = Tier.APPROVE_ONCE
 _T4 = Tier.ALWAYS_APPROVE
@@ -91,13 +94,16 @@ def _awk_scripts(words: list[str]) -> tuple[list[str], bool]:
 def _awk(words: list[str]) -> Verdict | None:
     scripts, hazardous = _awk_scripts(words)
     if hazardous:
-        return (_T3, "awk_unsafe", "awk loads a program file/extension (-f/-i/-l/-E/--file/...)")
+        msg = "awk loads a program file/extension (-f/-i/-l/-E/--file/...)"
+        return (_T3, "awk_unsafe", msg, True)
     for script in scripts:
         if _AWK_SYSTEM_RE.search(script):
-            return (_T4, "awk_system", "awk program calls system(): executes shell commands")
+            msg = "awk program calls system(): executes shell commands"
+            return (_T4, "awk_system", msg, True)
         hit = next((t for t in _AWK_HAZARD_TEXT if t in script), None)
         if hit is not None:
-            return (_T3, "awk_unsafe", f"awk program contains {hit!r} (pipe/redirect/getline)")
+            msg = f"awk program contains {hit!r} (pipe/redirect/getline)"
+            return (_T3, "awk_unsafe", msg, True)
     return None
 
 
@@ -123,7 +129,10 @@ _SED_SAFE_LONG = (
 )
 _SED_SAFE_SHORT = frozenset("nErub")
 _SED_S_FLAGS = frozenset("gpIi0123456789")
-_SED_SIMPLE_CMDS = frozenset("pdqQnN=")
+_SED_SIMPLE_CMDS = frozenset("pdqQnNgGhHxlzF=")
+_SED_TEXT_CMDS = frozenset("aic")
+_SED_BRANCH_CMDS = frozenset("btT")
+_SED_LABEL_RE = re.compile(r"[A-Za-z0-9_.-]*")
 
 
 def _sed_long_option(words: list[str], i: int, scripts: list[str]) -> int | None:
@@ -262,45 +271,121 @@ def _sed_command(s: str, i: int) -> int:
         return j
     if c in _SED_SIMPLE_CMDS:
         j = i + 1
-        while c in "qQ" and j < n and s[j].isdigit():
-            j += 1
+        if c in "qQl":
+            while j < n and s[j] in " \t":
+                j += 1
+            while j < n and s[j].isdigit():
+                j += 1
         return j
     return -1
 
 
+def _sed_text(s: str, i: int) -> int:
+    """Skip the literal text of an a/i/c command starting right after the command letter.
+
+    Forms: `a text`, `a\\text`, and `a\\` + newline + text. The text runs to an unescaped
+    newline or the end of the script; backslash-newline continues it. Any other backslash
+    (GNU escape processing) or a missing text is ambiguous -> -1. Returns the index just
+    past the consumed newline (or the script end)."""
+    n = len(s)
+    while i < n and s[i] in " \t":
+        i += 1
+    if i < n and s[i] == "\\":
+        i += 1
+        while i < n and s[i] in " \t":
+            i += 1
+        if i < n and s[i] == "\n":
+            i += 1
+    if i >= n:
+        return -1
+    while i < n:
+        if s[i] == "\n":
+            return i + 1
+        if s[i] == "\\":
+            if i + 1 < n and s[i + 1] == "\n":
+                i += 2
+                continue
+            return -1
+        i += 1
+    return i
+
+
+def _sed_label(s: str, i: int, *, required: bool) -> int:
+    """Skip an optional-space-prefixed label; -1 when required and empty."""
+    n = len(s)
+    while i < n and s[i] in " \t":
+        i += 1
+    m = _SED_LABEL_RE.match(s, i)
+    end = m.end() if m else i
+    return -1 if required and end == i else end
+
+
+def _sed_command_end(s: str, i: int) -> int:
+    """After a command: only blanks, then `;`, newline, `}` or the end may follow."""
+    n = len(s)
+    while i < n and s[i] in " \t":
+        i += 1
+    return -1 if i < n and s[i] not in ";\n}" else i
+
+
+def _sed_item(s: str, i: int) -> tuple[int, int]:
+    """Parse one command item at s[i] (not a comment, `}` or label definition).
+    Returns (next index, block depth change); next index -1 when outside the grammar."""
+    j = _sed_addresses(s, i)
+    if j < 0 or j >= len(s):
+        return -1, 0
+    c = s[j]
+    if c == "{":
+        return j + 1, 1
+    if c in _SED_TEXT_CMDS:
+        return _sed_text(s, j + 1), 0
+    if c in _SED_BRANCH_CMDS:
+        k = _sed_label(s, j + 1, required=False)
+        return (_sed_command_end(s, k) if k >= 0 else -1), 0
+    k = _sed_command(s, j)
+    return (_sed_command_end(s, k) if k >= 0 else -1), 0
+
+
 def _safe_sed_script(s: str) -> bool:
-    """True only for `[addr[,addr]][!]cmd` items joined by `;`/newlines, where cmd is
-    `s<d>re<d>repl<d>[gpIi0-9]*`, `y<d>..<d>..<d>`, or one of p d q Q n N =."""
+    """True only for items joined by `;`/newlines: `[addr[,addr]][!]cmd` with cmd one of
+    `s<d>re<d>repl<d>[gpIi0-9]*`, `y<d>..<d>..<d>`, `p d q Q n N g G h H x l z F =`,
+    `a/i/c` text, `b/t/T [label]`, or a `{ ... }` block of such; plus `:label` and `#`
+    comments. w W r R e (and everything else) are never accepted, inside blocks too."""
     n = len(s)
     i = 0
+    depth = 0
     while True:
         while i < n and s[i] in " \t;\n":
             i += 1
         if i >= n:
-            return True
-        i = _sed_addresses(s, i)
-        if i < 0:
-            return False
-        i = _sed_command(s, i)
-        if i < 0:
-            return False
-        while i < n and s[i] in " \t":
-            i += 1
-        if i < n and s[i] not in ";\n":
+            return depth == 0
+        c = s[i]
+        if c == "#":
+            while i < n and s[i] != "\n":
+                i += 1
+            continue
+        if c == "}":
+            depth -= 1
+            i = _sed_command_end(s, i + 1)
+        elif c == ":":
+            i = _sed_label(s, i + 1, required=True)
+        else:
+            i, delta = _sed_item(s, i)
+            depth += delta
+        if i < 0 or depth < 0:
             return False
 
 
 def _sed(words: list[str]) -> Verdict | None:
     scripts = _sed_scripts(words)
     if scripts is None:
-        return (_T3, "sed_unsafe", "sed option can read/write files or is not recognised")
-    if all(_safe_sed_script(s) for s in scripts):
+        msg = "sed option can read/write files or is not recognised"
+        return (_T3, "sed_unsafe", msg, True)
+    # GNU joins the script fragments (-e chunks) with newlines before parsing
+    if _safe_sed_script("\n".join(scripts)):
         return None
-    return (
-        _T3,
-        "sed_unsafe",
-        "sed script is outside the safe grammar (e/w/r/R/W, w or e flag, or unparseable)",
-    )
+    msg = "sed script is outside the safe grammar (e/w/r/R/W, w or e flag, or unparseable)"
+    return (_T3, "sed_unsafe", msg, True)
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +404,8 @@ _GIT_HAZARD_LONG = (
     "--work-tree",
     "--namespace",
 )
-_GIT_U_SUBCOMMANDS = frozenset({"fetch", "ls-remote", "branch", "tag"})
+_GIT_U_SUBCOMMANDS = frozenset({"fetch", "ls-remote"})
+_GIT_REF_SUBCOMMANDS = frozenset({"branch", "tag"})  # -c/-C/-u are ref operations there
 _GIT_REF_WRITE_LONG = (
     "--delete",
     "--force",
@@ -347,7 +433,9 @@ def _git_hazard_option(word: str, *, in_global: bool, sub: str) -> str | None:
     if word.startswith("--"):
         name = word.partition("=")[0]
         return name if _prefix_of(name, _GIT_HAZARD_LONG) else None
-    if word == "-c" or (in_global and word.startswith("-c")):
+    if in_global and word.startswith("-c"):
+        return "-c"
+    if word == "-c" and sub not in _GIT_REF_SUBCOMMANDS:
         return "-c"
     if word == "-u" and sub in _GIT_U_SUBCOMMANDS:
         return "-u"
@@ -397,13 +485,17 @@ def _git(words: list[str]) -> Verdict | None:
     sub_idx = _git_subcommand_index(words)
     hit = _git_option_hazard(words, sub_idx)
     if hit is not None:
-        return (_T3, "git_unsafe_args", f"git option {hit} can run commands or write files")
+        msg = f"git option {hit} can run commands or write files"
+        return (_T3, "git_unsafe_args", msg, True)
+    # No hazard option from here on: ordinary, approvable T3s (guarded=False).
     sub = words[sub_idx] if sub_idx < len(words) else ""
     rest = words[sub_idx + 1 :]
     if sub == "remote" and not _git_remote_safe(rest):
-        return (_T3, "git_remote_write", "git remote subcommand changes remotes")
-    if sub in ("branch", "tag") and _git_ref_write(rest):
-        return (_T3, "git_ref_write", f"git {sub} option deletes, moves or forces refs")
+        return (_T3, "git_remote_write", "git remote subcommand changes remotes", False)
+    if sub in _GIT_REF_SUBCOMMANDS and _git_ref_write(rest):
+        msg = f"git {sub} option deletes, moves or forces refs"
+        return (_T3, "git_ref_write", msg, False)
     if sub == "stash" and not _git_stash_safe(rest):
-        return (_T3, "git_stash_write", "git stash other than list/show changes the worktree")
+        msg = "git stash other than list/show changes the worktree"
+        return (_T3, "git_stash_write", msg, False)
     return None

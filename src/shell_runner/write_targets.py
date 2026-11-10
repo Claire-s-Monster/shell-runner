@@ -42,8 +42,31 @@ class CommandPaths:
     warnings: list[str] = field(default_factory=list)
 
 
+def _newlines_to_separators(command: str) -> str:
+    """Replace command-separating newlines with `;`. A newline inside quotes is data
+    (a multi-line sed/awk script) and is kept, so the script words stay faithful."""
+    out: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        c = command[i]
+        if c == "\\" and quote != "'" and i + 1 < len(command):
+            out.append(command[i : i + 2])
+            i += 2
+            continue
+        if quote:
+            quote = "" if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "\n":
+            c = " ; "
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokenize(command: str) -> list[str]:
-    text = command.replace("\n", " ; ")
+    text = _newlines_to_separators(command)
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
