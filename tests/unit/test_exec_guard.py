@@ -145,12 +145,32 @@ SED_T3 = [
     "sed -z p f",
     "sed -nz p f",
     "sed --null-data p f",
-    "sed '{p}' f",
-    "sed 'a text' f",
-    "sed 'i text' f",
-    "sed 'c text' f",
-    "sed 'x;G' f",
-    "sed '#n' f",
+    # w/W/r/R/e as commands, also nested in blocks and after `;`
+    "sed '/x/{w .git/config}' f",
+    "sed '1{e id}' f",
+    "sed '/x/{p;w out}' f",
+    "sed '/x/{/y/{r x}}' f",
+    "sed 'p;w out' f",
+    "sed '$!N;e id' f",
+    "sed ':a;w out' f",
+    "sed 'b a;w out' f",
+    # a/i/c text ends at newline or the end of the -e chunk, never at `;` or `}`
+    "sed 'a foo\nw x' f",
+    "sed 'a foo\\nw x' f",
+    "sed 'a foo\\' f",
+    "sed 'a' f",
+    "sed -e 'a x' -e 'w y' f",
+    "sed -e 'a x' -e 'e id' f",
+    "sed '/x/a foo\nw out' f",
+    "sed 'i\\\nfoo\nw out' f",
+    # blocks / labels that do not parse
+    "sed '{p' f",
+    "sed 'p}' f",
+    "sed '/x/{a foo}' f",
+    "sed '1:a' f",
+    "sed ': ' f",
+    "sed 'b a b' f",
+    "sed '/x/{p;q}}' f",
     "sed 's/a/b' f",
     "sed 's/a/b/q' f",
     "sed '1,5' f",
@@ -193,6 +213,36 @@ def test_sed_unsafe_or_unparseable_is_t3(tmp_path: Path, command: str) -> None:
         "sed -n 'n;p' f",
         "sed -i 's/a/b/' f",
         "sed -i.bak 's/a/b/' f",
+        # widened grammar (#85 follow-up): a/i/c, blocks, g G h H x l = z F, labels, comments
+        "sed '/x/a foo' f",
+        "sed '1i header' f",
+        "sed '$a footer' f",
+        "sed '2c replaced' f",
+        "sed '/x/a\\text' f",
+        "sed '1i\\\nheader' f",
+        "sed 'a w x' f",  # `w x` is literal text here
+        "sed 'a foo;w x' f",  # `;` does not end a/i/c text
+        "sed -n '/a/{p;q}' f",
+        "sed -n '/a/{p;{n;p}}' f",
+        "sed '1,3{/x/d}' f",
+        "sed '/x/{\np\nd\n}' f",
+        "sed ':a;N;$!ba;s/\\n/ /g' f",
+        "sed -e ':a' -e 'N' -e '$!ba' -e 's/\\n/ /g' f",
+        "sed '/x/b end;s/a/b/;:end' f",
+        "sed 't;T;b' f",
+        "sed 'G' f",
+        "sed 'x;G;h;H;g' f",
+        "sed -n 'l' f",
+        "sed -n 'l 5' f",
+        "sed 'F;z;=' f",
+        "sed '# c' f",
+        "sed '#n' f",
+        "sed -n -E 's/(a)/\\1/p' f",
+        "sed -r 's/(a)/\\1/' f",
+        "sed -u 's/a/b/' f",
+        "sed --posix 's/a/b/' f",
+        "sed --debug 's/a/b/' f",
+        "sed -e 'a x' -e 'p' f",
     ],
 )
 def test_sed_positive_shapes_keep_their_tier(tmp_path: Path, command: str) -> None:
@@ -236,6 +286,19 @@ GIT_T3 = [
     "git --work-tree=/x status",
     "git --namespace=x log",
     "git --names=x log",
+    # a hazard option anywhere makes an otherwise-ordinary T3 write approval-proof
+    "git stash push --git-dir=x",
+    "git -c k=v stash push",
+    "git stash push -m x --git-dir=y",
+    "git --work-tree=x stash pop",
+    "git remote add --git-dir=x a b",
+    "git -c k=v remote add a b",
+    "git branch -d x --output=y",
+    "git -ck=v tag -d v1",
+]
+
+# ordinary T3: needs approval, but approve_template / approve_verb work as for any T3
+GIT_NORMAL_T3 = [
     # remote
     "git remote add x url",
     "git remote set-url x y",
@@ -263,11 +326,14 @@ GIT_T3 = [
     "git branch --set-upstream-to=o/x",
     "git branch --set-upstream-to o/x",
     "git branch -u o/x",
+    "git branch -c a b",
+    "git branch -C a b",
     "git branch --edit-description",
     "git tag -d v1",
     "git tag -f v1",
     "git tag --force v1",
     "git tag -m msg v1",
+    "git tag -F msgfile v1",
     "git tag -u key v1",
     # stash
     "git stash drop",
@@ -285,6 +351,24 @@ GIT_T3 = [
 @pytest.mark.parametrize("command", GIT_T3)
 def test_git_dangerous_forms_are_t3(tmp_path: Path, command: str) -> None:
     _assert_t3_or_stricter(command, tmp_path)
+
+
+@pytest.mark.parametrize("command", GIT_NORMAL_T3)
+def test_git_ordinary_writes_are_unguarded_t3(tmp_path: Path, command: str) -> None:
+    cls = _cls(command, tmp_path)
+    assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3], command
+    assert not cls.path_guarded, command
+
+
+def test_guardedness_is_scoped_by_risk(tmp_path: Path) -> None:
+    assert _cls("awk 'BEGIN{system(\"x\")}'", tmp_path).path_guarded
+    assert _cls("sed 's/a/b/e' f", tmp_path).path_guarded
+    assert _cls("echo x > $F", tmp_path).path_guarded
+    assert _cls("git fetch --upload-pack=x o", tmp_path).path_guarded
+    assert not _cls("git stash push", tmp_path).path_guarded
+    # a guarded segment anywhere in a chain keeps the whole command approval-proof
+    assert _cls("git stash push && git -c k=v log", tmp_path).path_guarded
+    assert _cls("git stash push; sed 'w x' f", tmp_path).path_guarded
 
 
 @pytest.mark.parametrize(
@@ -329,7 +413,19 @@ def test_git_positive_shapes_keep_their_tier(tmp_path: Path, command: str) -> No
 
 def test_git_hazards_in_a_chain_are_checked(tmp_path: Path) -> None:
     _assert_t3_or_stricter("git status && git fetch --upload-pack=x origin", tmp_path)
-    _assert_t3_or_stricter("ls | xargs echo; git remote add x y", tmp_path)
+    cls = _cls("ls | xargs echo; git remote add x y", tmp_path)
+    assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3]
+    assert not cls.path_guarded  # ordinary T3 write, no hazard option
+
+
+def test_newline_inside_quotes_is_kept_in_the_script_word() -> None:
+    from shell_runner.write_targets import analyze
+
+    (cp,) = analyze("sed -e 'a x\nw y' f")
+    assert cp.words == ["-e", "a x\nw y", "f"]
+    first, second = analyze("sed p f\nsed 'w y' f")
+    assert first.words == ["p", "f"]
+    assert second.words == ["w y", "f"]
 
 
 def test_git_output_to_file_is_a_write_target(tmp_path: Path) -> None:

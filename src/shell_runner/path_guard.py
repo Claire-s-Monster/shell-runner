@@ -283,7 +283,7 @@ _STRICTNESS = {
 
 def _unresolved_finding(cp: CommandPaths) -> GuardFinding | None:
     """A write target built from `$`, backticks, globs or braces cannot be resolved:
-    fail closed to T3 (approvals may still apply unless it could be a `.git` path)."""
+    fail closed to T3, approval-proof (the template is shared with resolvable variants)."""
     targets = _unresolved_targets(cp)
     if not targets:
         return None
@@ -291,18 +291,18 @@ def _unresolved_finding(cp: CommandPaths) -> GuardFinding | None:
         Tier.APPROVE_ONCE,
         "unresolved_write_target",
         f"write target {targets[0]!r} cannot be resolved statically",
-        guarded=False,
     )
 
 
 def _exec_finding(cp: CommandPaths) -> GuardFinding | None:
-    """awk/sed/git forms that run code or write files (issue #85); approval-proof, since
-    the catalog template (`awk <arg>`, `git fetch <arg>`) is shared with the safe forms."""
+    """awk/sed/git forms that run code or write files (issue #85). Hazard findings are
+    approval-proof (the template is shared with the safe forms); git remote/branch/tag/
+    stash writes are ordinary approvable T3s (verdict.guarded is False)."""
     verdict = exec_guard.check(cp)
     if verdict is None:
         return None
-    tier, category, reason = verdict
-    return GuardFinding(tier, category, reason)
+    tier, category, reason, guarded = verdict
+    return GuardFinding(tier, category, reason, guarded=guarded)
 
 
 def _git_dir_matches(cp: CommandPaths, cwd: str, home: str) -> list[PathMatch]:
