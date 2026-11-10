@@ -559,8 +559,12 @@ def worktree_target_allowed(command: str, cwd: str, env: dict[str, str] | None =
     candidates = (os.path.normpath(joined), os.path.realpath(joined))
     if not all(_worktree_path_ok(c, roots, cwd_real, env, home) for c in candidates):
         return False
+    # remove checks the worktree is clean (status-like), so it needs the same inert
+    # hooks/config as add
+    if worktree_git.hooks_or_config_possible(top, home, env):
+        return False
     if sub == "add":
-        return not worktree_git.hooks_or_config_possible(top, home, env)
+        return True
     dirs = worktree_git.git_dirs(top)
     return dirs is not None and worktree_git.remove_target_unambiguous(dirs[1], target, candidates)
 

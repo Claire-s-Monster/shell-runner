@@ -349,8 +349,8 @@ def test_worktree_add_with_post_checkout_hook_stays_t3(lay: Layout) -> None:
     assert lay.tier(ADD) == T3  # non-executable counts as present
     hook.chmod(0o755)
     assert lay.tier(ADD) == T3
-    # remove runs no post-checkout hook
-    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+    # remove needs the same inert hooks/config as add
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
 
 
 def test_worktree_add_with_dangling_symlink_hook_stays_t3(lay: Layout) -> None:
@@ -393,7 +393,7 @@ def test_worktree_add_hookspath_or_include_in_any_config_stays_t3(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content)
     assert lay.tier(ADD) == T3
-    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
 
 
 def test_worktree_add_sample_only_hooks_dir_is_t2(lay: Layout) -> None:
@@ -477,7 +477,7 @@ def test_worktree_add_risky_config_stays_t3(lay: Layout, content: str) -> None:
     (lay.home / ".gitconfig").unlink()
     (lay.repo / ".git" / "config").write_text(content)
     assert lay.tier(ADD) == T3
-    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
 
 
 @pytest.mark.parametrize(
@@ -611,7 +611,7 @@ def test_worktree_add_xdg_config_home_is_honoured(
 def test_worktree_add_system_gitconfig_stays_t3(lay: Layout, content: str) -> None:
     worktree_git.SYSTEM_GITCONFIG.write_text(content)
     assert lay.tier(ADD) == T3
-    assert lay.tier("git worktree remove ../worktrees/existing") == T2
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
 
 
 def test_worktree_add_unreadable_config_stays_t3(lay: Layout) -> None:
@@ -647,6 +647,47 @@ def test_worktree_linked_checkout_with_bad_gitfile_stays_t3(lay: Layout) -> None
     assert lay.tier("git worktree add ../sibling", cwd=lay.worktrees / "existing") == T3
     (lay.worktrees / "existing" / ".git").write_text(f"gitdir: {lay.root}/missing\n")
     assert lay.tier("git worktree add ../sibling", cwd=lay.worktrees / "existing") == T3
+
+
+RM = "git worktree remove ../worktrees/existing"
+
+
+def test_worktree_remove_clean_is_t2(lay: Layout) -> None:
+    assert lay.tier(RM) == T2
+    (lay.repo / ".git" / "hooks").mkdir()
+    (lay.repo / ".git" / "hooks" / "pre-commit.sample").write_text("x")
+    (lay.repo / ".git" / "config").write_text("[core]\n\tbare = false\n")
+    assert lay.tier(RM) == T2
+
+
+def test_worktree_remove_with_fsmonitor_in_repo_config_is_t3(lay: Layout) -> None:
+    (lay.repo / ".git" / "config").write_text("[core]\n\tfsmonitor = /x\n")
+    assert lay.tier(RM) == T3
+
+
+@pytest.mark.parametrize("name", ["post-checkout", "reference-transaction", "fsmonitor-watchman"])
+def test_worktree_remove_with_non_sample_hook_is_t3(lay: Layout, name: str) -> None:
+    hooks = lay.repo / ".git" / "hooks"
+    hooks.mkdir()
+    (hooks / name).write_text("x")
+    assert lay.tier(RM) == T3
+
+
+def test_worktree_remove_user_config_and_lfs_exception(lay: Layout) -> None:
+    (lay.home / ".gitconfig").write_text(STOCK_LFS)
+    assert lay.tier(RM) == T2  # stock lfs filter in user config is inert
+    (lay.repo / ".git" / "config").write_text(STOCK_LFS)
+    assert lay.tier(RM) == T3  # but never in the repo config
+    (lay.repo / ".git" / "config").unlink()
+    (lay.home / ".gitconfig").write_text("[core]\n\tfsmonitor = x\n")
+    assert lay.tier(RM) == T3
+
+
+def test_worktree_remove_git_env_in_server_environment_is_t3(
+    lay: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_DIR", "/x")
+    assert lay.tier(RM) == T3
 
 
 def test_worktree_remove_requires_a_registered_worktree(lay: Layout) -> None:

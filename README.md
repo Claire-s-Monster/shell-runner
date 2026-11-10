@@ -190,15 +190,19 @@ included.
    Further fail-closed rules: only `-b <branch>` is accepted (`-B` resets an existing
    branch); the target must be a direct child of the root (no nesting); the repo top
    must lie inside `$HOME` (not `$HOME`, an ancestor, or `/`) and so must the root.
-   `add` runs the repo's `post-checkout` hook, so it is auto-allowed only when none can
-   run: `<common-dir>/hooks/post-checkout` must not exist (any file or dangling
-   symlink counts; `.git` files are followed via `gitdir:` and `commondir`); no
-   `hookspath` text and no `[include*]` section in `<common-dir>/config`,
-   `config.worktree`, `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` or `/etc/gitconfig`
-   (a read error other than "missing" also prompts); and no `GIT_DIR`,
-   `GIT_COMMON_DIR`, `GIT_WORK_TREE` or `GIT_CONFIG*` in the server environment.
-   `git -c core.hooksPath=...` and `--git-dir` prompt via the plain-command rule. `remove`
-   must name exactly a registered worktree (`<common-dir>/worktrees/*/gitdir`) and no
+   `add` and `remove` run hooks and config-driven commands (checkout, status-like
+   cleanliness checks), so both are auto-allowed only when nothing can run:
+   `<common-dir>/hooks` (and the private gitdir's) must be missing or hold only regular
+   `*.sample` files (`.git` files are followed via `gitdir:` and `commondir`); none of
+   `<common-dir>/config`, `config.worktree`, `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`
+   or `/etc/gitconfig` may contain `hookspath`, `[include*]`, `[filter*]`/`filter.`,
+   `fsmonitor`, `attributesfile`, `sshcommand`, `pager`, `editor`, `askpass`, a
+   `[diff]`/`[merge]` driver/command/external, or any unparseable line (a read error
+   other than "missing" also prompts). The one exception is the exact stock `git lfs
+   install` `[filter "lfs"]` section, honoured only in the user/system files, never the
+   repo's. No `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE` or `GIT_CONFIG*` may be set in
+   the server environment. `git -c core.hooksPath=...` and `--git-dir` prompt via the
+   plain-command rule. `remove` must also name exactly a registered worktree (`<common-dir>/worktrees/*/gitdir`) and no
    other registered worktree may end with `/<arg>` (git resolves a bare suffix first).
 
 **Git-directory write guard** ([#84](https://github.com/Claire-s-Monster/shell-runner/issues/84)).
