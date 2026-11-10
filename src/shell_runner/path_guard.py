@@ -22,16 +22,18 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import exec_guard
+from . import exec_guard, rules
 from .catalog import Tier
 from .executor import current_cwd_roots
 from .monitor import is_credential_path
 from .normalizer import _resolve_abs, classify_path
 from .rules import PathMatch
-from .write_targets import CommandPaths, _join_base, analyze
+from .shellprep import SENTINEL_PREFIX
+from .write_targets import CommandPaths, _join_base, _split, _tokenize, analyze
 
 GIT_DIR_GLOB = "builtin:.git"
 _TMP_ROOT = "/tmp"
@@ -402,6 +404,8 @@ def evaluate(
                 _unresolved_finding(cp),
                 _exec_finding(cp),
                 _bare_repo_finding(cp, cwd),
+                _worktree_finding(cp, command, cwd, env, sole=len(cps) == 1),
+                _mkdir_finding(cp, cwd, home),
             )
             if f is not None
         ]
@@ -421,3 +425,196 @@ def evaluate(
     # strictest tier first; at a tie a guarded (approval-proof) finding beats an unguarded one
     best = min(findings, key=lambda f: (_STRICTNESS[f.tier], not f.guarded))
     return replace(best, git_matches=tuple(dict.fromkeys(git_matches)))
+
+
+# ---------------------------------------------------------------------------
+# git worktree add / remove
+# ---------------------------------------------------------------------------
+#
+# `git worktree add|remove` is T2 only when ALL of these hold (otherwise it keeps its
+# catalog tier, T3 or higher):
+#   * the whole command is exactly one plain `git worktree add|remove ...` (no `-C`,
+#     cd, env prefix, pipe, `;`/`&&`, redirect, variable, glob or substitution)
+#   * only these options: add -b/-B <branch>, --detach/-d, -q/--quiet, --checkout,
+#     --no-checkout, --track, --no-track; remove takes none. Never --force/-f/--lock.
+#   * the target, resolved against the real cwd both lexically (`..` collapsed) and
+#     through symlinks, is a strict descendant of an allowed `worktrees/` root, which is
+#     derived from the enclosing repo top (nearest `.git` within the cwd roots, found
+#     without running git):
+#       <repo parent>/worktrees      e.g. <project>/development -> <project>/worktrees
+#       <repo>/.claude/worktrees
+#       the cwd's own parent when it is itself a `worktrees/` dir (cwd is a worktree)
+#   * and it is not $HOME, a credential path, a system path, or any path matching a
+#     protected-path rule (a rules config error also fails the check).
+# Any `git worktree add|remove` that is not allowed is marked path-guarded (T3 floor,
+# no persisted template/verb approval can lower it): the shared template
+# `git worktree add <cwd_path>` covers allowed and disallowed targets alike.
+
+_WT_SAFE_FLAGS = frozenset(
+    {"--detach", "-d", "-q", "--quiet", "--checkout", "--no-checkout", "--track", "--no-track"}
+)
+_WT_BRANCH_OPTS = frozenset({"-b", "-B"})
+_WT_META_CHARS = frozenset("$`;&|<>()*?[]{}!~\\\n\r#")
+_WT_SYSTEM_PREFIXES = (
+    "/etc",
+    "/usr",
+    "/var",
+    "/boot",
+    "/root",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt",
+)
+
+
+def _plain_words(command: str) -> list[str] | None:
+    """Words of `command` when, after the shared shellprep preprocessing, it is exactly one
+    simple command with no redirect (so no cd, env prefix, pipe, list or hidden substitution)."""
+    tokens = _tokenize(command)
+    if tokens is None:
+        return None
+    segments = _split(tokens)
+    if len(segments) != 1 or segments[0][1]:
+        return None
+    return segments[0][0]
+
+
+def _worktree_target(command: str) -> str | None:
+    """Target path of a plain `git worktree add|remove` using only safe options."""
+    tokens = _plain_words(command)
+    if tokens is None:
+        return None
+    if any(c in _WT_META_CHARS or t.startswith(SENTINEL_PREFIX) for t in tokens for c in t):
+        return None
+    if tokens[:2] != ["git", "worktree"] or len(tokens) < 3 or tokens[2] not in ("add", "remove"):
+        return None
+    sub, args = tokens[2], tokens[3:]
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if sub == "add" and a in _WT_BRANCH_OPTS:
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                return None
+            i += 2
+            continue
+        if sub == "add" and a in _WT_SAFE_FLAGS:
+            i += 1
+            continue
+        if not a or a.startswith("-"):
+            return None
+        positional.append(a)
+        i += 1
+    if not 1 <= len(positional) <= (2 if sub == "add" else 1):
+        return None
+    return positional[0]
+
+
+def _worktree_roots(cwd_real: Path) -> list[Path]:
+    top = _repo_top(cwd_real)
+    if top is None:
+        return []
+    roots = [top.parent / "worktrees", top / ".claude" / "worktrees"]
+    if top.parent.name == "worktrees":
+        roots.append(top.parent)
+    return roots
+
+
+def _worktree_path_ok(
+    path: str, roots: list[Path], cwd: str, env: dict[str, str], home: str
+) -> bool:
+    if path == os.path.realpath(home) or path.startswith(_WT_SYSTEM_PREFIXES):
+        return False
+    if classify_path(path, cwd, env) in ("<cred_path>", "<etc_path>", "<system_path>"):
+        return False
+    p = Path(path)
+    if not any(p != r and p.is_relative_to(r) for r in roots):
+        return False
+    verdict = rules.evaluate(f"touch {shlex.quote(path)}", cwd)
+    return verdict.config_error is None and not verdict.matches
+
+
+def worktree_target_allowed(command: str, cwd: str, env: dict[str, str] | None = None) -> bool:
+    """True iff `command` is a plain `git worktree add|remove` passing the path check."""
+    env = env or {}
+    home = env.get("HOME", os.path.expanduser("~"))
+    target = _worktree_target(command)
+    if target is None:
+        return False
+    cwd_real = os.path.realpath(cwd)
+    roots = _worktree_roots(Path(cwd_real))
+    joined = os.path.join(cwd_real, target)
+    candidates = (os.path.normpath(joined), os.path.realpath(joined))
+    return all(_worktree_path_ok(c, roots, cwd_real, env, home) for c in candidates)
+
+
+def _worktree_finding(
+    cp: CommandPaths, command: str, cwd: str, env: dict[str, str], *, sole: bool
+) -> GuardFinding | None:
+    if cp.verb != "git" or not any(
+        a == "worktree" and b in ("add", "remove")
+        for a, b in zip(cp.args, cp.args[1:], strict=False)
+    ):
+        return None
+    if sole and worktree_target_allowed(command, cwd, env):
+        return None
+    return GuardFinding(
+        Tier.APPROVE_ONCE,
+        "worktree_path",
+        "git worktree add/remove needs approval unless it is a plain, non-forced command "
+        "targeting an allowed worktrees/ directory",
+    )
+
+
+def _mkdir_target_ok(path: str, cwd: str, home: str) -> bool:
+    """In cwd (or /tmp, left to the catalog's scratch rules) and not protected."""
+    abs_p = _resolve_abs(path, cwd, home)
+    cwd_real = Path(os.path.realpath(cwd))
+    p = Path(abs_p)
+    if not (p.is_relative_to(cwd_real) or abs_p == _TMP_ROOT or abs_p.startswith(_TMP_ROOT + "/")):
+        return False
+    verdict = rules.evaluate(f"touch {shlex.quote(abs_p)}", cwd)
+    return verdict.config_error is None and not verdict.matches
+
+
+def _mkdir_finding(cp: CommandPaths, cwd: str, home: str) -> GuardFinding | None:
+    """mkdir stays T2 only when every target resolves inside cwd (or /tmp scratch) and
+    is not a protected path: `..` hops are classified <cwd_path> by the normalizer."""
+    if cp.verb != "mkdir":
+        return None
+    for target in cp.args:
+        dynamic = any(c in target for c in _DYNAMIC_CHARS)
+        if dynamic or not all(_mkdir_target_ok(c, cwd, home) for c in _candidates(target, cp)):
+            return GuardFinding(
+                Tier.APPROVE_ONCE,
+                "mkdir_outside_cwd",
+                f"mkdir {target} resolves outside cwd or onto a protected path",
+            )
+    return None
+
+
+def write_labels(command: str) -> list[str]:
+    """`fs-write: ...` audit labels for output redirects and `tee` targets.
+
+    /dev/null-style devices are not writes and fd duplications (2>&1, >&2) never
+    reach `redirects`.
+    """
+    labels: list[str] = []
+    for cp in analyze(command):
+        labels += [
+            f"fs-write: redirect {t}"
+            for t in cp.redirects
+            if os.path.normpath(t) not in _SAFE_DEVICES
+        ]
+        if cp.verb == "tee":
+            labels += [
+                f"fs-write: tee {t}"
+                for t in cp.writes[len(cp.redirects) :]
+                if os.path.normpath(t) not in _SAFE_DEVICES
+            ]
+    return labels
