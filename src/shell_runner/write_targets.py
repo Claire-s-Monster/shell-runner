@@ -51,7 +51,7 @@ def _tokenize(command: str) -> list[str] | None:
 
     There is deliberately no whitespace-split fallback: a command that shlex rejects
     would lose every separator, so callers must treat None as unparseable (fail closed)."""
-    prepared = prepare(command, keep_heredoc_tail=True)
+    prepared = prepare(command)
     if not prepared.ok:
         return None
     try:
