@@ -25,6 +25,7 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import exec_guard
 from .catalog import Tier
 from .executor import current_cwd_roots
 from .monitor import is_credential_path
@@ -294,6 +295,16 @@ def _unresolved_finding(cp: CommandPaths) -> GuardFinding | None:
     )
 
 
+def _exec_finding(cp: CommandPaths) -> GuardFinding | None:
+    """awk/sed/git forms that run code or write files (issue #85); approval-proof, since
+    the catalog template (`awk <arg>`, `git fetch <arg>`) is shared with the safe forms."""
+    verdict = exec_guard.check(cp)
+    if verdict is None:
+        return None
+    tier, category, reason = verdict
+    return GuardFinding(tier, category, reason)
+
+
 def _git_dir_matches(cp: CommandPaths, cwd: str, home: str) -> list[PathMatch]:
     """Write targets (redirects and every verb write) that resolve into a git dir.
 
@@ -339,6 +350,7 @@ def evaluate(command: str, cwd: str, env: dict[str, str] | None = None) -> Guard
                 _redirect_finding(cp, cwd, env, home),
                 _search_finding(cp, cwd, env, home),
                 _unresolved_finding(cp),
+                _exec_finding(cp),
             )
             if f is not None
         ]
