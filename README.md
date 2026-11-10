@@ -111,6 +111,14 @@ override the catalog-derived tier using persisted approvals, in this order:
 4. **Catalog rule** — the base tier from `catalog.py` applies when neither
    promotion hits.
 
+**Inline code is never promotable.** Commands that run inline code (`bash -c`,
+`python3 -c` and their option-cluster variants, `source <file>`) always need a
+fresh approval, including inside compound commands and wrappers such as
+`nohup bash -lc ...`. `approve_template`, `approve_template_global` and
+`approve_verb` on such a prompt degrade to a one-shot approval (the response
+carries a `scope_warning` saying so), and any template or verb row already
+stored for these shapes is ignored.
+
 Whichever tier results (promoted or catalog), the agent's `agent_cap` is
 re-applied via the PERMISSIVENESS cap-min formula (`_cap_permissiveness`).
 This means an `AUTO_CAPPED`-capped agent can still only receive

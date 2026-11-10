@@ -66,18 +66,18 @@ def test_scratchpad_operand_placeholder() -> None:
 # (command, expected tier): must not be auto-executed.
 NOT_ALLOWED = [
     # extra / different flags and -c
-    ("bash -n -c x", T3),
+    ("bash -n -c x", T4),
     ("bash -n -x f.sh", T3),
     ("bash -x -n f.sh", T3),
     ("bash -nx f.sh", T3),
     ("bash -n -- f.sh", T3),
     ("bash -n", T3),
     ("bash -c 'x'", T4),
-    ("bash -n -c 'x'", T3),
+    ("bash -n -c 'x'", T4),
     ("bash f.sh", T3),
     ("python3 -m py_compile f.py", T3),
     ("python3 -I -m py_compile", T3),
-    ("python3 -I -c 'import os'", T3),
+    ("python3 -I -c 'import os'", T4),
     ("python3 -I -m pip install x", T3),
     ("python3 -I -m py_compile -q f.py", T3),
     ("python3 -I -P -m py_compile f.py", T3),

@@ -38,6 +38,9 @@ class Rule:
     agent_scope: str | None = None  # None = all agents; or specific agent_id
     source: str = "seed"  # "seed" | "learned" | "manual"
     reason: str = ""
+    # False = inline code: never promotable via approve_template/approve_verb, and
+    # persisted template/verb approvals are ignored for commands matching the rule.
+    promotable: bool = True
 
     def compiled(self) -> re.Pattern[str]:
         return re.compile(self.pattern)
@@ -545,11 +548,34 @@ T4_ALWAYS_APPROVE: list[Rule] = [
     Rule(r"^chown\s+\w+\s+\S+$", Tier.ALWAYS_APPROVE, "fs-write"),
     Rule(r"^kill(\s+-9)?\s+<n>$", Tier.ALWAYS_APPROVE, "process"),
     # Process / code exec
-    Rule(r"^bash\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
-    Rule(r"^sh\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
-    Rule(r"^(?:z|da|k)sh\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
-    Rule(r"^python3?\s+-c\b", Tier.ALWAYS_APPROVE, "process"),
-    Rule(r"^source\s+\S+$", Tier.ALWAYS_APPROVE, "process"),
+    # Shells (bash sh dash zsh ksh): `-c` after any run of options. Options are
+    # short flags/clusters (`-e`, `-ec`, `+x`), `-o|+o|-O|+O <name>` (a cluster
+    # ending in o/O takes a value), `--rcfile|--init-file <f>`, and long flags.
+    # The first non-option word (script name) stops the scan, so
+    # `bash script.sh -c x` and `shellcheck ...` do not match.
+    Rule(
+        r"^(?:bash|sh|dash|zsh|ksh)"
+        r"(?:\s+(?:[-+][A-Za-z]*[oO]\s+\S+|--(?:rcfile|init-file)\s+\S+|--[\w-]+|[-+][A-Za-z]+))*"
+        r"\s+[-+][A-Za-z]*c",
+        Tier.ALWAYS_APPROVE,
+        "process",
+        promotable=False,
+    ),
+    # Python (python, python3, python3.N): `-c` after any run of interpreter
+    # options: `-W|-X <x>` (also inside a cluster, `-IW x`), `--check-hash-based-pycs <x>`,
+    # long flags, and short flags/clusters (`-I`, `-Ic`, `-IEc`). A cluster
+    # reaching `c` is inline code. The first non-option word (script or module
+    # name) stops the scan, so `python3 -m foo -c x` and `python3 s.py -c x`
+    # stay T3 (the -c belongs to the module/script).
+    Rule(
+        r"^python(?:3(?:\.\d+)?)?"
+        r"(?:\s+(?:-[A-Za-z]*[WX]\s+\S+|--check-hash-based-pycs\s+\S+|--[\w-]+(?:=\S+)?|-[A-Za-z]+))*"
+        r"\s+-[A-Za-z]*c",
+        Tier.ALWAYS_APPROVE,
+        "process",
+        promotable=False,
+    ),
+    Rule(r"^source\s+\S+$", Tier.ALWAYS_APPROVE, "process", promotable=False),
 ]
 
 # ---------------------------------------------------------------------------
