@@ -21,7 +21,7 @@ _ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
 _INTERPRETER_RE = re.compile(r"^(?:python[\d.]*|perl|ruby|node|sh|bash|zsh|dash)$")
 _INLINE_FLAG_RE = re.compile(r"^-[A-Za-z]*[ceE]$")
 
-_DELETE_VERBS = frozenset({"rm", "rmdir", "truncate", "touch", "shred", "unlink"})
+_DELETE_VERBS = frozenset({"rm", "rmdir", "truncate", "touch", "shred", "unlink", "mkdir"})
 _COPY_VERBS = frozenset({"cp", "mv", "install", "ln"})
 
 
