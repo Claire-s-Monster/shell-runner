@@ -79,11 +79,15 @@ def test_redirect_outside_cwd_needs_approval(command: str) -> None:
         "echo x >/dev/null 2>&1",
         "echo x 2>&1",
         "echo x >&2",
-        "echo x > $OUT",
     ],
 )
 def test_redirect_into_cwd_tmp_devnull_keeps_tier(command: str) -> None:
     assert _tier(command) == T1
+
+
+def test_unresolvable_redirect_target_is_t3_since_84() -> None:
+    # was T1 (the target could not be resolved, so the guard skipped it); now fail closed
+    assert _tier("echo x > $OUT") == T3
 
 
 def test_guard_never_loosens() -> None:

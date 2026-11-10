@@ -1423,7 +1423,8 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     guarded_note: str | None = None
     if reusable:
         pending = db.get_pending_prompt(req.prompt_id)
-        if pending is not None and path_guard.evaluate(pending["raw_cmd"], pending["cwd"]):
+        guard = path_guard.evaluate(pending["raw_cmd"], pending["cwd"]) if pending else None
+        if guard is not None and guard.guarded:
             guarded_note = (
                 f"{req.decision} downgraded to a one-shot approval: this command redirects "
                 "outside the cwd or searches a broad/credential path, and a reusable approval "

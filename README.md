@@ -180,13 +180,23 @@ checkout|restore|rm|mv|apply` paths, `tar -C`) inside a git directory is T3 at
 least, immune to template/verb/global approvals (`path_guard:git_dir_write`),
 and flagged (`protected_path_match` glob `builtin:.git`, found by
 `shell_audit(flagged_only=true)`). It is never a DENY. A git directory is any path
-with a `.git` component, plus the target of a `.git` file's `gitdir:` line and
+with a `.git` component, the target of a `.git` file's `gitdir:` line and
 that directory's `commondir` (found by walking up from the cwd; git is not
-run). Targets are checked both normalized and symlink-resolved; `$VAR`, globs
-and command substitutions in a target are not resolved and keep their previous
-tier. Reads (`cat .git/config`, `git status`) are unchanged. Not covered:
-`.gitattributes` (outside `.git`), inline interpreter code, `git config`
-itself, and writes through a variable or glob.
+run), or any directory with the structural signature `HEAD` + `objects/` +
+`refs/` (bare repos, separate git dirs; checked on the cwd's and the target's
+ancestors). Targets are checked both normalized and symlink-resolved. `git
+log|show|diff ... --output=F` (or `--output F`, or a unique prefix such as
+`--outp`) counts as a write to `F`. Reads (`cat .git/config`, `git status`) are
+unchanged. Not covered: `.gitattributes` (outside `.git`), inline interpreter
+code, and `git config` itself.
+
+**Unresolvable write targets are T3.** A write target containing `$`, a
+backtick, `*`, `?`, `[` or `{` cannot be resolved statically, so the command is
+at least T3 (it is not approval-proof unless the target could name a `.git`
+component, e.g. `.git/c*` or `$D` alone). This changes previously auto-executing
+shapes such as `echo x > $TMPDIR/f`, `echo x >> $OUT`, `echo x > out-*.txt`,
+``echo x > `pwd`/f``, `echo x > f{1,2}`, and the same targets for `tee`, `touch`,
+`mkdir`, `cp`, `mv`, `ln`, `dd of=`, `truncate`, `sed -i`.
 
 ## Audit trail: approver columns, retention, `shell_audit`
 

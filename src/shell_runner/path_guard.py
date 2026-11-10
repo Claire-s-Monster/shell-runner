@@ -49,6 +49,8 @@ class GuardFinding:
     reason: str
     # built-in git-dir write hits: surfaced as flagged protected_path matches (audit)
     git_matches: tuple[PathMatch, ...] = ()
+    # False: raise the tier only; persisted template/verb approvals may still apply
+    guarded: bool = True
 
 
 def _candidates(path: str, cp: CommandPaths) -> list[str]:
@@ -196,16 +198,28 @@ def _dirs_from_dot_git(d: Path) -> list[str]:
 def _git_dirs_for(start: str) -> list[str]:
     """Walk up from `start` to the nearest `.git` entry (no git subprocess)."""
     real = Path(os.path.realpath(start))
+    structural = [str(d) for d in (real, *real.parents) if _is_git_structure(d)]
     for d in (real, *real.parents):
         dirs = _dirs_from_dot_git(d)
         if dirs:
-            return [p for g in dirs for p in (os.path.normpath(g), os.path.realpath(g))]
-    return []
+            found = [*dirs, *structural]
+            return [p for g in found for p in (os.path.normpath(g), os.path.realpath(g))]
+    return [p for g in structural for p in (os.path.normpath(g), os.path.realpath(g))]
+
+
+def _is_git_structure(d: Path) -> bool:
+    """A bare repo / separate git dir signature: HEAD file + objects/ + refs/."""
+    try:
+        return (d / "HEAD").is_file() and (d / "objects").is_dir() and (d / "refs").is_dir()
+    except OSError:
+        return False
 
 
 def _in_git_dir(path: str, git_dirs: list[str]) -> bool:
     p = Path(path)
-    return ".git" in p.parts or any(p.is_relative_to(g) for g in git_dirs)
+    if ".git" in p.parts or any(p.is_relative_to(g) for g in git_dirs):
+        return True
+    return any(_is_git_structure(a) for a in (p, *p.parents))
 
 
 def _expand_home(path: str, home: str) -> str:
@@ -214,6 +228,70 @@ def _expand_home(path: str, home: str) -> str:
     if path.startswith("~/"):
         return home + path[1:]
     return home + path[5:] if path.startswith("$HOME") else path
+
+
+_DYNAMIC_PIECE_RE = re.compile(
+    r"(\$\{[^}]*\}?|\$\([^)]*\)?|\$\w*|`[^`]*`?|\{[^}]*\}?|\[[^\]]*\]?|[*?])"
+)
+_PURE_VAR_RE = re.compile(r"\$\w+|\$\{\w+\}|\$\([^)]*\)|`[^`]*`")
+
+
+def _is_dynamic(target: str) -> bool:
+    return any(c in target for c in _DYNAMIC_CHARS)
+
+
+def _component_regex(component: str) -> re.Pattern[str]:
+    """Over-approximate regex for a shell word: every expansion/glob piece is `.*`."""
+    parts = _DYNAMIC_PIECE_RE.split(component)
+    return re.compile("".join(".*" if i % 2 else re.escape(p) for i, p in enumerate(parts)))
+
+
+def _could_be_dot_git(target: str) -> bool:
+    """True when an unresolvable target may still name a `.git` component.
+
+    A literal `.git` component counts; so does a component whose globs/expansions
+    could spell `.git`. A leading pure `$VAR` / `$(..)` / backtick component followed
+    by more path (`$TMPDIR/f`) is taken as a base directory, not as a `.git`
+    component; a target that is nothing but an expansion (`$F`) could be anything.
+    """
+    comps = [c for c in target.split("/") if c]
+    for i, c in enumerate(comps):
+        if c == ".git":
+            return True
+        if not _is_dynamic(c):
+            continue
+        if i == 0 and len(comps) > 1 and _PURE_VAR_RE.fullmatch(c):
+            continue
+        if _component_regex(c).fullmatch(".git"):
+            return True
+    return False
+
+
+def _unresolved_targets(cp: CommandPaths) -> list[str]:
+    return [t for t in dict.fromkeys(cp.writes) if t and _is_dynamic(t)]
+
+
+_STRICTNESS = {
+    Tier.DENY: 0,
+    Tier.ALWAYS_APPROVE: 1,
+    Tier.APPROVE_ONCE: 2,
+    Tier.AUTO_CAPPED: 3,
+    Tier.AUTO_LOG: 4,
+}
+
+
+def _unresolved_finding(cp: CommandPaths) -> GuardFinding | None:
+    """A write target built from `$`, backticks, globs or braces cannot be resolved:
+    fail closed to T3 (approvals may still apply unless it could be a `.git` path)."""
+    targets = _unresolved_targets(cp)
+    if not targets:
+        return None
+    return GuardFinding(
+        Tier.APPROVE_ONCE,
+        "unresolved_write_target",
+        f"write target {targets[0]!r} cannot be resolved statically",
+        guarded=False,
+    )
 
 
 def _git_dir_matches(cp: CommandPaths, cwd: str, home: str) -> list[PathMatch]:
@@ -227,7 +305,11 @@ def _git_dir_matches(cp: CommandPaths, cwd: str, home: str) -> list[PathMatch]:
     git_dirs = [g for b in dict.fromkeys(bases) for g in _git_dirs_for(b)]
     found: list[PathMatch] = []
     for target in cp.writes:
-        if not target or any(c in target for c in _DYNAMIC_CHARS):
+        if not target:
+            continue
+        if _is_dynamic(target):
+            if _could_be_dot_git(target):
+                found.append(PathMatch(target, GIT_DIR_GLOB, "flag", "write", "builtin"))
             continue
         for cand in _candidates(target, cp):
             try:
@@ -247,27 +329,32 @@ def evaluate(command: str, cwd: str, env: dict[str, str] | None = None) -> Guard
     """Most restrictive finding for `command`, or None when nothing is flagged."""
     env = env or {}
     home = env.get("HOME", os.path.expanduser("~"))
-    worst: GuardFinding | None = None
+    findings: list[GuardFinding] = []
     git_matches: list[PathMatch] = []
     for cp in analyze(command):
         git_matches += _git_dir_matches(cp, cwd, home)
-        for finding in (
-            _redirect_finding(cp, cwd, env, home),
-            _search_finding(cp, cwd, env, home),
-        ):
-            if finding is None:
-                continue
-            if finding.tier == Tier.DENY:
-                return replace(finding, git_matches=tuple(git_matches))
-            worst = worst or finding
-    if not git_matches:
-        return worst
-    if worst is not None and worst.tier == Tier.DENY:
-        return worst
-    first = git_matches[0]
-    return GuardFinding(
-        Tier.APPROVE_ONCE,
-        "git_dir_write",
-        f"write into git directory ({first.path}); can plant hooks/config that git later executes",
-        tuple(dict.fromkeys(git_matches)),
-    )
+        findings += [
+            f
+            for f in (
+                _redirect_finding(cp, cwd, env, home),
+                _search_finding(cp, cwd, env, home),
+                _unresolved_finding(cp),
+            )
+            if f is not None
+        ]
+    if git_matches:
+        first = git_matches[0]
+        findings.insert(
+            0,
+            GuardFinding(
+                Tier.APPROVE_ONCE,
+                "git_dir_write",
+                f"write into git directory ({first.path}); can plant hooks/config that "
+                "git later executes",
+            ),
+        )
+    if not findings:
+        return None
+    # strictest tier first; at a tie a guarded (approval-proof) finding beats an unguarded one
+    best = min(findings, key=lambda f: (_STRICTNESS[f.tier], not f.guarded))
+    return replace(best, git_matches=tuple(dict.fromkeys(git_matches)))
