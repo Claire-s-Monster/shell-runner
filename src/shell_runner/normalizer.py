@@ -1057,7 +1057,7 @@ def _normalize_internal(
 
     # Shared preprocessing (also used by write_targets): line continuations (bash joins
     # them with no space), comments, ANSI-C quotes, heredoc bodies, newline separators.
-    prepared = prepare(command, keep_heredoc_tail=False)
+    prepared = prepare(command)
     for warning in prepared.warnings:
         state.warn(warning)
     cmd = prepared.text

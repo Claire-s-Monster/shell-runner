@@ -95,11 +95,10 @@ def decode_ansi_c(raw: str) -> str:
 
 
 class _Scanner:
-    def __init__(self, text: str, *, keep_tail: bool, sentinel_start: int) -> None:
+    def __init__(self, text: str, *, sentinel_start: int) -> None:
         self.s = text
         self.n = len(text)
         self.i = 0
-        self.keep_tail = keep_tail
         self.out: list[str] = []
         self.sep_pending = False
         self.pending: list[str] = []  # heredoc delimiters awaiting their bodies
@@ -230,18 +229,13 @@ class _Scanner:
         self.sentinels[name] = "<heredoc>"
         return name
 
-    def _skip_tail(self) -> None:
-        if not self.keep_tail:
-            end = self.s.find("\n", self.i)
-            self.i = self.n if end < 0 else end
-
     def _heredoc(self) -> None:
+        # Only the body is removed; the rest of the opener line stays normal shell text.
         s = self.s
         if s.startswith("<<<", self.i):
             m = _HERESTRING_WORD_RE.match(s, self.i + 3)
             self._emit(self._sentinel())
             self.i = m.end() if m else self.i + 3
-            self._skip_tail()
             return
         m = _OPENER_RE.match(s, self.i)
         if m is None:
@@ -251,13 +245,13 @@ class _Scanner:
         self.pending.append(next(g for g in m.groups() if g))
         self._emit(self._sentinel())
         self.i = m.end()
-        self._skip_tail()
 
     def _consume_bodies(self) -> None:
         for delim in self.pending:
             while True:
                 if self.i >= self.n:
                     self.warnings.append("unterminated_heredoc")
+                    self.ok = False  # the body cannot be delimited
                     break
                 end = self.s.find("\n", self.i)
                 line = self.s[self.i : self.n if end < 0 else end]
@@ -267,14 +261,17 @@ class _Scanner:
         self.pending = []
 
 
-def prepare(command: str, *, keep_heredoc_tail: bool, sentinel_start: int = 0) -> Prepared:
+def prepare(command: str, *, sentinel_start: int = 0) -> Prepared:
     """Resolve continuations, comments, ANSI-C quotes, heredocs and newlines once.
 
-    `keep_heredoc_tail=False` (normalizer) drops the rest of a heredoc/here-string line
-    after the opener, as the catalog always did; `True` (write_targets) keeps it so a
-    redirect after the opener (`cat <<EOF > .git/config`) is still seen.
+    Heredoc handling removes only the BODY (the lines up to the delimiter); the rest of the
+    opener line (`&& cmd`, `; cmd`, `| cmd`, redirects) stays in the text, so every
+    segment of it is classified. A heredoc whose terminator is missing makes `ok` False.
     """
-    scanner = _Scanner(command, keep_tail=keep_heredoc_tail, sentinel_start=sentinel_start)
+    scanner = _Scanner(command, sentinel_start=sentinel_start)
     scanner.run()
+    if scanner.pending:  # opener on the last line: no body, no terminator
+        scanner.warnings.append("unterminated_heredoc")
+        scanner.ok = False
     warnings = tuple(dict.fromkeys(scanner.warnings))
     return Prepared("".join(scanner.out).strip(), scanner.sentinels, warnings, scanner.ok)
