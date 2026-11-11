@@ -79,6 +79,20 @@ TOOLS: dict[str, dict[str, Any]] = {
                         "Use shell_status(job_id) to poll, shell_kill(job_id) to terminate."
                     ),
                 },
+                "detach": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "If true, run as a transient systemd unit that survives a server "
+                        "restart. Implies a background job: returns decision=running and "
+                        "job_id. timeout_s is IGNORED; the unit's RuntimeMaxSec (default 4h) "
+                        "is the only ceiling. Approvals are bound to this value: an "
+                        "approve_token is valid only when re-calling with the same detach "
+                        "value, and template/verb approvals never auto-approve a detach "
+                        "(approve_template/approve_verb become one-shot). Number of "
+                        "concurrent detached jobs is capped (SHELL_RUNNER_MAX_DETACHED)."
+                    ),
+                },
             },
         },
     },

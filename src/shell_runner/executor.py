@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -25,6 +26,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .models import MAX_TIMEOUT_S
+from .unit_runner import (
+    UNPARSEABLE_RESULT,
+    SystemdBackend,
+    UnitBackend,
+    UnitResult,
+    build_unit_argv,
+    resolve_memory_max,
+    resolve_runtime_max_s,
+    unit_name,
+)
 
 if TYPE_CHECKING:
     from .persistence import Persistence
@@ -534,6 +545,201 @@ def _job_is_terminal(persistence: Persistence, job_id: str) -> bool:
     return row is not None and row.get("status") != "running"
 
 
+# Injectable seam: tests replace this with a fake so no systemd-run is ever spawned.
+_unit_backend: UnitBackend = SystemdBackend()
+
+
+async def execute_detached(
+    db: Persistence,
+    job_id: str,
+    command: str,
+    cwd: str,
+    env_passthrough: list[str] | None,
+    backend: UnitBackend | None = None,
+    *,
+    telemetry_id: str,
+    agent_id: str,
+) -> Path:
+    """Start command as a transient systemd unit and record a kind='unit' job row.
+
+    The sandbox matches execute_background(): cwd goes through resolve_cwd() and
+    the unit's environment is exactly _build_env()'s output. The row is written
+    only after the unit started, so a failed start leaves no row and no job dir.
+    Returns the job dir (stdout.log / stderr.log / result live there).
+    """
+    resolved, cwd_error = resolve_cwd(cwd)
+    if cwd_error is not None or resolved is None:
+        raise ValueError(cwd_error)
+    unit_name(job_id)  # validates job_id before it is used as a path component
+
+    chosen = backend if backend is not None else _unit_backend
+    job_dir = _job_dir_base() / job_id
+    runtime_max_s = resolve_runtime_max_s()
+    # Built before the job dir exists: a rejected cwd/job_dir (ValueError) leaves nothing behind.
+    argv = build_unit_argv(
+        job_id,
+        command,
+        str(resolved),
+        _build_env(env_passthrough),
+        str(job_dir.resolve()),
+        resolve_memory_max(),
+        runtime_max_s,
+    )
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        await chosen.start(argv)
+    except BaseException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+
+    try:
+        await asyncio.to_thread(
+            db.create_job,
+            job_id=job_id,
+            telemetry_id=telemetry_id,
+            raw_cmd=command,
+            cwd=cwd,
+            agent_id=agent_id,
+            timeout_s=runtime_max_s,
+            stdout_path=str(job_dir / "stdout.log"),
+            stderr_path=str(job_dir / "stderr.log"),
+            pid=None,
+            kind="unit",
+        )
+    except BaseException:
+        logger.exception("Failed to persist job row for unit job %s; stopping its unit", job_id)
+        try:
+            await chosen.kill(job_id)
+        except Exception:
+            logger.exception("Error stopping orphaned unit for job %s", job_id)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    return job_dir
+
+
+def _unit_exit_code(result: UnitResult) -> int | None:
+    """The numeric $EXIT_STATUS, or None when systemd reported a signal name."""
+    status = result.exit_status
+    return int(status) if status.isascii() and status.isdigit() else None
+
+
+def _unit_terminal_status(result: UnitResult) -> str:
+    if result.service_result == "timeout":
+        return "timed_out"
+    return "completed" if result.exit_status == "0" else "failed"
+
+
+def _unit_duration_ms(job: dict) -> int:
+    try:
+        started = datetime.fromisoformat(job["started_at"])
+    except (KeyError, TypeError, ValueError):
+        return 0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return max(0, int((datetime.now(UTC) - started).total_seconds() * 1000))
+
+
+def finalize_unit_job(
+    db: Persistence, job: dict, *, status: str, exit_code: int | None = None
+) -> None:
+    """Move a running kind='unit' row to a terminal status and finalize its telemetry call.
+
+    Both writes are only_if_running: a row already terminal (e.g. 'killed') is
+    never overwritten, whichever of kill / refresh / reconcile gets there first.
+    """
+    db.update_job_status(
+        job["job_id"],
+        status=status,
+        exit_code=exit_code,
+        finished_at=_now_iso(),
+        only_if_running=True,
+    )
+    db.finalize_call(
+        job["telemetry_id"],
+        decision="executed",  # the command did run, even if killed / lost
+        exit_code=exit_code,
+        stdout_bytes=_log_size_bytes(job.get("stdout_path")),
+        stderr_bytes=_log_size_bytes(job.get("stderr_path")),
+        duration_ms=_unit_duration_ms(job),
+        decision_path=None,
+        only_if_running=True,
+    )
+
+
+def refresh_unit_job(
+    db: Persistence, job: dict, active: set[str] | None, backend: UnitBackend | None = None
+) -> dict:
+    """If job is a running kind='unit' row whose unit is gone and whose result file
+    exists, record the outcome.
+
+    *active* is the backend's set of active unit job ids, or None when it could not
+    be queried. The result file is written by the job's own user, so it is trusted
+    ONLY once the unit is confirmed inactive (ExecStopPost then replaces any spoofed
+    file with the real one). While the unit is active, or when *active* is None, the
+    row is left as it is. Returns the (possibly updated) row.
+    """
+    if job["kind"] != "unit" or job["status"] != "running" or not job.get("stdout_path"):
+        return job
+    if active is None or job["job_id"] in active:
+        return job
+    chosen = backend if backend is not None else _unit_backend
+    result = chosen.read_result(Path(job["stdout_path"]).parent)
+    if result is None:
+        return job
+    _finalize_from_result(db, job, result)
+    return db.get_job(job["job_id"]) or job
+
+
+def _finalize_from_result(db: Persistence, job: dict, result: UnitResult) -> None:
+    if result == UNPARSEABLE_RESULT:
+        logger.warning("unit job %s: result_unparseable; marking failed", job["job_id"])
+    finalize_unit_job(
+        db, job, status=_unit_terminal_status(result), exit_code=_unit_exit_code(result)
+    )
+
+
+def _settle_gone_unit(db: Persistence, job: dict, backend: UnitBackend) -> None:
+    """A running unit row whose unit is no longer active: take the outcome from the
+    result file, or mark it 'unit_missing' (the existing terminal status for a unit
+    that vanished without recording a result)."""
+    result = backend.read_result(Path(job["stdout_path"]).parent) if job["stdout_path"] else None
+    if result is None:
+        finalize_unit_job(db, job, status="unit_missing")
+    else:
+        _finalize_from_result(db, job, result)
+
+
+async def reconcile_units(db: Persistence, backend: UnitBackend | None = None) -> int:
+    """Settle running kind='unit' rows against systemd; returns how many were changed.
+
+    Active unit: left running. Gone unit: terminal from its result file, else
+    'unit_missing'. If the backend cannot be queried NOTHING is changed (a failed
+    query is not evidence that units are gone); the next tick retries.
+    """
+    chosen = backend if backend is not None else _unit_backend
+    # Rows are read BEFORE the active set: a row is only written after its unit
+    # started, so every row read here has a unit that exists in the later snapshot
+    # if it is still alive. The reverse order could mark a just-started job missing.
+    rows = [j for j in await asyncio.to_thread(db.list_running_jobs) if j["kind"] == "unit"]
+    if not rows:
+        return 0
+    try:
+        active = await chosen.active_units()
+    except Exception as exc:
+        logger.warning("unit reconcile skipped: cannot query systemd (%s); will retry", exc)
+        return 0
+    changed = 0
+    for job in rows:
+        if job["job_id"] in active:
+            continue
+        try:
+            await asyncio.to_thread(_settle_gone_unit, db, job, chosen)
+            changed += 1
+        except Exception:
+            logger.exception("Failed to reconcile unit job %s", job["job_id"])
+    return changed
+
+
 async def execute_background(
     *,
     command: str,
@@ -610,6 +816,7 @@ async def execute_background(
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             pid=proc.pid,
+            kind="process",
         )
     except Exception:
         logger.exception(

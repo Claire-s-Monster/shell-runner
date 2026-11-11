@@ -48,6 +48,7 @@ from .executor import (
     discard_job_tracking,
     execute,
     execute_background,
+    execute_detached,
     inline_budget_s,
     job_result,
     validate_cwd,
@@ -88,6 +89,7 @@ from .persistence import (
     parse_time_bound,
 )
 from .seeds import DEFAULT_SEED_APPROVALS
+from .unit_runner import resolve_max_detached
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,9 @@ _db_path = os.environ.get("SHELL_RUNNER_DB", str(DEFAULT_DB_PATH))
 db = Persistence(db_path=_db_path)
 
 _cleanup_task: asyncio.Task[None] | None = None
+
+# Serialises the detached-unit cap check with the spawn that makes it count.
+_detach_lock = asyncio.Lock()
 
 RETENTION_S = int(os.environ.get("SHELL_RUNNER_JOB_RETENTION_S", str(7 * 24 * 3600)))
 DEFAULT_RETENTION_DAYS = 14
@@ -200,7 +205,7 @@ def _compute_duration_ms(job: dict) -> int | None:
 
 
 def _apply_template_approval(
-    cls: ClassificationResult, agent_id: str, cwd: str
+    cls: ClassificationResult, agent_id: str, cwd: str, detach: bool = False
 ) -> ClassificationResult:
     """Override classification tier via persisted approvals (template or verb+cwd).
 
@@ -243,6 +248,11 @@ def _apply_template_approval(
     if cls.non_promotable:
         return cls
 
+    # 1d. A detached run outlives the session and is bound to its own one-shot
+    # approval: template / verb rows (granted for attached runs) never apply.
+    if detach:
+        return cls
+
     # 2. Exact-template promotion first.
     approved_int = db.get_template_approved_tier(cls.template, agent_id)
     promotion_label = "approved_template"
@@ -281,10 +291,23 @@ def _apply_template_approval(
     )
 
 
+async def _reconcile_units() -> None:
+    """Settle running kind='unit' rows against systemd. Never raises: a failure is
+    logged and retried on the next tick."""
+    try:
+        changed = await executor.reconcile_units(db)
+        if changed:
+            logger.info("Reconciled %d detached unit job(s)", changed)
+    except Exception:
+        logger.exception("Error during unit reconcile")
+
+
 async def _periodic_cleanup(interval_s: int = 60) -> None:
-    """Delete expired pending prompts and stale jobs every *interval_s* seconds."""
+    """Reconcile unit jobs, delete expired pending prompts and stale jobs every
+    *interval_s* seconds."""
     while True:
         await asyncio.sleep(interval_s)
+        await _reconcile_units()
         try:
             # Decided prompts (they carry approver_agent_id) are kept forever:
             # the audit rows they explain are never pruned either.
@@ -365,6 +388,7 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     orphaned = await asyncio.to_thread(monitor.reconcile_orphans, db)
     if orphaned:
         logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
+    await _reconcile_units()  # detached units survive restarts; settle any that finished
 
     try:
         yield
@@ -663,6 +687,7 @@ async def _execute_approved_command(
             normalizer_warnings=[],
             protected_path_match=recheck_cls.protected_path_json,
             flagged=int(recheck_cls.flagged),
+            approval_id=prompt["id"],
         ),
         telemetry_writer,
         catalog_writer,
@@ -688,6 +713,29 @@ class _DispatchContext:
     normalizer_warnings: list[str]
     protected_path_match: str | None
     flagged: int
+    approval_id: str | None = None  # consumed pending_prompts row, restored on a cap refusal
+
+
+def _detach_cap_error(cap: int) -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail=(
+            f"detach refused: {cap} detached jobs already running "
+            f"(SHELL_RUNNER_MAX_DETACHED={cap}); nothing was spawned. "
+            "Wait for one to finish or shell_kill it, then retry."
+        ),
+    )
+
+
+async def _refuse_if_detach_full() -> None:
+    """Unlocked early cap peek: refuse BEFORE a one-shot approval is consumed.
+
+    The locked recheck in _dispatch_approved stays authoritative; this only keeps
+    the common refusal from burning the approval.
+    """
+    cap = resolve_max_detached()
+    if await asyncio.to_thread(db.count_running_units) >= cap:
+        raise _detach_cap_error(cap)
 
 
 async def _dispatch_approved(
@@ -699,10 +747,9 @@ async def _dispatch_approved(
     *,
     approval_consumed: bool = False,
 ) -> ExecuteResponse:
-    """Single post-approval dispatch: background/file vs inline (+ inline-budget divert).
+    """Single post-approval dispatch: detach vs background/file vs inline (+ divert).
 
-    The only place a classified/approved command is spawned. A future
-    `detach` mode needs adding here only. approval_consumed=True enables the
+    The only place a classified/approved command is spawned. approval_consumed=True enables the
     issue #42 sqlite-busy no-op note (approved-token / approve_once path only).
     """
 
@@ -753,6 +800,63 @@ async def _dispatch_approved(
                 was_denied=False,
             )
 
+    if req.detach:
+        # timeout_s is deliberately not passed: the unit's RuntimeMaxSec is the ceiling.
+        telemetry_id = str(uuid.uuid4())
+        job_id = str(uuid.uuid4())
+        # The cap check and the spawn (which writes the kind='unit' job row) are
+        # one critical section, or concurrent dispatches could all pass the check.
+        async with _detach_lock:
+            cap = resolve_max_detached()
+            if await asyncio.to_thread(db.count_running_units) >= cap:
+                # Lost a race with another dispatch after the early peek: give the
+                # already-consumed approval back so the caller can retry.
+                if ctx.approval_id is not None:
+                    await asyncio.to_thread(db.restore_approval, ctx.approval_id)
+                raise _detach_cap_error(cap)
+            await _record(
+                telemetry_id,
+                _written_row("running", None, [*ctx.decision_path, "detached"]),
+                wait=True,
+            )
+            await _upsert_catalog()
+            try:
+                await execute_detached(
+                    db,
+                    job_id,
+                    req.command,
+                    req.cwd,
+                    None,
+                    telemetry_id=telemetry_id,
+                    agent_id=req.agent_id,
+                )
+            except BaseException:
+                # The unit never started: do not leave the pre-written row 'running'.
+                await asyncio.to_thread(
+                    db.finalize_call,
+                    telemetry_id,
+                    decision="failed",
+                    exit_code=None,
+                    stdout_bytes=0,
+                    stderr_bytes=0,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    decision_path=[*ctx.decision_path, "detached", "start_failed"],
+                    only_if_running=True,
+                )
+                raise
+        return ExecuteResponse(
+            decision="running",
+            tier=ctx.final_tier,
+            matched_rule=ctx.matched_rule_pattern,
+            exit_code=None,
+            stdout="",
+            stderr="",
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            telemetry_id=telemetry_id,
+            job_id=job_id,
+        )
     if req.run_in_background or req.output_mode == "file":
         telemetry_id = str(uuid.uuid4())
         await _record(
@@ -921,11 +1025,17 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             mismatches.append(
                 f"agent_id is bound to '{peek['agent_id']}' but request used '{req.agent_id}'"
             )
+        if bool(peek["detach"]) != req.detach:
+            mismatches.append(
+                f"detach is bound to {bool(peek['detach'])} but request used {req.detach}"
+            )
         if mismatches:
             raise HTTPException(
                 status_code=403,
                 detail="approve_token does not match: " + "; ".join(mismatches),
             )
+        if req.detach:
+            await _refuse_if_detach_full()  # before consume: a refusal must not burn the token
         prompt = await asyncio.to_thread(db.consume_approve_token, token=req.approve_token)
         if prompt is None:
             raise HTTPException(
@@ -938,7 +1048,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 
     # Path B: no token — classify first
     cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd)
+    cls = _apply_template_approval(cls, req.agent_id, req.cwd, req.detach)
 
     # DENY
     if cls.tier == Tier.DENY:
@@ -1042,8 +1152,14 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
     # (raw_cmd, cwd, agent_id) consumes it once instead of re-prompting.
     # Single-use + TTL-bounded + exact (cmd, cwd, agent) match = same trust
     # boundary as consuming an approve_token, just without requiring the token.
+    if req.detach:
+        await _refuse_if_detach_full()  # before consume: a refusal must not burn the approval
     consumed = await asyncio.to_thread(
-        db.consume_approval_by_command, raw_cmd=req.command, cwd=req.cwd, agent_id=req.agent_id
+        db.consume_approval_by_command,
+        raw_cmd=req.command,
+        cwd=req.cwd,
+        agent_id=req.agent_id,
+        detach=req.detach,
     )
     if consumed is not None:
         return await _execute_approved_command(
@@ -1128,6 +1244,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         command_tier=int(cls.command_tier),
         matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
         decision_path=list(cls.decision_path),
+        detach=req.detach,
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
@@ -1179,6 +1296,13 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         f" → {cls.tier.name}; requires approval via shell_approve_pending from a primary"
         " session (approver identity is self-reported, not a human check — see issue #29)"
     )
+    detach_rerun = ""
+    if req.detach:
+        why += (
+            "; detach=true: this approval is one-shot and bound to detach=true "
+            "(template/verb approvals never apply to detached runs)"
+        )
+        detach_rerun = " Re-run with detach=true; the token is refused for any other detach value."
     return ExecuteResponse(
         decision="prompt_required",
         tier=int(cls.tier),
@@ -1202,8 +1326,9 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
                 "repeatedly until state is 'approved', then re-run shell_execute with the "
                 "identical command, cwd and agent_id plus approve_token. "
-                "Stop if state is 'denied' or 'expired'."
+                "Stop if state is 'denied' or 'expired'." + detach_rerun
             ),
+            detach=req.detach,
         ),
     )
 
@@ -1344,6 +1469,7 @@ def _prompt_detail(row: dict) -> PendingPromptDetail:
         approved_at=row.get("approved_at"),
         consumed_at=row.get("consumed_at"),
         scope_warning=describe_template_scope(row["normalized_template"]),
+        detach=bool(row.get("detach", 0)),
     )
 
 
@@ -1424,7 +1550,12 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     if reusable:
         pending = db.get_pending_prompt(req.prompt_id)
         guard = path_guard.evaluate(pending["raw_cmd"], pending["cwd"]) if pending else None
-        if guard is not None and guard.guarded:
+        if pending is not None and pending["detach"]:
+            guarded_note = (
+                f"{req.decision} downgraded to a one-shot approval: detach=true approvals "
+                "are bound to detached runs and never promotable"
+            )
+        elif guard is not None and guard.guarded:
             guarded_note = (
                 f"{req.decision} downgraded to a one-shot approval: this command redirects "
                 "outside the cwd or searches a broad/credential path, and a reusable approval "
@@ -1542,15 +1673,37 @@ async def audit_route(body: AuditRequest) -> AuditResponse:
     return AuditResponse(**result)
 
 
+async def _refresh_unit_job(job: dict) -> dict:
+    """Lazily settle a running kind='unit' row from its result file (no-op otherwise).
+
+    Runs before shell_status / shell_wait read the row. A backend or DB error
+    here must not fail the read: the row is returned unchanged.
+    """
+    if job["kind"] != "unit" or job["status"] != "running":
+        return job
+    try:
+        # The result file is only trusted once the backend confirms the unit is gone.
+        try:
+            active: set[str] | None = await executor._unit_backend.active_units()
+        except Exception:
+            logger.warning("cannot query units; leaving job %s untouched", job["job_id"])
+            active = None
+        return await asyncio.to_thread(executor.refresh_unit_job, db, job, active)
+    except Exception:
+        logger.exception("Failed to refresh unit job %s", job["job_id"])
+        return job
+
+
 @app.post("/tools/shell_status", response_model=ShellStatusResponse)
 async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
     job = db.get_job(body.job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"job {body.job_id} not found")
-    # shell_monitor jobs (pid None) also expose their parsed events.
+    job = await _refresh_unit_job(job)
+    # shell_monitor jobs also expose their parsed events.
     events = (
         await asyncio.to_thread(monitor.read_events, job["stdout_path"] or "")
-        if job["pid"] is None
+        if job["kind"] == "monitor"
         else None
     )
     return ShellStatusResponse(
@@ -1703,6 +1856,8 @@ async def _wait_for_terminal(job_id: str, wait_s: float) -> dict | None:
     deadline = time.monotonic() + wait_s
     while True:
         job = db.get_job(job_id)
+        if job is not None:
+            job = await _refresh_unit_job(job)
         if job is None or _is_terminal(job):
             return job
         remaining = deadline - time.monotonic()
@@ -1759,12 +1914,59 @@ async def shell_wait_route(body: ShellWaitRequest) -> ShellWaitResponse:
     )
 
 
+async def _unit_still_active(job_id: str) -> bool:
+    """True unless the unit is positively gone; a failed query counts as active."""
+    try:
+        return job_id in await executor._unit_backend.active_units()
+    except Exception:
+        return True
+
+
+async def _kill_unit_job(job: dict) -> ShellKillResponse:
+    """Stop a unit job. 'killed' is recorded BEFORE the stop, so a refresh that runs
+    while the unit is dying finds a terminal row and cannot record 'failed'. If the
+    stop raises and the unit is still (or possibly) alive, 'killed' is reverted.
+
+    Runs under _detach_lock, the lock guarding the detach cap, so the cap count
+    never drops while the unit is still being stopped."""
+    async with _detach_lock:
+        return await _kill_unit_job_locked(job)
+
+
+async def _kill_unit_job_locked(job: dict) -> ShellKillResponse:
+    job_id = job["job_id"]  # the unit name derives from the row, never from client input
+    await asyncio.to_thread(
+        db.update_job_status,
+        job_id,
+        status="killed",
+        finished_at=_now_iso(),
+        only_if_running=True,
+    )
+    current = await asyncio.to_thread(db.get_job, job_id)
+    if current is None or current["status"] != "killed":
+        return ShellKillResponse(killed=False, reason="job already finished")
+    try:
+        await executor._unit_backend.kill(job_id)
+    except Exception as exc:
+        if await _unit_still_active(job_id):
+            await asyncio.to_thread(
+                db.update_job_status,
+                job_id,
+                status="running",
+                only_if_status="killed",
+            )
+            logger.exception("Failed to stop unit for job %s; reverted to running", job_id)
+            return ShellKillResponse(killed=False, reason=f"failed to stop unit: {exc}")
+    await asyncio.to_thread(executor.finalize_unit_job, db, job, status="killed", exit_code=None)
+    return ShellKillResponse(killed=True, reason="unit stopped")
+
+
 @app.post("/tools/shell_kill", response_model=ShellKillResponse)
 async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
     job = db.get_job(body.job_id)
     if not job or job["status"] != "running":
         return ShellKillResponse(killed=False, reason="job not running or not found")
-    if job["pid"] is None:
+    if job["kind"] == "monitor":
         # shell_monitor job: an asyncio task, not a process. The task writes its own
         # terminal "killed" event; with no live task (e.g. after a restart) just mark it.
         if not await monitor.cancel_monitor(body.job_id, db):
@@ -1776,6 +1978,8 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
                 only_if_running=True,
             )
         return ShellKillResponse(killed=True, reason="monitor stopped")
+    if job["kind"] == "unit":
+        return await _kill_unit_job(job)
     sig = getattr(signal, body.sig, signal.SIGTERM)
     try:
         os.kill(job["pid"], sig)
@@ -1960,9 +2164,12 @@ async def handle_mcp_sse(request: Request) -> StreamingResponse:
 
 
 def _running_jobs_summary() -> list[dict[str, Any]]:
+    """Running jobs a shell-runner restart would orphan. Detached units (kind='unit')
+    are excluded: they are systemd services that survive restarts by design."""
     return [
         {"job_id": j["job_id"], "raw_cmd": j["raw_cmd"], "started_at": j["started_at"]}
         for j in db.list_running_jobs()
+        if j["kind"] != "unit"
     ]
 
 

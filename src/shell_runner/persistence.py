@@ -155,7 +155,11 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("verb_approvals", "approved_by", "TEXT"),
     ("shell_calls", "protected_path_match", "TEXT"),
     ("shell_calls", "flagged", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "kind", "TEXT NOT NULL DEFAULT 'process'"),
+    ("pending_prompts", "detach", "INTEGER NOT NULL DEFAULT 0"),
 )
+
+JOB_KINDS = frozenset({"process", "monitor", "unit"})
 
 
 # Issue #53: SQLite's busy handler is unfair, so many threads in this process
@@ -289,6 +293,10 @@ class Persistence:
             if column not in existing:
                 # table/column/type come from the constant above, never user input.
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")  # noqa: S608
+                if (table, column) == ("jobs", "kind"):
+                    # Only on the migration that adds the column: before it, a
+                    # pid-less job was necessarily a shell_monitor task.
+                    conn.execute("UPDATE jobs SET kind = 'monitor' WHERE pid IS NULL")
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
@@ -533,6 +541,7 @@ class Persistence:
         matched_rule_category: str | None,
         decision_path: list[str],
         ttl_seconds: int = 300,
+        detach: bool = False,
     ) -> str:
         prompt_id = str(uuid.uuid4())
         now = datetime.now(UTC)
@@ -543,8 +552,8 @@ class Persistence:
                 INSERT INTO pending_prompts (
                     id, created_at, expires_at, agent_id, cwd, raw_cmd,
                     normalized_template, command_tier, matched_rule_category,
-                    decision_path_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    decision_path_json, detach
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     prompt_id,
@@ -557,6 +566,7 @@ class Persistence:
                     command_tier,
                     matched_rule_category,
                     json.dumps(decision_path),
+                    int(detach),
                 ),
             )
         return prompt_id
@@ -666,7 +676,9 @@ class Persistence:
                 "matched_rule_category": row["matched_rule_category"],
             }
 
-    def consume_approval_by_command(self, *, raw_cmd: str, cwd: str, agent_id: str) -> dict | None:
+    def consume_approval_by_command(
+        self, *, raw_cmd: str, cwd: str, agent_id: str, detach: bool = False
+    ) -> dict | None:
         """Atomically find and consume a durable approve_once approval by command.
 
         Mirrors consume_approve_token (same BEGIN IMMEDIATE serialisation and
@@ -685,11 +697,11 @@ class Persistence:
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                        command_tier, matched_rule_category, expires_at, consumed_at
                 FROM pending_prompts
-                WHERE raw_cmd = ? AND cwd = ? AND agent_id = ?
+                WHERE raw_cmd = ? AND cwd = ? AND agent_id = ? AND detach = ?
                   AND approved_at IS NOT NULL AND consumed_at IS NULL
                 ORDER BY approved_at DESC LIMIT 1
                 """,
-                (raw_cmd, cwd, agent_id),
+                (raw_cmd, cwd, agent_id, int(detach)),
             ).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
@@ -712,6 +724,21 @@ class Persistence:
                 "matched_rule_category": row["matched_rule_category"],
             }
 
+    def restore_approval(self, prompt_id: str) -> bool:
+        """Un-consume a prompt (clear consumed_at) when its approved run never started.
+
+        Only used when a detach cap recheck refuses after the approval was consumed,
+        so it only touches a consumed detach prompt. Returns whether a row changed.
+        Expiry still applies, so this never extends an approval's lifetime.
+        """
+        with self._write_conn() as conn:
+            cur = conn.execute(
+                "UPDATE pending_prompts SET consumed_at = NULL"
+                " WHERE id = ? AND consumed_at IS NOT NULL AND detach = 1",
+                (prompt_id,),
+            )
+            return cur.rowcount > 0
+
     def get_pending_prompt(self, prompt_id: str) -> dict | None:
         """Fetch a pending prompt by id (full row as dict)."""
         with self._conn() as conn:
@@ -719,7 +746,8 @@ class Persistence:
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                        command_tier, matched_rule_category, expires_at,
-                       approve_token, approve_decision, approved_at, consumed_at
+                       approve_token, approve_decision, approved_at, consumed_at,
+                       detach
                 FROM pending_prompts WHERE id = ?
                 """,
                 (prompt_id,),
@@ -741,7 +769,7 @@ class Persistence:
             SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                    command_tier, matched_rule_category, expires_at,
                    approve_token, approve_decision, approved_at, consumed_at,
-                   created_at
+                   created_at, detach
             FROM pending_prompts
             {where}
             ORDER BY created_at DESC, id
@@ -768,7 +796,8 @@ class Persistence:
             row = conn.execute(
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
-                       command_tier, matched_rule_category, expires_at, consumed_at
+                       command_tier, matched_rule_category, expires_at, consumed_at,
+                       detach
                 FROM pending_prompts
                 WHERE approve_token = ?
                 """,
@@ -1116,16 +1145,20 @@ class Persistence:
         stdout_path: str,
         stderr_path: str,
         pid: int | None,
+        kind: str = "process",
     ) -> None:
-        # pid is None for shell_monitor jobs (an in-process asyncio task, no subprocess).
+        # kind: 'process' (subprocess, has pid), 'monitor' (in-process asyncio task, no
+        # pid) or 'unit' (transient systemd unit, no pid).
+        if kind not in JOB_KINDS:
+            raise ValueError(f"invalid job kind: {kind!r}")
         started_at = _now_utc()
         with self._write_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO jobs (
                     job_id, telemetry_id, raw_cmd, cwd, agent_id,
-                    started_at, status, pid, stdout_path, stderr_path, timeout_s
-                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
+                    started_at, status, pid, stdout_path, stderr_path, timeout_s, kind
+                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1138,6 +1171,7 @@ class Persistence:
                     stdout_path,
                     stderr_path,
                     timeout_s,
+                    kind,
                 ),
             )
 
@@ -1149,37 +1183,55 @@ class Persistence:
         exit_code: int | None = None,
         finished_at: str | None = None,
         only_if_running: bool = False,
+        only_if_status: str | None = None,
     ) -> None:
         """Update a job's status.
 
         With only_if_running=True the UPDATE is a no-op unless the row is still
         'running', so a concurrent terminal write (e.g. shell_kill's 'killed')
         is never clobbered; the check and write are one SQL statement.
+        only_if_status=<s> is the same guard for an arbitrary expected status
+        (used to revert a tentative 'killed' back to 'running').
         """
-        guard = " AND status = 'running'" if only_if_running else ""
+        guard = ""
+        params: list[object] = [status, exit_code, finished_at, job_id]
+        if only_if_running:
+            guard = " AND status = 'running'"
+        elif only_if_status is not None:
+            guard = " AND status = ?"
+            params.append(only_if_status)
         with self._write_conn() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ?, exit_code = ?, finished_at = ? "
                 f"WHERE job_id = ?{guard}",  # noqa: S608 - constant fragment, no user input
-                (status, exit_code, finished_at, job_id),
+                params,
             )
 
     def kill_orphaned_monitor_jobs(self) -> list[dict]:
-        """Mark every 'running' job with no pid (a shell_monitor task) as 'killed'.
+        """Mark every 'running' monitor job (a shell_monitor task) as 'killed'.
 
         Run at startup: a monitor is an in-process task, so none can have survived a
-        restart. Returns the rows that were changed.
+        restart. Unit jobs also have no pid but do survive, so this matches on kind.
+        Returns the rows that were changed.
         """
         with self._write_conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM jobs WHERE status = 'running' AND pid IS NULL"
+                "SELECT * FROM jobs WHERE status = 'running' AND kind = 'monitor'"
             ).fetchall()
             conn.execute(
                 "UPDATE jobs SET status = 'killed', finished_at = ? "
-                "WHERE status = 'running' AND pid IS NULL",
+                "WHERE status = 'running' AND kind = 'monitor'",
                 (_now_utc(),),
             )
         return [dict(r) for r in rows]
+
+    def count_running_units(self) -> int:
+        """Number of detached (kind='unit') jobs still marked running."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE kind = 'unit' AND status = 'running'"
+            ).fetchone()
+        return int(row[0])
 
     def get_job(self, job_id: str) -> dict | None:
         with self._conn() as conn:
@@ -1201,25 +1253,27 @@ class Persistence:
 
         Returns rows that were removed so the caller can delete stdout/stderr files.
 
+        A kind='unit' job that is still running is never removed, however old:
+        its unit outlives restarts and its row and job_dir are the only way to
+        reach its result.
+
         Uses julianday() for timestamp arithmetic because strftime('%s', ...)
         returns NULL for ISO 8601 strings with timezone suffix (e.g. '+00:00'),
         which is the format produced by _now_iso().
         """
+        expired = (
+            "(julianday('now') - julianday(started_at)) * 86400.0 > ? "
+            "AND NOT (kind = 'unit' AND status = 'running')"
+        )
         with self._write_conn() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM jobs
-                WHERE (julianday('now') - julianday(started_at)) * 86400.0 > ?
-                """,
+                f"SELECT * FROM jobs WHERE {expired}",  # noqa: S608 - constant fragment
                 (retention_seconds,),
             ).fetchall()
             removed = [dict(r) for r in rows]
             if removed:
                 conn.execute(
-                    """
-                    DELETE FROM jobs
-                    WHERE (julianday('now') - julianday(started_at)) * 86400.0 > ?
-                    """,
+                    f"DELETE FROM jobs WHERE {expired}",  # noqa: S608 - constant fragment
                     (retention_seconds,),
                 )
         return removed

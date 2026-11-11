@@ -7,6 +7,24 @@ from pathlib import Path
 import pytest
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "systemd: needs a real systemd user manager (skipped by default; "
+        "pixi run -e dev pytest tests/integration/test_unit_systemd_smoke.py -m systemd)",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip systemd-marked tests unless explicitly selected with -m."""
+    if "systemd" in (config.option.markexpr or ""):
+        return
+    skip = pytest.mark.skip(reason="systemd tests need -m systemd")
+    for item in items:
+        if "systemd" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
 def _isolated_rules_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
     """Point the rules config dir at an empty tmp dir so a developer's real

@@ -732,6 +732,7 @@ async def start_monitor(req: ShellMonitorRequest, db: Persistence) -> ShellMonit
         stdout_path=str(events_path),
         stderr_path=str(diag_path),
         pid=None,
+        kind="monitor",
     )
 
     mon = _Monitor(spec, config, events_path)

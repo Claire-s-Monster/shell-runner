@@ -36,6 +36,17 @@ class ExecuteRequest(BaseModel):
             "T3/T4 approval flow still applies before spawn."
         ),
     )
+    detach: bool = Field(
+        default=False,
+        description=(
+            "If True, run the command as a transient systemd unit that survives a "
+            "server restart, and return decision='running' plus a job_id (like "
+            "run_in_background). timeout_s is ignored: the unit's RuntimeMaxSec is "
+            "the only ceiling. Approvals are bound to this value: an approve_token "
+            "only works with the same detach value, and template/verb approvals "
+            "never apply to detach."
+        ),
+    )
 
 
 class ExecutePromptInfo(BaseModel):
@@ -46,6 +57,7 @@ class ExecutePromptInfo(BaseModel):
     tier: int
     why: str
     next_steps: str = ""
+    detach: bool = False
 
 
 class ExecuteResponse(BaseModel):
@@ -116,6 +128,7 @@ class PendingPromptDetail(BaseModel):
     approved_at: str | None = None
     consumed_at: str | None = None
     scope_warning: str | None = None
+    detach: bool = False
 
 
 class ApproveRequest(BaseModel):
