@@ -1547,10 +1547,10 @@ async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
     job = db.get_job(body.job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"job {body.job_id} not found")
-    # shell_monitor jobs (pid None) also expose their parsed events.
+    # shell_monitor jobs also expose their parsed events.
     events = (
         await asyncio.to_thread(monitor.read_events, job["stdout_path"] or "")
-        if job["pid"] is None
+        if job["kind"] == "monitor"
         else None
     )
     return ShellStatusResponse(
@@ -1764,7 +1764,7 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
     job = db.get_job(body.job_id)
     if not job or job["status"] != "running":
         return ShellKillResponse(killed=False, reason="job not running or not found")
-    if job["pid"] is None:
+    if job["kind"] == "monitor":
         # shell_monitor job: an asyncio task, not a process. The task writes its own
         # terminal "killed" event; with no live task (e.g. after a restart) just mark it.
         if not await monitor.cancel_monitor(body.job_id, db):

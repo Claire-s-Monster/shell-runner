@@ -610,6 +610,7 @@ async def execute_background(
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             pid=proc.pid,
+            kind="process",
         )
     except Exception:
         logger.exception(

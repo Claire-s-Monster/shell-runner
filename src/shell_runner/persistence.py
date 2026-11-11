@@ -155,7 +155,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("verb_approvals", "approved_by", "TEXT"),
     ("shell_calls", "protected_path_match", "TEXT"),
     ("shell_calls", "flagged", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "kind", "TEXT NOT NULL DEFAULT 'process'"),
 )
+
+JOB_KINDS = frozenset({"process", "monitor", "unit"})
 
 
 # Issue #53: SQLite's busy handler is unfair, so many threads in this process
@@ -289,6 +292,10 @@ class Persistence:
             if column not in existing:
                 # table/column/type come from the constant above, never user input.
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")  # noqa: S608
+                if (table, column) == ("jobs", "kind"):
+                    # Only on the migration that adds the column: before it, a
+                    # pid-less job was necessarily a shell_monitor task.
+                    conn.execute("UPDATE jobs SET kind = 'monitor' WHERE pid IS NULL")
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
@@ -1116,16 +1123,20 @@ class Persistence:
         stdout_path: str,
         stderr_path: str,
         pid: int | None,
+        kind: str = "process",
     ) -> None:
-        # pid is None for shell_monitor jobs (an in-process asyncio task, no subprocess).
+        # kind: 'process' (subprocess, has pid), 'monitor' (in-process asyncio task, no
+        # pid) or 'unit' (transient systemd unit, no pid).
+        if kind not in JOB_KINDS:
+            raise ValueError(f"invalid job kind: {kind!r}")
         started_at = _now_utc()
         with self._write_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO jobs (
                     job_id, telemetry_id, raw_cmd, cwd, agent_id,
-                    started_at, status, pid, stdout_path, stderr_path, timeout_s
-                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
+                    started_at, status, pid, stdout_path, stderr_path, timeout_s, kind
+                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1138,6 +1149,7 @@ class Persistence:
                     stdout_path,
                     stderr_path,
                     timeout_s,
+                    kind,
                 ),
             )
 
@@ -1165,18 +1177,19 @@ class Persistence:
             )
 
     def kill_orphaned_monitor_jobs(self) -> list[dict]:
-        """Mark every 'running' job with no pid (a shell_monitor task) as 'killed'.
+        """Mark every 'running' monitor job (a shell_monitor task) as 'killed'.
 
         Run at startup: a monitor is an in-process task, so none can have survived a
-        restart. Returns the rows that were changed.
+        restart. Unit jobs also have no pid but do survive, so this matches on kind.
+        Returns the rows that were changed.
         """
         with self._write_conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM jobs WHERE status = 'running' AND pid IS NULL"
+                "SELECT * FROM jobs WHERE status = 'running' AND kind = 'monitor'"
             ).fetchall()
             conn.execute(
                 "UPDATE jobs SET status = 'killed', finished_at = ? "
-                "WHERE status = 'running' AND pid IS NULL",
+                "WHERE status = 'running' AND kind = 'monitor'",
                 (_now_utc(),),
             )
         return [dict(r) for r in rows]
