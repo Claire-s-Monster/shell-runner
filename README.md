@@ -172,47 +172,6 @@ included.
    count like `./build/out`. Every target must resolve (realpath) inside the cwd,
    or be `/tmp` scratch per item 3, and must not match a protected-path rule. `..`
    escapes, symlinks out of the cwd, `$VAR` targets and protected paths prompt.
-6. **`git worktree list|prune`** (AUTO_CAPPED): `list` with `--porcelain`/`-v`/`-z`;
-   `prune` with only `-n`/`--dry-run`/`-v`. `prune --expire ...` and other options prompt.
-7. **`git worktree add|remove`** (AUTO_CAPPED, path-checked in `path_guard.py`): only
-   as one plain command (no `-C`, `cd`, env prefix, pipe, `;`/`&&`, redirect, variable,
-   glob or substitution) with no `--force`/`-f`/`--lock` (`add` also accepts `-b|-B
-   <branch>`, `--detach`/`-d`, `-q`, `--[no-]checkout`, `--[no-]track` and one
-   commit-ish). The target, resolved against the real cwd both lexically and through
-   symlinks, must be strictly inside an allowed `worktrees/` directory: `<repo
-   parent>/worktrees`, `<repo>/.claude/worktrees`, or (when the cwd is itself a
-   worktree) its parent `worktrees/` dir. The repo is the nearest ancestor of the cwd
-   holding `.git`, within the cwd roots (found without running git). It must also not be
-   `$HOME`, a credential path, a system path (`/etc /usr /var /boot /root /proc /sys
-   /dev /bin /sbin /lib /opt`) or match a protected-path rule. Anything else keeps
-   prompting, and every `add|remove` that is not auto-allowed is path-guarded: a
-   persisted template/verb approval (`git worktree add <cwd_path>`) cannot lower it.
-   Further fail-closed rules: only `-b <branch>` is accepted (`-B` resets an existing
-   branch); the target must be a direct child of the root (no nesting); the repo top
-   must lie inside `$HOME` (not `$HOME`, an ancestor, or `/`) and so must the root.
-   `add` and `remove` run hooks and config-driven commands (checkout, status-like
-   cleanliness checks), so both are auto-allowed only when nothing can run:
-   `<common-dir>/hooks` (and the private gitdir's) must be missing or hold only regular
-   `*.sample` files (`.git` files are followed via `gitdir:` and `commondir`); none of
-   `<common-dir>/config`, `config.worktree`, `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`
-   or `/etc/gitconfig` may contain `hookspath`, `[include*]`, `[filter*]`/`filter.`,
-   `fsmonitor`, `attributesfile`, `sshcommand`, `pager`, `editor`, `askpass`, a
-   `[diff]`/`[merge]` driver/command/external, or any unparseable line (a read error
-   other than "missing" also prompts). The one exception is the exact stock `git lfs
-   install` `[filter "lfs"]` section, honoured only in the user/system files, never the
-   repo's. No `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE` or `GIT_CONFIG*` may be set in
-   the server environment. `git -c core.hooksPath=...` and `--git-dir` prompt via the
-   plain-command rule. `remove` must also name exactly a registered worktree (`<common-dir>/worktrees/*/gitdir`) and no
-   other registered worktree may end with `/<arg>` (git resolves a bare suffix first).
-   Also prompting: a target with any component named `.git` (any case, trailing dots or
-   spaces) or holding/under a git-dir marker (`HEAD` + `objects/` + `refs/`); such targets
-   also take the git-dir write guard (T3, flagged). `remove`/`add` of the cwd or any
-   ancestor of it (e.g. `git worktree remove .` from inside a linked worktree) prompts.
-   The system gitconfig of the `git` the server's PATH resolves to
-   (`<realpath prefix>/etc/gitconfig`) is scanned like `/etc/gitconfig`; if it exists but
-   cannot be read, the command prompts. **Note:** removing a sibling worktree stays
-   auto-allowed, and without `--force` git still deletes *ignored* files in it (only
-   modified/untracked files block the removal).
 
    `mkdir` stays AUTO_CAPPED only under a project cwd: with the cwd at `$HOME` itself, a
    system/credential path or a protected path it prompts.

@@ -81,10 +81,9 @@ def test_write_into_acceptance_is_flagged_not_denied(root: Path, name: str) -> N
     assert any(m["kind"] == "write" for m in json.loads(result.protected_path_json))
     assert result.tier != Tier.DENY
 
-    # never lowered by the worktree/mkdir/labelling code
+    # never lowered by the mkdir/labelling code
     base = _classify_catalog(command, str(root), AGENT)
     assert PERMISSIVENESS[result.command_tier] <= PERMISSIVENESS[base.command_tier]
-    assert not any("worktree" in p for p in result.decision_path)
     assert bool([p for p in result.decision_path if p.startswith("fs-write")]) == labelled
 
 

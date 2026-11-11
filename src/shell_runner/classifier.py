@@ -466,52 +466,10 @@ def classify(
             decision_path=(*result.decision_path, note),
         )
     result = _apply_path_guard(result, command, cwd, env)
-    result = _apply_worktree_relax(result, command, cwd, env)
     labels = path_guard.write_labels(command)
     if labels:
         result = replace(result, decision_path=(*result.decision_path, *labels))
     return result
-
-
-def _apply_worktree_relax(
-    result: ClassificationResult, command: str, cwd: str, env: dict[str, str] | None
-) -> ClassificationResult:
-    """Lower a plain `git worktree add|remove` from T3 to T2 when its target passes the
-    path_guard worktree check. Only ever acts on an unflagged, unguarded, unmatched
-    T3 fall-through, so it can never loosen a T4/DENY or rules-flagged command."""
-    if (
-        result.command_tier != Tier.APPROVE_ONCE
-        or result.path_guarded
-        or result.flagged
-        or result.protected_matches
-        or result.non_promotable
-        or len(result.segments) != 1
-        or result.segments[0].decision_step != "T3_fallthrough"
-        or not path_guard.worktree_target_allowed(command, cwd, env)
-    ):
-        return result
-    rule = Rule(
-        pattern="path_guard:worktree_path",
-        tier=Tier.AUTO_CAPPED,
-        category="git-write",
-        source="manual",
-        reason="git worktree add/remove, no --force, target inside an allowed worktrees/ directory",
-    )
-    cap_perm = _cap_permissiveness(result.agent_cap)
-    tier = Tier.AUTO_CAPPED if PERMISSIVENESS[Tier.AUTO_CAPPED] <= cap_perm else result.agent_cap
-    seg = replace(result.segments[0], tier=Tier.AUTO_CAPPED, matched_rule=rule, decision_step="T2")
-    return replace(
-        result,
-        tier=tier,
-        command_tier=Tier.AUTO_CAPPED,
-        matched_rule=rule,
-        segments=(seg,),
-        path_guarded=True,
-        decision_path=(
-            *result.decision_path,
-            f"path_guard: {rule.reason} -> {Tier.AUTO_CAPPED.name}",
-        ),
-    )
 
 
 def _apply_path_guard(
