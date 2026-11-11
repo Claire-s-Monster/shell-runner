@@ -109,6 +109,7 @@ test-integration = "pytest tests/integration -v"
 test = "pytest tests/ -v --ignore=tests/live --ignore=tests/debug"
 test-debug = "pytest tests/debug -v"
 test-live = "pytest tests/live -v"
+test-systemd = "pytest tests/integration/test_unit_systemd_smoke.py -v -m systemd"
 test-all = "pytest tests/ -v"
 test-cov = "pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=html"
 lint = "ruff check src/"
@@ -192,12 +193,15 @@ addopts = [
     "--timeout=60",
     "--ignore=.pixi",
     "--ignore=scripts",
+    "-m",
+    "not systemd",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: integration tests requiring full setup",
     "live: live server tests (manual execution only)",
     "debug: debug/diagnostic tests",
+    "systemd: needs a real systemd user manager (deselected by default; pixi run -e dev test-systemd)",
     "unit: unit tests for isolated components",
     "asyncio: async tests",
     "regression: regression tests for previously fixed bugs",
