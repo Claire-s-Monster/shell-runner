@@ -30,6 +30,7 @@ pixi run check-all
 |------|-------------|
 | `test` | Run tests (excludes live and debug) |
 | `test-unit` | Run unit tests only |
+| `test-systemd` | Real-systemd smoke test for detached jobs (marker `systemd`, off by default) |
 | `test-cov` | Run tests with coverage report |
 | `lint` | Run ruff linter with auto-fix |
 | `format` | Run black formatter |
@@ -255,6 +256,65 @@ component, e.g. `.git/c*` or `$D` alone). This changes previously auto-executing
 shapes such as `echo x > $TMPDIR/f`, `echo x >> $OUT`, `echo x > out-*.txt`,
 ``echo x > `pwd`/f``, `echo x > f{1,2}`, and the same targets for `tee`, `touch`,
 `mkdir`, `cp`, `mv`, `ln`, `dd of=`, `truncate`, `sed -i`.
+
+## Detached jobs: `shell_execute` with `detach=true`
+
+**Semantics.** `detach=true` starts the command as a transient user systemd unit
+named `sr-job-<id>.service` (`systemd-run --user`), outside the server's own
+process tree. The job survives server restarts. `timeout_s` is ignored for
+detached runs; instead the unit gets `RuntimeMaxSec` as a hard ceiling (and a
+finite `MemoryMax`, with swap disabled). The job's environment is exactly the
+usual allowlist, and cwd goes through the same cwd-root check as other runs.
+Output goes to `stdout.log` / `stderr.log` in the job dir. Use `shell_status`,
+`shell_wait` and `shell_kill` with the returned `job_id` as for background jobs.
+
+**Defaults and env overrides.**
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SHELL_RUNNER_MAX_DETACHED` | `4` | Max detached jobs running at once |
+| `SHELL_RUNNER_UNIT_MEMORY_MAX` | `8G` | `MemoryMax` per unit (finite values only, e.g. `512M`, `2G`) |
+| `SHELL_RUNNER_UNIT_RUNTIME_MAX_S` | `14400` | `RuntimeMaxSec` per unit, seconds (positive integer) |
+
+**Approval binding.** A detached run outlives the session, so it needs its own
+approval. The approval prompt shows `detach=true`, and the approval token is bound
+to it: the token is refused unless the retry also passes `detach=true`, and a token
+issued for an attached run is refused for `detach=true`. Template and verb
+approvals never cover `detach` (and a detach approval is never promoted to one);
+every detached run is approved one-shot.
+
+**Cap.** At `SHELL_RUNNER_MAX_DETACHED` running detached jobs, `shell_execute`
+returns HTTP 429 and starts nothing. The check runs before the approval is
+consumed, so a refusal does not burn the token; retry once a job has finished.
+
+**Statuses.** `running`, `completed` (exit 0), `failed` (non-zero exit or killed
+by a signal), `timed_out` (hit `RuntimeMaxSec`), `killed` (`shell_kill`) and
+`unit_missing` (the unit vanished without recording a result). `shell_kill` marks
+the job `killed` before stopping the unit, so a late result cannot overwrite it.
+
+**Reconcile.** The unit writes a `result` file when it stops. `shell_status` and
+`shell_wait` refresh a running row from it lazily; the server also reconciles all
+running detached rows against systemd at startup and every minute. An active unit
+is left running, a gone unit takes its outcome from the result file, else
+`unit_missing`. If systemd cannot be queried nothing is changed and the next tick
+retries. Units are independent of the server, so a restart is never blocked by
+running units and does not stop them.
+
+**Requirements.** The server needs a reachable systemd user manager:
+`XDG_RUNTIME_DIR` (and the user bus) must be set in the server's environment, and
+for jobs to run with no login session, enable lingering
+(`loginctl enable-linger <user>`).
+
+**Smoke test.** The default suite never touches real systemd. To verify against a
+real user manager (special characters, env allowlist, exit status, `RuntimeMaxSec`
+timeout, unit collection), run:
+
+```bash
+pixi run -e dev test-systemd
+```
+
+It is selected by the `systemd` pytest marker, deselected by default, and skips
+itself if no user manager is reachable.
 
 ## Audit trail: approver columns, retention, `shell_audit`
 
