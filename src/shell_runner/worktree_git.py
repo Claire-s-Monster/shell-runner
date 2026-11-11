@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path
 
 _FORBIDDEN_RE = re.compile(
@@ -30,6 +31,20 @@ _STOCK_LFS = {
 
 # Patched by tests only; deliberately not configurable from the environment.
 SYSTEM_GITCONFIG = Path("/etc/gitconfig")
+
+
+def _git_executable() -> str | None:
+    """The `git` the server's PATH resolves to (the one a runner command would exec)."""
+    return shutil.which("git")
+
+
+def _running_git_system_config() -> Path | None:
+    """`<prefix>/etc/gitconfig` of the git that will actually run, prefix being two
+    levels above its realpath (`<prefix>/bin/git`); None when git is not on PATH."""
+    exe = _git_executable()
+    if exe is None:
+        return None
+    return Path(os.path.realpath(exe)).parent.parent / "etc" / "gitconfig"
 
 
 def git_dirs(top: Path) -> tuple[Path, Path] | None:
@@ -171,9 +186,12 @@ def hooks_or_config_possible(top: Path, home: str, env: dict[str, str]) -> bool:
     if any(_hooks_dir_unsafe(d / "hooks") for d in {priv, common}):
         return True
     xdg = env.get("XDG_CONFIG_HOME") or os.environ.get("XDG_CONFIG_HOME") or f"{home}/.config"
+    user_files = [Path(home) / ".gitconfig", Path(xdg) / "git" / "config", SYSTEM_GITCONFIG]
+    running = _running_git_system_config()
+    if running is not None and running != SYSTEM_GITCONFIG:
+        user_files.append(running)  # exists-but-unreadable fails closed in _config_unsafe
     return _config_unsafe(
-        [common / "config", common / "config.worktree", priv / "config.worktree"],
-        [Path(home) / ".gitconfig", Path(xdg) / "git" / "config", SYSTEM_GITCONFIG],
+        [common / "config", common / "config.worktree", priv / "config.worktree"], user_files
     )
 
 

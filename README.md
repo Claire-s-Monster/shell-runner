@@ -204,6 +204,18 @@ included.
    the server environment. `git -c core.hooksPath=...` and `--git-dir` prompt via the
    plain-command rule. `remove` must also name exactly a registered worktree (`<common-dir>/worktrees/*/gitdir`) and no
    other registered worktree may end with `/<arg>` (git resolves a bare suffix first).
+   Also prompting: a target with any component named `.git` (any case, trailing dots or
+   spaces) or holding/under a git-dir marker (`HEAD` + `objects/` + `refs/`); such targets
+   also take the git-dir write guard (T3, flagged). `remove`/`add` of the cwd or any
+   ancestor of it (e.g. `git worktree remove .` from inside a linked worktree) prompts.
+   The system gitconfig of the `git` the server's PATH resolves to
+   (`<realpath prefix>/etc/gitconfig`) is scanned like `/etc/gitconfig`; if it exists but
+   cannot be read, the command prompts. **Note:** removing a sibling worktree stays
+   auto-allowed, and without `--force` git still deletes *ignored* files in it (only
+   modified/untracked files block the removal).
+
+   `mkdir` stays AUTO_CAPPED only under a project cwd: with the cwd at `$HOME` itself, a
+   system/credential path or a protected path it prompts.
 
 **Git-directory write guard** ([#84](https://github.com/Claire-s-Monster/shell-runner/issues/84)).
 Planting `core.fsmonitor`, `core.pager`, `diff.external`, a `filter.*.smudge`,

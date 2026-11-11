@@ -66,6 +66,7 @@ def lay(monkeypatch: pytest.MonkeyPatch) -> Iterator[Layout]:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(root / ".config"))
     monkeypatch.setattr(worktree_git, "SYSTEM_GITCONFIG", root / "no-such-system-gitconfig")
+    monkeypatch.setattr(worktree_git, "_git_executable", lambda: None)
     try:
         yield Layout(root, home, repo, wts)
     finally:
@@ -969,6 +970,149 @@ def test_out_of_scope_commands_stay_t3_or_higher(lay: Layout, command: str) -> N
     result = lay.cls(command)
     assert PERMISSIVENESS[result.command_tier] <= PERMISSIVENESS[T3]
     assert not result.flagged
+
+
+# ---------------------------------------------------------------------------
+# Security review fixes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["../worktrees/.git", "../worktrees/.GIT", "../worktrees/.Git", "'../worktrees/.git.'"]
+    + ["'../worktrees/.git '", "'../worktrees/.git. .'", "../worktrees/.git/sub"],
+)
+def test_worktree_add_into_dot_git_name_is_not_t2(lay: Layout, target: str) -> None:
+    for cmd in (f"git worktree add {target} evilbranch", f"git worktree remove {target}"):
+        assert lay.tier(cmd) == T3, cmd
+
+
+def test_worktree_add_dot_git_dir_is_flagged_git_dir_write(lay: Layout) -> None:
+    for cmd in (
+        "git worktree add ../worktrees/.git evilbranch",
+        "git worktree add .git/x evilbranch",
+        "git worktree add -b br .git/x HEAD",
+    ):
+        result = lay.cls(cmd)
+        assert result.command_tier == T3, cmd
+        assert result.flagged, cmd
+        assert result.matched_rule is not None
+        assert result.matched_rule.category == "git_dir_write", cmd
+
+
+def test_worktree_add_branch_or_commit_named_like_path_is_not_a_write_target(lay: Layout) -> None:
+    result = lay.cls("git worktree add -b feat/x ../worktrees/feat origin/development")
+    assert result.command_tier == T2
+    assert not result.flagged
+
+
+def test_worktree_add_symlinked_dot_git_component_is_not_t2(lay: Layout) -> None:
+    (lay.worktrees / "link").symlink_to(lay.repo / ".git")
+    assert lay.tier("git worktree add ../worktrees/link evilbranch") == T3
+
+
+def test_worktree_add_onto_git_dir_marker_is_not_t2(lay: Layout) -> None:
+    fake = lay.worktrees / "fakegit"
+    for d in (fake / "objects", fake / "refs"):
+        d.mkdir(parents=True)
+    (fake / "HEAD").write_text("ref: refs/heads/x\n")
+    assert lay.tier("git worktree add ../worktrees/fakegit evilbranch") == T3
+
+
+def _linked_worktree(lay: Layout) -> Path:
+    priv = lay.repo / ".git" / "worktrees" / "existing"
+    (priv / "commondir").write_text("../..\n")
+    wt = lay.worktrees / "existing"
+    (wt / ".git").write_text(f"gitdir: {priv}\n")
+    (lay.worktrees / "sibling").mkdir()
+    reg = lay.repo / ".git" / "worktrees" / "sibling"
+    reg.mkdir()
+    (reg / "gitdir").write_text(f"{lay.worktrees / 'sibling' / '.git'}\n")
+    return wt
+
+
+@pytest.mark.parametrize(
+    "target", [".", "./", "../existing", "../existing/", "..", "../../worktrees/existing"]
+)
+def test_worktree_remove_of_cwd_or_ancestor_is_not_t2(lay: Layout, target: str) -> None:
+    wt = _linked_worktree(lay)
+    assert lay.tier(f"git worktree remove {target}", cwd=wt) == T3
+
+
+def test_worktree_remove_of_cwd_by_absolute_path_is_not_t2(lay: Layout) -> None:
+    wt = _linked_worktree(lay)
+    assert lay.tier(f"git worktree remove {wt}", cwd=wt) == T3
+
+
+def test_worktree_remove_of_sibling_from_linked_worktree_stays_t2(lay: Layout) -> None:
+    wt = _linked_worktree(lay)
+    assert lay.tier("git worktree remove ../sibling", cwd=wt) == T2
+
+
+@pytest.mark.parametrize(
+    "content", ["[core]\nhooksPath = x\n", "[include]\npath = /x\n", "[filter]\nclean = x\n"]
+)
+def test_worktree_add_scans_system_gitconfig_of_the_running_git(
+    lay: Layout, monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    prefix = lay.root / "elsewhere2"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "etc").mkdir()
+    real = prefix / "bin" / "git"
+    real.write_text("")
+    link = lay.root / "pathdir" / "git"
+    link.parent.mkdir()
+    link.symlink_to(real)  # found via PATH, realpath leads to the prefix
+    monkeypatch.setattr(worktree_git, "_git_executable", lambda: str(link))
+    assert lay.tier(ADD) == T2
+    (prefix / "etc" / "gitconfig").write_text(content)
+    assert lay.tier(ADD) == T3
+    assert lay.tier("git worktree remove ../worktrees/existing") == T3
+
+
+def test_worktree_add_running_git_system_gitconfig_stock_lfs_is_t2(
+    lay: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = lay.root / "pfx"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "etc").mkdir()
+    (prefix / "bin" / "git").write_text("")
+    monkeypatch.setattr(worktree_git, "_git_executable", lambda: str(prefix / "bin" / "git"))
+    (prefix / "etc" / "gitconfig").write_text(STOCK_LFS)
+    assert lay.tier(ADD) == T2
+
+
+def test_worktree_add_unreadable_running_git_system_gitconfig_stays_t3(
+    lay: Layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = lay.root / "pfx"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "etc" / "gitconfig").mkdir(parents=True)  # exists, cannot be read as a file
+    (prefix / "bin" / "git").write_text("")
+    monkeypatch.setattr(worktree_git, "_git_executable", lambda: str(prefix / "bin" / "git"))
+    assert lay.tier(ADD) == T3
+
+
+@pytest.mark.parametrize("command", ["mkdir x", "mkdir -p x/y", "mkdir -p ./x"])
+def test_mkdir_in_home_itself_is_not_t2(lay: Layout, command: str) -> None:
+    assert lay.tier(command, cwd=lay.home) == T3
+
+
+@pytest.mark.parametrize("cwd", ["/etc", "/usr/local", "/var", "/root"])
+def test_mkdir_in_system_cwd_is_not_t2(lay: Layout, cwd: str) -> None:
+    assert PERMISSIVENESS[lay.cls("mkdir -p x", cwd=Path(cwd)).command_tier] <= PERMISSIVENESS[T3]
+
+
+def test_mkdir_in_protected_cwd_is_not_t2(lay: Layout) -> None:
+    (lay.root / "cfg" / "rules.toml").write_text(
+        f'[[protected]]\nglob = "{lay.repo}/src/**"\nmode = "flag"\nreason = "r"\n'
+    )
+    assert lay.tier("mkdir -p x", cwd=lay.repo / "src") == T3
+    assert lay.tier("mkdir -p x") == T2
+
+
+def test_mkdir_in_project_subdir_of_home_stays_t2(lay: Layout) -> None:
+    assert lay.tier("mkdir -p x/y", cwd=lay.repo / "src") == T2
 
 
 def test_no_protected_rules_added_for_claude_hooks(lay: Layout) -> None:

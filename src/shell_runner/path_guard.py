@@ -524,10 +524,23 @@ def _worktree_roots(top: Path, home_real: Path) -> list[Path]:
     return [r for r in roots if r != home_real and r.is_relative_to(home_real)]
 
 
+_DOT_GIT_NAME_RE = re.compile(r"^\.git[. ]*$", re.IGNORECASE)
+
+
+def _is_git_dir_like(p: Path) -> bool:
+    """Any component named `.git` (any case, trailing dots/spaces), or a git dir marker
+    (HEAD + objects/ + refs/) at the path or above it: git would discover it as a repo."""
+    return any(_DOT_GIT_NAME_RE.match(part) for part in p.parts) or any(
+        _is_git_structure(a) for a in (p, *p.parents)
+    )
+
+
 def _worktree_path_ok(
     path: str, roots: list[Path], cwd: str, env: dict[str, str], home: str
 ) -> bool:
     if path == os.path.realpath(home) or path.startswith(_WT_SYSTEM_PREFIXES):
+        return False
+    if _is_git_dir_like(Path(path)):
         return False
     if classify_path(path, cwd, env) in ("<cred_path>", "<etc_path>", "<system_path>"):
         return False
@@ -558,6 +571,11 @@ def worktree_target_allowed(command: str, cwd: str, env: dict[str, str] | None =
     candidates = (os.path.normpath(joined), os.path.realpath(joined))
     if not all(_worktree_path_ok(c, roots, cwd_real, env, home) for c in candidates):
         return False
+    # never remove (or add over) the directory we are standing in or one above it
+    if any(Path(cwd_real).is_relative_to(c) for c in candidates):
+        return False
+    # Removing a sibling stays T2 by design. NOTE: without --force, `git worktree remove`
+    # still deletes IGNORED files in the worktree (only untracked/modified block it).
     # remove checks the worktree is clean (status-like), so it needs the same inert
     # hooks/config as add
     if worktree_git.hooks_or_config_possible(top, home, env):
@@ -597,11 +615,32 @@ def _mkdir_target_ok(path: str, cwd: str, home: str) -> bool:
     return verdict.config_error is None and not verdict.matches
 
 
+def _mkdir_cwd_ok(cwd: str, home: str) -> bool:
+    """cwd is a project directory: not $HOME itself, a system/credential path or protected."""
+    cwd_real = os.path.realpath(cwd)
+    if cwd_real == os.path.realpath(home) or cwd_real.startswith(_WT_SYSTEM_PREFIXES):
+        return False
+    if classify_path(cwd_real, cwd_real, {"HOME": home}) in (
+        "<cred_path>",
+        "<etc_path>",
+        "<system_path>",
+    ):
+        return False
+    verdict = rules.evaluate(f"touch {shlex.quote(cwd_real)}", cwd_real)
+    return verdict.config_error is None and not verdict.matches
+
+
 def _mkdir_finding(cp: CommandPaths, cwd: str, home: str) -> GuardFinding | None:
     """mkdir stays T2 only when every target resolves inside cwd (or /tmp scratch) and
     is not a protected path: `..` hops are classified <cwd_path> by the normalizer."""
     if cp.verb != "mkdir":
         return None
+    if not _mkdir_cwd_ok(cwd, home):
+        return GuardFinding(
+            Tier.APPROVE_ONCE,
+            "mkdir_outside_cwd",
+            "mkdir with cwd at $HOME itself or a protected/system path needs approval",
+        )
     for target in cp.args:
         dynamic = any(c in target for c in _DYNAMIC_CHARS)
         if dynamic or not all(_mkdir_target_ok(c, cwd, home) for c in _candidates(target, cp)):
