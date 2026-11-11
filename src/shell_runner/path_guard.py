@@ -472,7 +472,6 @@ _WT_SYSTEM_PREFIXES = (
 )
 
 
-<<<<<<< HEAD
 def _plain_words(command: str) -> list[str] | None:
     """Words of `command` when, after the shared shellprep preprocessing, it is exactly one
     simple command with no redirect (so no cd, env prefix, pipe, list or hidden substitution)."""
