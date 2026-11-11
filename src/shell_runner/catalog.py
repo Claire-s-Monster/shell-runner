@@ -440,17 +440,6 @@ T2_AUTO_CAPPED: list[Rule] = [
         "git-read",
     ),
     Rule(r"^git\s+config\s+--get\s+\S+$", Tier.AUTO_CAPPED, "git-read"),
-    # git worktree list / prune: no path operands. Prune only takes the reporting
-    # options (-n/--dry-run, -v); --expire and anything else stays T3.
-    # worktree add/remove need a path check and are handled in path_guard.
-    Rule(
-        r"^git\s+worktree\s+list(\s+(--porcelain|-v|--verbose|-z))*$", Tier.AUTO_CAPPED, "git-read"
-    ),
-    Rule(
-        r"^git\s+worktree\s+prune(\s+(-n|--dry-run|-v|--verbose))*$",
-        Tier.AUTO_CAPPED,
-        "git-write",
-    ),
     # Safe gh CLI read-ops
     Rule(
         r"^gh\s+(pr|issue|run|workflow|repo)\s+(view|list|status)(\s+\S+)*$",

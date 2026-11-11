@@ -285,9 +285,6 @@ def _git_sub_writes(sub: str, args: list[str]) -> list[str]:
         return _positional(args)
     if sub in ("rm", "mv"):
         return _positional(args)
-    if sub == "worktree" and args and args[0] in ("add", "remove"):
-        # the target path only: not the -b/-B branch name nor the commit-ish after it
-        return _positional(_skip_value_opts(args[1:], {"-b", "-B"}))[:1]
     return []
 
 
