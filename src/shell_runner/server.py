@@ -48,6 +48,7 @@ from .executor import (
     discard_job_tracking,
     execute,
     execute_background,
+    execute_detached,
     inline_budget_s,
     job_result,
     validate_cwd,
@@ -200,7 +201,7 @@ def _compute_duration_ms(job: dict) -> int | None:
 
 
 def _apply_template_approval(
-    cls: ClassificationResult, agent_id: str, cwd: str
+    cls: ClassificationResult, agent_id: str, cwd: str, detach: bool = False
 ) -> ClassificationResult:
     """Override classification tier via persisted approvals (template or verb+cwd).
 
@@ -241,6 +242,11 @@ def _apply_template_approval(
     # 1c. Inline code (`-c`, `source`) is never promotable, in any segment: rows
     # created while the shape was still T3 no longer apply.
     if cls.non_promotable:
+        return cls
+
+    # 1d. A detached run outlives the session and is bound to its own one-shot
+    # approval: template / verb rows (granted for attached runs) never apply.
+    if detach:
         return cls
 
     # 2. Exact-template promotion first.
@@ -699,10 +705,9 @@ async def _dispatch_approved(
     *,
     approval_consumed: bool = False,
 ) -> ExecuteResponse:
-    """Single post-approval dispatch: background/file vs inline (+ inline-budget divert).
+    """Single post-approval dispatch: detach vs background/file vs inline (+ divert).
 
-    The only place a classified/approved command is spawned. A future
-    `detach` mode needs adding here only. approval_consumed=True enables the
+    The only place a classified/approved command is spawned. approval_consumed=True enables the
     issue #42 sqlite-busy no-op note (approved-token / approve_once path only).
     """
 
@@ -753,6 +758,38 @@ async def _dispatch_approved(
                 was_denied=False,
             )
 
+    if req.detach:
+        # timeout_s is deliberately not passed: the unit's RuntimeMaxSec is the ceiling.
+        telemetry_id = str(uuid.uuid4())
+        await _record(
+            telemetry_id,
+            _written_row("running", None, [*ctx.decision_path, "detached"]),
+            wait=True,
+        )
+        await _upsert_catalog()
+        job_id = str(uuid.uuid4())
+        await execute_detached(
+            db,
+            job_id,
+            req.command,
+            req.cwd,
+            None,
+            telemetry_id=telemetry_id,
+            agent_id=req.agent_id,
+        )
+        return ExecuteResponse(
+            decision="running",
+            tier=ctx.final_tier,
+            matched_rule=ctx.matched_rule_pattern,
+            exit_code=None,
+            stdout="",
+            stderr="",
+            stdout_full_path=None,
+            stderr_full_path=None,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            telemetry_id=telemetry_id,
+            job_id=job_id,
+        )
     if req.run_in_background or req.output_mode == "file":
         telemetry_id = str(uuid.uuid4())
         await _record(
@@ -921,6 +958,10 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             mismatches.append(
                 f"agent_id is bound to '{peek['agent_id']}' but request used '{req.agent_id}'"
             )
+        if bool(peek["detach"]) != req.detach:
+            mismatches.append(
+                f"detach is bound to {bool(peek['detach'])} but request used {req.detach}"
+            )
         if mismatches:
             raise HTTPException(
                 status_code=403,
@@ -938,7 +979,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 
     # Path B: no token — classify first
     cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd)
+    cls = _apply_template_approval(cls, req.agent_id, req.cwd, req.detach)
 
     # DENY
     if cls.tier == Tier.DENY:
@@ -1043,7 +1084,11 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
     # Single-use + TTL-bounded + exact (cmd, cwd, agent) match = same trust
     # boundary as consuming an approve_token, just without requiring the token.
     consumed = await asyncio.to_thread(
-        db.consume_approval_by_command, raw_cmd=req.command, cwd=req.cwd, agent_id=req.agent_id
+        db.consume_approval_by_command,
+        raw_cmd=req.command,
+        cwd=req.cwd,
+        agent_id=req.agent_id,
+        detach=req.detach,
     )
     if consumed is not None:
         return await _execute_approved_command(
@@ -1128,6 +1173,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         command_tier=int(cls.command_tier),
         matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
         decision_path=list(cls.decision_path),
+        detach=req.detach,
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
@@ -1179,6 +1225,13 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         f" → {cls.tier.name}; requires approval via shell_approve_pending from a primary"
         " session (approver identity is self-reported, not a human check — see issue #29)"
     )
+    detach_rerun = ""
+    if req.detach:
+        why += (
+            "; detach=true: this approval is one-shot and bound to detach=true "
+            "(template/verb approvals never apply to detached runs)"
+        )
+        detach_rerun = " Re-run with detach=true; the token is refused for any other detach value."
     return ExecuteResponse(
         decision="prompt_required",
         tier=int(cls.tier),
@@ -1202,8 +1255,9 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
                 "repeatedly until state is 'approved', then re-run shell_execute with the "
                 "identical command, cwd and agent_id plus approve_token. "
-                "Stop if state is 'denied' or 'expired'."
+                "Stop if state is 'denied' or 'expired'." + detach_rerun
             ),
+            detach=req.detach,
         ),
     )
 
@@ -1344,6 +1398,7 @@ def _prompt_detail(row: dict) -> PendingPromptDetail:
         approved_at=row.get("approved_at"),
         consumed_at=row.get("consumed_at"),
         scope_warning=describe_template_scope(row["normalized_template"]),
+        detach=bool(row.get("detach", 0)),
     )
 
 
@@ -1424,7 +1479,12 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     if reusable:
         pending = db.get_pending_prompt(req.prompt_id)
         guard = path_guard.evaluate(pending["raw_cmd"], pending["cwd"]) if pending else None
-        if guard is not None and guard.guarded:
+        if pending is not None and pending["detach"]:
+            guarded_note = (
+                f"{req.decision} downgraded to a one-shot approval: detach=true approvals "
+                "are bound to detached runs and never promotable"
+            )
+        elif guard is not None and guard.guarded:
             guarded_note = (
                 f"{req.decision} downgraded to a one-shot approval: this command redirects "
                 "outside the cwd or searches a broad/credential path, and a reusable approval "

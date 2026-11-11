@@ -156,6 +156,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("shell_calls", "protected_path_match", "TEXT"),
     ("shell_calls", "flagged", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "kind", "TEXT NOT NULL DEFAULT 'process'"),
+    ("pending_prompts", "detach", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 JOB_KINDS = frozenset({"process", "monitor", "unit"})
@@ -540,6 +541,7 @@ class Persistence:
         matched_rule_category: str | None,
         decision_path: list[str],
         ttl_seconds: int = 300,
+        detach: bool = False,
     ) -> str:
         prompt_id = str(uuid.uuid4())
         now = datetime.now(UTC)
@@ -550,8 +552,8 @@ class Persistence:
                 INSERT INTO pending_prompts (
                     id, created_at, expires_at, agent_id, cwd, raw_cmd,
                     normalized_template, command_tier, matched_rule_category,
-                    decision_path_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    decision_path_json, detach
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     prompt_id,
@@ -564,6 +566,7 @@ class Persistence:
                     command_tier,
                     matched_rule_category,
                     json.dumps(decision_path),
+                    int(detach),
                 ),
             )
         return prompt_id
@@ -673,7 +676,9 @@ class Persistence:
                 "matched_rule_category": row["matched_rule_category"],
             }
 
-    def consume_approval_by_command(self, *, raw_cmd: str, cwd: str, agent_id: str) -> dict | None:
+    def consume_approval_by_command(
+        self, *, raw_cmd: str, cwd: str, agent_id: str, detach: bool = False
+    ) -> dict | None:
         """Atomically find and consume a durable approve_once approval by command.
 
         Mirrors consume_approve_token (same BEGIN IMMEDIATE serialisation and
@@ -692,11 +697,11 @@ class Persistence:
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                        command_tier, matched_rule_category, expires_at, consumed_at
                 FROM pending_prompts
-                WHERE raw_cmd = ? AND cwd = ? AND agent_id = ?
+                WHERE raw_cmd = ? AND cwd = ? AND agent_id = ? AND detach = ?
                   AND approved_at IS NOT NULL AND consumed_at IS NULL
                 ORDER BY approved_at DESC LIMIT 1
                 """,
-                (raw_cmd, cwd, agent_id),
+                (raw_cmd, cwd, agent_id, int(detach)),
             ).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
@@ -726,7 +731,8 @@ class Persistence:
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                        command_tier, matched_rule_category, expires_at,
-                       approve_token, approve_decision, approved_at, consumed_at
+                       approve_token, approve_decision, approved_at, consumed_at,
+                       detach
                 FROM pending_prompts WHERE id = ?
                 """,
                 (prompt_id,),
@@ -748,7 +754,7 @@ class Persistence:
             SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                    command_tier, matched_rule_category, expires_at,
                    approve_token, approve_decision, approved_at, consumed_at,
-                   created_at
+                   created_at, detach
             FROM pending_prompts
             {where}
             ORDER BY created_at DESC, id
@@ -775,7 +781,8 @@ class Persistence:
             row = conn.execute(
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
-                       command_tier, matched_rule_category, expires_at, consumed_at
+                       command_tier, matched_rule_category, expires_at, consumed_at,
+                       detach
                 FROM pending_prompts
                 WHERE approve_token = ?
                 """,
