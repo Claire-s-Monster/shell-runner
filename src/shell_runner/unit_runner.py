@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MEMORY_MAX = "8G"
 DEFAULT_RUNTIME_MAX_S = 14400
 DEFAULT_MAX_DETACHED = 4
+MAX_RUNTIME_MAX_S = 7 * 24 * 3600  # env overrides are clamped to 7 days
+_MEMORY_SUFFIXES = {"K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+_MEMORY_FALLBACK_CEILING = 2**40  # used when physical RAM cannot be read
+_MAX_RESULT_BYTES = 256
 
 MAX_DETACHED_ENV = "SHELL_RUNNER_MAX_DETACHED"
 MEMORY_MAX_ENV = "SHELL_RUNNER_UNIT_MEMORY_MAX"
@@ -37,6 +41,10 @@ _MEMORY_RE = re.compile(r"[1-9][0-9]*[KMGT]?")
 _RUNTIME_RE = re.compile(r"[1-9][0-9]*")
 
 _RESULT_FILE = "result"
+# `systemctl stop` on a unit that is not loaded fails, but there is nothing left to stop.
+_UNIT_ABSENT_RE = re.compile(r"not loaded|does not exist|not found", re.IGNORECASE)
+# ASCII only: str.isdigit() accepts characters such as U+00B2 that int() rejects.
+_RESULT_RE = re.compile(rb"([0-9]{1,3}|[A-Z]+) ([a-z-]+)\n?")
 
 
 class UnitStartError(RuntimeError):
@@ -55,15 +63,35 @@ class UnitResult:
     service_result: str  # "success", "exit-code", "signal", "timeout", ...
 
 
+# Returned by read_result for a present-but-invalid result file (never produced by
+# parsing: "?" cannot match the exit-status pattern, "_" the service-result one).
+UNPARSEABLE_RESULT = UnitResult(exit_status="?", service_result="result_unparseable")
+
+
 def resolve_memory_max(environ: Mapping[str, str] | None = None) -> str:
     """MemoryMax for unit jobs: env override if finite and valid, else the default."""
     raw = (environ if environ is not None else os.environ).get(MEMORY_MAX_ENV)
     if raw is None:
         return DEFAULT_MEMORY_MAX
-    if _MEMORY_RE.fullmatch(raw):
+    if _MEMORY_RE.fullmatch(raw) and _memory_bytes(raw) < _memory_ceiling_bytes():
         return raw
     logger.warning("ignoring invalid %s=%r; using %s", MEMORY_MAX_ENV, raw, DEFAULT_MEMORY_MAX)
     return DEFAULT_MEMORY_MAX
+
+
+def _memory_bytes(value: str) -> int:
+    """Bytes in a validated _MEMORY_RE value (systemd suffixes are powers of 1024)."""
+    if value[-1] in _MEMORY_SUFFIXES:
+        return int(value[:-1]) * _MEMORY_SUFFIXES[value[-1]]
+    return int(value)
+
+
+def _memory_ceiling_bytes() -> int:
+    """Exclusive upper bound for MemoryMax: physical RAM, or 1T when that is unknown."""
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return _MEMORY_FALLBACK_CEILING + 1  # sysconf failed: reject only values > 1T
 
 
 def resolve_runtime_max_s(environ: Mapping[str, str] | None = None) -> int:
@@ -72,7 +100,7 @@ def resolve_runtime_max_s(environ: Mapping[str, str] | None = None) -> int:
     if raw is None:
         return DEFAULT_RUNTIME_MAX_S
     if _RUNTIME_RE.fullmatch(raw):
-        return int(raw)
+        return min(int(raw), MAX_RUNTIME_MAX_S)
     logger.warning("ignoring invalid %s=%r; using %d", RUNTIME_MAX_ENV, raw, DEFAULT_RUNTIME_MAX_S)
     return DEFAULT_RUNTIME_MAX_S
 
@@ -218,7 +246,11 @@ class SystemdBackend:
 
     async def kill(self, job_id: str) -> None:
         # unit_name() validates job_id, so nothing but sr-job-<uuid>.service is addressed.
-        await _run("systemctl", "--user", "stop", unit_name(job_id))
+        name = unit_name(job_id)
+        rc, _, err = await _run("systemctl", "--user", "stop", name)
+        text = err.decode(errors="replace").strip()
+        if rc != 0 and not _UNIT_ABSENT_RE.search(text):
+            raise UnitBackendError(f"systemctl stop {name} exited {rc}: {text}")
 
     async def active_units(self) -> set[str]:
         rc, out, err = await _run(
@@ -245,11 +277,15 @@ class SystemdBackend:
         return found
 
     def read_result(self, job_dir: Path) -> UnitResult | None:
+        """None when there is no result file; UNPARSEABLE_RESULT when it is invalid."""
         try:
-            text = (Path(job_dir) / _RESULT_FILE).read_text()
+            with (Path(job_dir) / _RESULT_FILE).open("rb") as fh:
+                data = fh.read(_MAX_RESULT_BYTES + 1)
         except OSError:
             return None
-        parts = text.split()
-        if len(parts) != 2:
-            return None
-        return UnitResult(exit_status=parts[0], service_result=parts[1])
+        match = _RESULT_RE.fullmatch(data) if len(data) <= _MAX_RESULT_BYTES else None
+        if match is None:
+            return UNPARSEABLE_RESULT
+        return UnitResult(
+            exit_status=match.group(1).decode(), service_result=match.group(2).decode()
+        )

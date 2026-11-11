@@ -264,6 +264,34 @@ def test_locked_recheck_refusal_restores_consumed_approval(
     assert client.post("/execute", json=body).json()["decision"] == "running"
 
 
+def _prompt(db: Persistence, *, detach: bool) -> str:
+    prompt_id = db.create_pending_prompt(
+        agent_id="a",
+        cwd="/tmp",
+        raw_cmd="x",
+        normalized_template="x",
+        command_tier=3,
+        matched_rule_category=None,
+        decision_path=[],
+        detach=detach,
+    )
+    db.approve_prompt(prompt_id=prompt_id, decision="approve_once")
+    return prompt_id
+
+
+def test_restore_approval_only_unconsumes_consumed_detach_prompt(db: Persistence) -> None:
+    detach_id = _prompt(db, detach=True)
+    plain_id = _prompt(db, detach=False)
+    assert db.restore_approval(detach_id) is False  # never consumed: nothing to restore
+    db.consume_approval_by_command(raw_cmd="x", cwd="/tmp", agent_id="a", detach=False)
+    assert (db.get_pending_prompt(plain_id) or {})["consumed_at"] is not None
+    assert db.restore_approval(plain_id) is False  # not a detach prompt
+    assert (db.get_pending_prompt(plain_id) or {})["consumed_at"] is not None
+    db.consume_approval_by_command(raw_cmd="x", cwd="/tmp", agent_id="a", detach=True)
+    assert db.restore_approval(detach_id) is True
+    assert (db.get_pending_prompt(detach_id) or {})["consumed_at"] is None
+
+
 def test_start_failure_finalizes_running_telemetry_row(
     db: Persistence, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -1682,7 +1682,13 @@ async def _refresh_unit_job(job: dict) -> dict:
     if job["kind"] != "unit" or job["status"] != "running":
         return job
     try:
-        return await asyncio.to_thread(executor.refresh_unit_job, db, job)
+        # The result file is only trusted once the backend confirms the unit is gone.
+        try:
+            active: set[str] | None = await executor._unit_backend.active_units()
+        except Exception:
+            logger.warning("cannot query units; leaving job %s untouched", job["job_id"])
+            active = None
+        return await asyncio.to_thread(executor.refresh_unit_job, db, job, active)
     except Exception:
         logger.exception("Failed to refresh unit job %s", job["job_id"])
         return job
@@ -1919,7 +1925,15 @@ async def _unit_still_active(job_id: str) -> bool:
 async def _kill_unit_job(job: dict) -> ShellKillResponse:
     """Stop a unit job. 'killed' is recorded BEFORE the stop, so a refresh that runs
     while the unit is dying finds a terminal row and cannot record 'failed'. If the
-    stop raises and the unit is still (or possibly) alive, 'killed' is reverted."""
+    stop raises and the unit is still (or possibly) alive, 'killed' is reverted.
+
+    Runs under _detach_lock, the lock guarding the detach cap, so the cap count
+    never drops while the unit is still being stopped."""
+    async with _detach_lock:
+        return await _kill_unit_job_locked(job)
+
+
+async def _kill_unit_job_locked(job: dict) -> ShellKillResponse:
     job_id = job["job_id"]  # the unit name derives from the row, never from client input
     await asyncio.to_thread(
         db.update_job_status,

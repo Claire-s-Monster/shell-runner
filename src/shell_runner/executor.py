@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from .models import MAX_TIMEOUT_S
 from .unit_runner import (
+    UNPARSEABLE_RESULT,
     SystemdBackend,
     UnitBackend,
     UnitResult,
@@ -618,7 +619,8 @@ async def execute_detached(
 
 def _unit_exit_code(result: UnitResult) -> int | None:
     """The numeric $EXIT_STATUS, or None when systemd reported a signal name."""
-    return int(result.exit_status) if result.exit_status.isdigit() else None
+    status = result.exit_status
+    return int(status) if status.isascii() and status.isdigit() else None
 
 
 def _unit_terminal_status(result: UnitResult) -> str:
@@ -664,22 +666,36 @@ def finalize_unit_job(
     )
 
 
-def refresh_unit_job(db: Persistence, job: dict, backend: UnitBackend | None = None) -> dict:
-    """If job is a running kind='unit' row whose result file exists, record the outcome.
+def refresh_unit_job(
+    db: Persistence, job: dict, active: set[str] | None, backend: UnitBackend | None = None
+) -> dict:
+    """If job is a running kind='unit' row whose unit is gone and whose result file
+    exists, record the outcome.
 
-    Returns the (possibly updated) row. A unit with no result file is still
-    active (or gone; reconcile_units handles that) and is left as it is.
+    *active* is the backend's set of active unit job ids, or None when it could not
+    be queried. The result file is written by the job's own user, so it is trusted
+    ONLY once the unit is confirmed inactive (ExecStopPost then replaces any spoofed
+    file with the real one). While the unit is active, or when *active* is None, the
+    row is left as it is. Returns the (possibly updated) row.
     """
     if job["kind"] != "unit" or job["status"] != "running" or not job.get("stdout_path"):
+        return job
+    if active is None or job["job_id"] in active:
         return job
     chosen = backend if backend is not None else _unit_backend
     result = chosen.read_result(Path(job["stdout_path"]).parent)
     if result is None:
         return job
+    _finalize_from_result(db, job, result)
+    return db.get_job(job["job_id"]) or job
+
+
+def _finalize_from_result(db: Persistence, job: dict, result: UnitResult) -> None:
+    if result == UNPARSEABLE_RESULT:
+        logger.warning("unit job %s: result_unparseable; marking failed", job["job_id"])
     finalize_unit_job(
         db, job, status=_unit_terminal_status(result), exit_code=_unit_exit_code(result)
     )
-    return db.get_job(job["job_id"]) or job
 
 
 def _settle_gone_unit(db: Persistence, job: dict, backend: UnitBackend) -> None:
@@ -690,9 +706,7 @@ def _settle_gone_unit(db: Persistence, job: dict, backend: UnitBackend) -> None:
     if result is None:
         finalize_unit_job(db, job, status="unit_missing")
     else:
-        finalize_unit_job(
-            db, job, status=_unit_terminal_status(result), exit_code=_unit_exit_code(result)
-        )
+        _finalize_from_result(db, job, result)
 
 
 async def reconcile_units(db: Persistence, backend: UnitBackend | None = None) -> int:

@@ -14,6 +14,7 @@ from shell_runner import unit_runner
 from shell_runner.unit_runner import (
     DEFAULT_MEMORY_MAX,
     DEFAULT_RUNTIME_MAX_S,
+    UNPARSEABLE_RESULT,
     SystemdBackend,
     UnitResult,
     build_unit_argv,
@@ -182,7 +183,8 @@ def test_memory_max_bad_values_fall_back(value: str) -> None:
 
 
 @pytest.mark.parametrize("value", ["512M", "2G", "1048576", "1T", "4K"])
-def test_memory_max_valid_override(value: str) -> None:
+def test_memory_max_valid_override(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    _fake_ram(monkeypatch, 2 * 2**40)
     assert resolve_memory_max({"SHELL_RUNNER_UNIT_MEMORY_MAX": value}) == value
 
 
@@ -290,6 +292,71 @@ def test_read_result_parses(tmp_path: Path) -> None:
     )
 
 
-def test_read_result_garbage_is_none(tmp_path: Path) -> None:
-    (tmp_path / "result").write_text("")
-    assert SystemdBackend().read_result(tmp_path) is None
+@pytest.mark.parametrize(
+    "text", ["", "² success\n", "1234 exit-code\n", "0 success\nextra\n", "0 success" + " x" * 200]
+)
+def test_read_result_garbage_is_unparseable(tmp_path: Path, text: str) -> None:
+    (tmp_path / "result").write_text(text)
+    assert SystemdBackend().read_result(tmp_path) == UNPARSEABLE_RESULT
+
+
+def test_read_result_oversized_is_unparseable(tmp_path: Path) -> None:
+    (tmp_path / "result").write_bytes(b"0 success\n" + b"\0" * 10_000)
+    assert SystemdBackend().read_result(tmp_path) == UNPARSEABLE_RESULT
+
+
+def test_read_result_signal_name_parses(tmp_path: Path) -> None:
+    (tmp_path / "result").write_text("TERM signal\n")
+    assert SystemdBackend().read_result(tmp_path) == UnitResult("TERM", "signal")
+
+
+# --- kill return code (finding 3) --------------------------------------------------
+
+
+async def test_kill_nonzero_rc_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_exec(monkeypatch, _FakeProc(rc=1, err=b"Failed to stop: Access denied"))
+    with pytest.raises(unit_runner.UnitBackendError, match="Access denied"):
+        await SystemdBackend().kill(JOB_ID)
+
+
+@pytest.mark.parametrize(
+    "err", [b"Unit sr-job-x.service not loaded.", b"Unit sr-job-x.service does not exist."]
+)
+async def test_kill_unit_not_loaded_is_success(monkeypatch: pytest.MonkeyPatch, err: bytes) -> None:
+    _patch_exec(monkeypatch, _FakeProc(rc=5, err=err))
+    await SystemdBackend().kill(JOB_ID)
+
+
+# --- env upper bounds (finding 4) ---------------------------------------------------
+
+
+def test_runtime_clamped_to_seven_days() -> None:
+    assert resolve_runtime_max_s({"SHELL_RUNNER_UNIT_RUNTIME_MAX_S": "99999999999"}) == 604800
+    assert resolve_runtime_max_s({"SHELL_RUNNER_UNIT_RUNTIME_MAX_S": "604800"}) == 604800
+
+
+def _fake_ram(monkeypatch: pytest.MonkeyPatch, ram_bytes: int | None) -> None:
+    def sysconf(name: str) -> int:
+        if ram_bytes is None:
+            raise ValueError(name)
+        return {"SC_PHYS_PAGES": ram_bytes // 4096, "SC_PAGE_SIZE": 4096}[name]
+
+    monkeypatch.setattr(unit_runner.os, "sysconf", sysconf)
+
+
+@pytest.mark.parametrize("value", ["16G", "17G", "1T", "16384M", "17179869184"])
+def test_memory_max_at_or_above_ram_falls_back(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    _fake_ram(monkeypatch, 16 * 2**30)
+    assert resolve_memory_max({"SHELL_RUNNER_UNIT_MEMORY_MAX": value}) == DEFAULT_MEMORY_MAX
+
+
+@pytest.mark.parametrize("value", ["15G", "512M", "4K"])
+def test_memory_max_below_ram_accepted(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    _fake_ram(monkeypatch, 16 * 2**30)
+    assert resolve_memory_max({"SHELL_RUNNER_UNIT_MEMORY_MAX": value}) == value
+
+
+def test_memory_max_sysconf_failure_caps_at_one_tib(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_ram(monkeypatch, None)
+    assert resolve_memory_max({"SHELL_RUNNER_UNIT_MEMORY_MAX": "1T"}) == "1T"
+    assert resolve_memory_max({"SHELL_RUNNER_UNIT_MEMORY_MAX": "2T"}) == DEFAULT_MEMORY_MAX

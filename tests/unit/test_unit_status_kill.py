@@ -5,6 +5,7 @@ A FakeUnitBackend stands in for systemd; nothing here spawns a unit.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 from shell_runner import executor
 from shell_runner import server as srv
 from shell_runner.persistence import Persistence
-from shell_runner.unit_runner import UnitResult
+from shell_runner.unit_runner import SystemdBackend, UnitResult
 
 AGENT = "focused-code-modifier"
 
@@ -249,7 +250,7 @@ def test_stale_refresh_cannot_overwrite_killed(
     assert stale is not None
     client.post("/tools/shell_kill", json={"job_id": job_id})
     backend.results[job_id] = UnitResult("0", "success")
-    executor.refresh_unit_job(db, stale, backend)
+    executor.refresh_unit_job(db, stale, set(), backend)
     job = db.get_job(job_id)
     assert job is not None
     assert job["status"] == "killed"
@@ -266,8 +267,8 @@ def test_refresh_during_kill_cannot_record_failed(
 
     def refresh_mid_kill(_: str) -> None:
         backend.results[job_id] = UnitResult("TERM", "signal")  # would map to 'failed'
-        executor.refresh_unit_job(db, db.get_job(job_id) or stale, backend)
-        executor.refresh_unit_job(db, stale, backend)
+        executor.refresh_unit_job(db, db.get_job(job_id) or stale, set(), backend)
+        executor.refresh_unit_job(db, stale, set(), backend)
 
     backend.on_kill = refresh_mid_kill
     assert client.post("/tools/shell_kill", json={"job_id": job_id}).json()["killed"] is True
@@ -313,3 +314,125 @@ def test_kill_does_not_clobber_already_finished_unit(
     resp = client.post("/tools/shell_kill", json={"job_id": job_id})
     assert resp.json()["killed"] is False
     assert backend.killed == []
+
+
+# --- security hardening (review findings 1, 2, 3, 5) ------------------------------
+
+
+def _write_result(tmp_path: Path, job_id: str, text: str) -> None:
+    (tmp_path / "jobs" / job_id / "result").write_text(text)
+
+
+@pytest.mark.parametrize("text", ["² success\n", "0 success" + " x" * 200, "0 SUCCESS\n", ""])
+def test_unparseable_result_marks_failed_not_stuck(
+    client: TestClient, db: Persistence, backend: FakeUnitBackend, tmp_path: Path, text: str
+) -> None:
+    job_id = _job(db, tmp_path)
+    _write_result(tmp_path, job_id, text)
+    backend.read_result = SystemdBackend().read_result  # type: ignore[method-assign]
+    body = _status(client, job_id)
+    assert body["status"] == "failed"
+    assert body["exit_code"] is None
+    assert db.count_running_units() == 0
+
+
+async def test_reconcile_isolates_unparseable_row(
+    db: Persistence, backend: FakeUnitBackend, tmp_path: Path
+) -> None:
+    bad = _job(db, tmp_path)
+    good = _job(db, tmp_path)
+    _write_result(tmp_path, bad, "² success\n")
+    _write_result(tmp_path, good, "0 success\n")
+    backend.read_result = SystemdBackend().read_result  # type: ignore[method-assign]
+    assert await executor.reconcile_units(db, backend) == 2
+    assert (db.get_job(bad) or {})["status"] == "failed"
+    assert (db.get_job(good) or {})["status"] == "completed"
+
+
+def test_spoofed_result_ignored_while_unit_active(
+    client: TestClient, db: Persistence, backend: FakeUnitBackend, tmp_path: Path
+) -> None:
+    job_id = _job(db, tmp_path)
+    backend.results[job_id] = UnitResult("0", "success")  # the job wrote it itself
+    backend.active = {job_id}
+    assert _status(client, job_id)["status"] == "running"
+    wait = client.post("/tools/shell_wait", json={"job_id": job_id, "wait_s": 0}).json()
+    assert wait["job_status"] == "running"
+    assert db.count_running_units() == 1
+    assert client.post("/tools/shell_kill", json={"job_id": job_id}).json()["killed"] is True
+
+
+def test_refresh_leaves_row_untouched_when_backend_unqueryable(
+    client: TestClient,
+    db: Persistence,
+    backend: FakeUnitBackend,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = _job(db, tmp_path)
+    backend.results[job_id] = UnitResult("0", "success")
+
+    async def boom() -> set[str]:
+        raise OSError("no bus")
+
+    monkeypatch.setattr(backend, "active_units", boom)
+    assert _status(client, job_id)["status"] == "running"
+    assert db.count_running_units() == 1
+
+
+class _Proc:
+    def __init__(self, rc: int, out: bytes = b"", err: bytes = b"") -> None:
+        self.returncode, self._out, self._err = rc, out, err
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._out, self._err
+
+
+def _patch_systemctl(
+    monkeypatch: pytest.MonkeyPatch, job_id: str, *, stop_rc: int, stop_err: bytes, alive: bool
+) -> None:
+    async def fake(*argv: str, **kwargs: object) -> _Proc:
+        if "stop" in argv:
+            return _Proc(stop_rc, err=stop_err)
+        out = f"sr-job-{job_id}.service loaded active running x\n".encode() if alive else b""
+        return _Proc(0, out=out)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+
+
+def test_kill_reverts_when_systemctl_stop_fails_and_unit_alive(
+    client: TestClient, db: Persistence, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = _job(db, tmp_path)
+    monkeypatch.setattr(executor, "_unit_backend", SystemdBackend())
+    _patch_systemctl(monkeypatch, job_id, stop_rc=1, stop_err=b"Access denied", alive=True)
+    body = client.post("/tools/shell_kill", json={"job_id": job_id}).json()
+    assert body["killed"] is False
+    assert (db.get_job(job_id) or {})["status"] == "running"
+    assert db.count_running_units() == 1
+
+
+def test_kill_succeeds_when_unit_not_loaded(
+    client: TestClient, db: Persistence, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = _job(db, tmp_path)
+    monkeypatch.setattr(executor, "_unit_backend", SystemdBackend())
+    err = f"Failed to stop sr-job-{job_id}.service: Unit sr-job-{job_id}.service not loaded."
+    _patch_systemctl(monkeypatch, job_id, stop_rc=5, stop_err=err.encode(), alive=False)
+    assert client.post("/tools/shell_kill", json={"job_id": job_id}).json()["killed"] is True
+    assert (db.get_job(job_id) or {})["status"] == "killed"
+
+
+async def test_kill_holds_detach_lock_during_mark_and_stop(
+    db: Persistence, backend: FakeUnitBackend, tmp_path: Path
+) -> None:
+    job_id = _job(db, tmp_path)
+    held_during_stop: list[bool] = []
+    backend.on_kill = lambda _: held_during_stop.append(srv._detach_lock.locked())
+    async with srv._detach_lock:  # a concurrent detach is mid-cap-check
+        task = asyncio.create_task(srv._kill_unit_job(db.get_job(job_id) or {}))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert db.count_running_units() == 1  # not yet marked killed
+    assert (await task).killed is True
+    assert held_during_stop == [True]
