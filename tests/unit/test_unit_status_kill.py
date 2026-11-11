@@ -6,6 +6,7 @@ A FakeUnitBackend stands in for systemd; nothing here spawns a unit.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -23,15 +24,22 @@ class FakeUnitBackend:
     def __init__(self) -> None:
         self.results: dict[str, UnitResult] = {}
         self.killed: list[str] = []
+        self.on_kill: Callable[[str], None] | None = None
+        self.kill_error: Exception | None = None
+        self.active: set[str] = set()
 
     async def start(self, argv: list[str]) -> None:
         return None
 
     async def kill(self, job_id: str) -> None:
         self.killed.append(job_id)
+        if self.on_kill is not None:
+            self.on_kill(job_id)
+        if self.kill_error is not None:
+            raise self.kill_error
 
     async def active_units(self) -> set[str]:
-        return set()
+        return set(self.active)
 
     def read_result(self, job_dir: Path) -> UnitResult | None:
         return self.results.get(Path(job_dir).name)
@@ -246,6 +254,54 @@ def test_stale_refresh_cannot_overwrite_killed(
     assert job is not None
     assert job["status"] == "killed"
     assert job["exit_code"] is None
+
+
+def test_refresh_during_kill_cannot_record_failed(
+    client: TestClient, db: Persistence, backend: FakeUnitBackend, tmp_path: Path
+) -> None:
+    """A refresh that runs inside backend.kill sees the dying unit's 'signal' result."""
+    job_id = _job(db, tmp_path)
+    stale = db.get_job(job_id)
+    assert stale is not None
+
+    def refresh_mid_kill(_: str) -> None:
+        backend.results[job_id] = UnitResult("TERM", "signal")  # would map to 'failed'
+        executor.refresh_unit_job(db, db.get_job(job_id) or stale, backend)
+        executor.refresh_unit_job(db, stale, backend)
+
+    backend.on_kill = refresh_mid_kill
+    assert client.post("/tools/shell_kill", json={"job_id": job_id}).json()["killed"] is True
+    job = db.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "killed"
+    assert _call(db, job_id)[0] == "executed"
+
+
+def test_kill_error_with_unit_gone_keeps_killed(
+    client: TestClient, db: Persistence, backend: FakeUnitBackend, tmp_path: Path
+) -> None:
+    job_id = _job(db, tmp_path)
+    backend.kill_error = OSError("boom")  # unit not in backend.active
+    assert client.post("/tools/shell_kill", json={"job_id": job_id}).json()["killed"] is True
+    job = db.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "killed"
+
+
+def test_kill_error_with_unit_alive_reverts_to_running(
+    client: TestClient, db: Persistence, backend: FakeUnitBackend, tmp_path: Path
+) -> None:
+    job_id = _job(db, tmp_path)
+    backend.kill_error = OSError("boom")
+    backend.active = {job_id}
+    body = client.post("/tools/shell_kill", json={"job_id": job_id}).json()
+    assert body["killed"] is False
+    assert "boom" in body["reason"]
+    job = db.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "running"
+    assert job["finished_at"] is None
+    assert _call(db, job_id)[0] == "running"
 
 
 def test_kill_does_not_clobber_already_finished_unit(

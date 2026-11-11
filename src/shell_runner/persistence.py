@@ -1177,19 +1177,28 @@ class Persistence:
         exit_code: int | None = None,
         finished_at: str | None = None,
         only_if_running: bool = False,
+        only_if_status: str | None = None,
     ) -> None:
         """Update a job's status.
 
         With only_if_running=True the UPDATE is a no-op unless the row is still
         'running', so a concurrent terminal write (e.g. shell_kill's 'killed')
         is never clobbered; the check and write are one SQL statement.
+        only_if_status=<s> is the same guard for an arbitrary expected status
+        (used to revert a tentative 'killed' back to 'running').
         """
-        guard = " AND status = 'running'" if only_if_running else ""
+        guard = ""
+        params: list[object] = [status, exit_code, finished_at, job_id]
+        if only_if_running:
+            guard = " AND status = 'running'"
+        elif only_if_status is not None:
+            guard = " AND status = ?"
+            params.append(only_if_status)
         with self._write_conn() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ?, exit_code = ?, finished_at = ? "
                 f"WHERE job_id = ?{guard}",  # noqa: S608 - constant fragment, no user input
-                (status, exit_code, finished_at, job_id),
+                params,
             )
 
     def kill_orphaned_monitor_jobs(self) -> list[dict]:

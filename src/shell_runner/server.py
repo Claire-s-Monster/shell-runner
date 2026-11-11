@@ -1908,6 +1908,45 @@ async def shell_wait_route(body: ShellWaitRequest) -> ShellWaitResponse:
     )
 
 
+async def _unit_still_active(job_id: str) -> bool:
+    """True unless the unit is positively gone; a failed query counts as active."""
+    try:
+        return job_id in await executor._unit_backend.active_units()
+    except Exception:
+        return True
+
+
+async def _kill_unit_job(job: dict) -> ShellKillResponse:
+    """Stop a unit job. 'killed' is recorded BEFORE the stop, so a refresh that runs
+    while the unit is dying finds a terminal row and cannot record 'failed'. If the
+    stop raises and the unit is still (or possibly) alive, 'killed' is reverted."""
+    job_id = job["job_id"]  # the unit name derives from the row, never from client input
+    await asyncio.to_thread(
+        db.update_job_status,
+        job_id,
+        status="killed",
+        finished_at=_now_iso(),
+        only_if_running=True,
+    )
+    current = await asyncio.to_thread(db.get_job, job_id)
+    if current is None or current["status"] != "killed":
+        return ShellKillResponse(killed=False, reason="job already finished")
+    try:
+        await executor._unit_backend.kill(job_id)
+    except Exception as exc:
+        if await _unit_still_active(job_id):
+            await asyncio.to_thread(
+                db.update_job_status,
+                job_id,
+                status="running",
+                only_if_status="killed",
+            )
+            logger.exception("Failed to stop unit for job %s; reverted to running", job_id)
+            return ShellKillResponse(killed=False, reason=f"failed to stop unit: {exc}")
+    await asyncio.to_thread(executor.finalize_unit_job, db, job, status="killed", exit_code=None)
+    return ShellKillResponse(killed=True, reason="unit stopped")
+
+
 @app.post("/tools/shell_kill", response_model=ShellKillResponse)
 async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
     job = db.get_job(body.job_id)
@@ -1926,15 +1965,7 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
             )
         return ShellKillResponse(killed=True, reason="monitor stopped")
     if job["kind"] == "unit":
-        # The unit name is derived from the DB row's job_id (validated inside the
-        # backend), never from anything the client supplied beyond the lookup key.
-        await executor._unit_backend.kill(job["job_id"])
-        # only_if_running: a terminal state recorded meanwhile is never clobbered,
-        # and any refresh that comes later cannot overwrite 'killed'.
-        await asyncio.to_thread(
-            executor.finalize_unit_job, db, job, status="killed", exit_code=None
-        )
-        return ShellKillResponse(killed=True, reason="unit stopped")
+        return await _kill_unit_job(job)
     sig = getattr(signal, body.sig, signal.SIGTERM)
     try:
         os.kill(job["pid"], sig)
