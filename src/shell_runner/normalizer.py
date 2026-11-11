@@ -179,8 +179,10 @@ READ_ONLY_FILE_VERBS: frozenset[str] = frozenset(
 # Read-only inspection verbs whose bare operands (`Makefile`, `src/x.py`) are file
 # paths. They are classified like `./<operand>` so they resolve (symlinks, `..`)
 # and get credential detection instead of staying an unmatchable literal word.
+# `mkdir` is the one writer here: `mkdir -p build/out` must resolve like `./build/out`
+# so it can reach the in-cwd fs-write rule (path_guard re-checks that it stays in cwd).
 _BARE_PATH_VERBS: frozenset[str] = frozenset(
-    {"ls", "stat", "du", "file", "wc", "head", "tail", "diff", "cmp"}
+    {"ls", "stat", "du", "file", "wc", "head", "tail", "diff", "cmp", "mkdir"}
 )
 _BARE_OPERAND_RE = re.compile(r"[\w.@+%-]+(?:/[\w.@+%-]+)*/?")
 
@@ -753,6 +755,9 @@ def _refine_operand(
         and classified == tok
         and _BARE_OPERAND_RE.fullmatch(tok)
         and not tok.startswith("-")
+        # a protected `$VAR`/`$(cmd)` is a sentinel word here: the real path is unknown,
+        # so a writer (mkdir) must not read it as a cwd-relative name
+        and not (verb == "mkdir" and _SENTINEL_PREFIX in tok)
     ):
         classified = classify_path("./" + tok, cwd, env)
         state.record(classified, tok)

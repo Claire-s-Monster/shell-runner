@@ -136,7 +136,7 @@ limitation tracked in [#29](https://github.com/Claire-s-Monster/shell-runner/iss
 
 ## What auto-executes (no prompt)
 
-Beyond the per-tier seed rules in `catalog.py`, four categories run without a
+Beyond the per-tier seed rules in `catalog.py`, the categories below run without a
 prompt. In every case a credential path (the `monitor.is_credential_path`
 list: `~/.ssh`, `~/.aws`, `~/.gnupg`, `.netrc`, `~/.claude/.credentials.json`,
 `.env*`, `*.pem`, `*.key`, ...) is classified `<cred_path>` and never matches
@@ -168,6 +168,54 @@ included.
    resolves to the cwd or `/tmp` (incl. scratchpads). Home, `/etc`, credential
    paths, globs and `$VAR` operands still prompt, as do `zsh -n` and `ksh -n`
    (their startup-file handling under `-n` is unverified). `py_compile` writes `__pycache__/*.pyc` next to the source.
+5. **`mkdir [-p]` in cwd** (AUTO_CAPPED, `fs-write`): bare names (`mkdir -p build/out`)
+   count like `./build/out`. Every target must resolve (realpath) inside the cwd,
+   or be `/tmp` scratch per item 3, and must not match a protected-path rule. `..`
+   escapes, symlinks out of the cwd, `$VAR` targets and protected paths prompt.
+6. **`git worktree list|prune`** (AUTO_CAPPED): `list` with `--porcelain`/`-v`/`-z`;
+   `prune` with only `-n`/`--dry-run`/`-v`. `prune --expire ...` and other options prompt.
+7. **`git worktree add|remove`** (AUTO_CAPPED, path-checked in `path_guard.py`): only
+   as one plain command (no `-C`, `cd`, env prefix, pipe, `;`/`&&`, redirect, variable,
+   glob or substitution) with no `--force`/`-f`/`--lock` (`add` also accepts `-b|-B
+   <branch>`, `--detach`/`-d`, `-q`, `--[no-]checkout`, `--[no-]track` and one
+   commit-ish). The target, resolved against the real cwd both lexically and through
+   symlinks, must be strictly inside an allowed `worktrees/` directory: `<repo
+   parent>/worktrees`, `<repo>/.claude/worktrees`, or (when the cwd is itself a
+   worktree) its parent `worktrees/` dir. The repo is the nearest ancestor of the cwd
+   holding `.git`, within the cwd roots (found without running git). It must also not be
+   `$HOME`, a credential path, a system path (`/etc /usr /var /boot /root /proc /sys
+   /dev /bin /sbin /lib /opt`) or match a protected-path rule. Anything else keeps
+   prompting, and every `add|remove` that is not auto-allowed is path-guarded: a
+   persisted template/verb approval (`git worktree add <cwd_path>`) cannot lower it.
+   Further fail-closed rules: only `-b <branch>` is accepted (`-B` resets an existing
+   branch); the target must be a direct child of the root (no nesting); the repo top
+   must lie inside `$HOME` (not `$HOME`, an ancestor, or `/`) and so must the root.
+   `add` and `remove` run hooks and config-driven commands (checkout, status-like
+   cleanliness checks), so both are auto-allowed only when nothing can run:
+   `<common-dir>/hooks` (and the private gitdir's) must be missing or hold only regular
+   `*.sample` files (`.git` files are followed via `gitdir:` and `commondir`); none of
+   `<common-dir>/config`, `config.worktree`, `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`
+   or `/etc/gitconfig` may contain `hookspath`, `[include*]`, `[filter*]`/`filter.`,
+   `fsmonitor`, `attributesfile`, `sshcommand`, `pager`, `editor`, `askpass`, a
+   `[diff]`/`[merge]` driver/command/external, or any unparseable line (a read error
+   other than "missing" also prompts). The one exception is the exact stock `git lfs
+   install` `[filter "lfs"]` section, honoured only in the user/system files, never the
+   repo's. No `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE` or `GIT_CONFIG*` may be set in
+   the server environment. `git -c core.hooksPath=...` and `--git-dir` prompt via the
+   plain-command rule. `remove` must also name exactly a registered worktree (`<common-dir>/worktrees/*/gitdir`) and no
+   other registered worktree may end with `/<arg>` (git resolves a bare suffix first).
+   Also prompting: a target with any component named `.git` (any case, trailing dots or
+   spaces) or holding/under a git-dir marker (`HEAD` + `objects/` + `refs/`); such targets
+   also take the git-dir write guard (T3, flagged). `remove`/`add` of the cwd or any
+   ancestor of it (e.g. `git worktree remove .` from inside a linked worktree) prompts.
+   The system gitconfig of the `git` the server's PATH resolves to
+   (`<realpath prefix>/etc/gitconfig`) is scanned like `/etc/gitconfig`; if it exists but
+   cannot be read, the command prompts. **Note:** removing a sibling worktree stays
+   auto-allowed, and without `--force` git still deletes *ignored* files in it (only
+   modified/untracked files block the removal).
+
+   `mkdir` stays AUTO_CAPPED only under a project cwd: with the cwd at `$HOME` itself, a
+   system/credential path or a protected path it prompts.
 
 **Git-directory write guard** ([#84](https://github.com/Claire-s-Monster/shell-runner/issues/84)).
 Planting `core.fsmonitor`, `core.pager`, `diff.external`, a `filter.*.smudge`,
@@ -272,6 +320,13 @@ trial evidence). Decided prompts
 (those carrying an approver) are also kept forever, independent of this
 window, because the audit rows they explain are never pruned; undecided
 prompts are still removed on expiry.
+
+**Write labels.** Output redirects (`>`, `>>`, `2>`, `&>`, `&>>`) and `tee` targets
+are recorded in `shell_calls.decision_path` as `fs-write: redirect <target>` /
+`fs-write: tee <target>`. `/dev/null` and fd duplications (`2>&1`, `>&2`) are not
+writes and get no label. The label does not change the tier or
+`matched_rule_category`; a write to a protected path additionally sets
+`protected_path_match` and `flagged = 1`.
 
 **`shell_audit`** (MCP tool; HTTP `POST /audit`) is a read-only query over
 `shell_calls`. Claude Code caches `tools/list`, so start a new session to see
