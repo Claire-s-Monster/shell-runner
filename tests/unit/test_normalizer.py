@@ -49,9 +49,11 @@ ENV = {"HOME": "/home/test"}
         # Heredocs
         ("cat <<EOF\nhello\nEOF", "cat <heredoc>"),
         # Process substitution (cat in READ_ONLY_FILE_VERBS → <file_arg> inside subst)
+        # (each inner command is also a command of its own: shellprep.prepare extracts it)
         (
             "diff <(cat a.txt) <(cat b.txt)",
-            "diff <process_subst:cat <file_arg>> <process_subst:cat <file_arg>>",
+            "diff <process_subst:cat <file_arg>> <process_subst:cat <file_arg>>"
+            " ; cat <file_arg> ; cat <file_arg>",
         ),
         # Forkbomb (literal — not normalized to anything fancy)
         (":(){ :|:& };:", ":(){ :|:& };:"),

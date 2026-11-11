@@ -11,6 +11,8 @@ the SAME commands. Before either tokenizes, this module resolves, once and quote
     single-quoted word, so `\\'` cannot desync a tokenizer and `$'sys\\x74em'` reads `system`;
   * heredocs and here-strings: openers outside quotes become a sentinel and the bodies are
     removed, so body text (apostrophes, `<<`) never reaches a tokenizer;
+  * process substitution `<(..)` / `>(..)` outside quotes: the inner command is extracted and
+    classified like a `$(..)` body (it is literal inside double quotes and heredoc bodies);
   * newlines outside quotes become ` ; ` (a command separator), except after an operator
     that already continues the command (`&&`, `||`, `|`, `;`, `&`, `(`); a newline inside
     quotes stays data (multi-line sed/awk scripts).
@@ -47,6 +49,7 @@ _SIMPLE_ESCAPES = {
     "?": "?",
 }
 _HEX_LENGTHS = {"x": 2, "u": 4, "U": 8}
+_MAX_CODE_POINT = 0x10FFFF
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,9 @@ class Prepared:
 
 
 def decode_ansi_c(raw: str) -> str:
-    """Decode the body of `$'...'` (bash ANSI-C quoting). NULs are dropped."""
+    """Decode the body of `$'...'` (bash ANSI-C quoting). NULs are dropped.
+
+    Raises ValueError for a code point that is not a valid character (callers fail closed)."""
     out: list[str] = []
     i, n = 0, len(raw)
     while i < n:
@@ -74,7 +79,10 @@ def decode_ansi_c(raw: str) -> str:
         elif e in _HEX_LENGTHS:
             m = re.match(f"[0-9A-Fa-f]{{1,{_HEX_LENGTHS[e]}}}", raw[i + 2 :])
             if m:
-                out.append(chr(int(m.group(), 16)))
+                code = int(m.group(), 16)
+                if code > _MAX_CODE_POINT or 0xD800 <= code <= 0xDFFF:
+                    raise ValueError(f"invalid code point in ANSI-C quote: {m.group()}")
+                out.append(chr(code))
                 i += 2 + m.end()
             else:
                 out.append(raw[i : i + 2])
@@ -260,6 +268,7 @@ class _Scanner:
         self.extras: list[str] = []  # command texts hidden in substitutions (classified too)
         self.arith: list[int] = []  # open $(( .. )): paren depth inside; `<<` is a shift there
         self.brace = 0  # open ${ .. }: `#` is never a comment there
+        self.bracket = 0  # open $[ .. ] (old arithmetic): likewise
         self.parens: list[str] = []  # open `$(` ("$") and plain `(` ("(")
         self.last_sig = ""  # last significant char emitted, "a" when it was escaped
         self.at_ws = True  # the next char starts a word (a `#` there begins a comment)
@@ -333,14 +342,30 @@ class _Scanner:
                     self.parens.append("$")
                 self._emit("$(", ws=True)
                 self.i += 2
+            elif c == "$" and s.startswith("$[", self.i):
+                self.bracket += 1
+                self._emit("$[", ws=False)
+                self.i += 2
+            elif c == "]" and self.bracket:
+                self.bracket -= 1
+                self._emit(c, ws=False)
+                self.i += 1
+            elif c in "<>" and not self.arith and s.startswith("(", self.i + 1):
+                self._process_subst()
             elif self.arith and c in "()":
                 self._arith_paren(c)
             elif c == "(":
+                # `((..))` is arithmetic: a `#` in it is never a comment (the 2nd paren marks it)
                 self.parens.append("(")
                 self._emit(c)
                 self.i += 1
+                if s.startswith("(", self.i):
+                    self.parens.append("A")
+                    self._emit("(")
+                    self.i += 1
             elif c == ")":
-                self._emit(c, ws=not (self.parens and self.parens.pop() == "$"))
+                top = self.parens.pop() if self.parens else ""
+                self._emit(c, ws=top != "$")
                 self.i += 1
             elif c == "}" and self.brace:
                 self.brace -= 1
@@ -372,7 +397,30 @@ class _Scanner:
             self.i += 1
 
     def _at_word_start(self) -> bool:
-        return self.at_ws and not self.arith and not self.brace
+        return (
+            self.at_ws
+            and not self.arith
+            and not self.brace
+            and not self.bracket
+            and "A" not in self.parens
+        )
+
+    def _process_subst(self) -> None:
+        """`<(cmd)` / `>(cmd)`: bash runs `cmd`, so it is classified as a command of its own.
+        The text stays (the normalizer templates it), with quotes, escapes and newlines
+        defanged so that nothing in it can hide the rest of the command line."""
+        s = self.s
+        end = _scan_close(s, self.i + 2, ")", quotes=True, subst=True, nest=True, comments=True)
+        if end < 0:
+            self.ok = False
+            end = self.n
+        else:
+            self.extras.append(s[self.i + 2 : end - 1])
+        piece = s[self.i : end]
+        if any(ch in piece for ch in "'\"\\\n"):
+            piece = _defang(piece).replace("\n", " ; ")
+        self._emit(piece, ws=False)
+        self.i = end
 
     def _comment(self) -> None:
         end = self.s.find("\n", self.i)
@@ -430,7 +478,11 @@ class _Scanner:
         if j >= self.n:
             self.ok = False
             j = self.n
-        decoded = decode_ansi_c(s[self.i + 2 : j])
+        try:
+            decoded = decode_ansi_c(s[self.i + 2 : j])
+        except ValueError:
+            self.ok = False
+            decoded = ""
         self._emit("'" + decoded.replace("'", "'\\''") + "'")
         self.i = j + 1
 
@@ -476,7 +528,12 @@ class _Scanner:
                 elif c == '"':
                     inner, quoted = re.sub(r'\\([$`"\\])', r"\1", inner[1:-1]), True
                 elif inner.startswith("$'"):
-                    inner, quoted = decode_ansi_c(inner[2:-1]), True
+                    try:
+                        inner = decode_ansi_c(inner[2:-1])
+                    except ValueError:
+                        self.ok = False
+                        inner = ""
+                    quoted = True
                 text.append(inner)
                 j = end
         return j, "".join(text), quoted

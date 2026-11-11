@@ -585,6 +585,13 @@ T4_ALWAYS_APPROVE: list[Rule] = [
         "process",
         promotable=False,
     ),
+    # Same for a process substitution as the program: `bash < <(cmd)`, `bash <(cmd)`.
+    Rule(
+        r"^(?:bash|sh|dash|zsh|ksh|python(?:3(?:\.\d+)?)?)(?=\s)(?:\s+\S+)*?\s+<process_subst:",
+        Tier.ALWAYS_APPROVE,
+        "process",
+        promotable=False,
+    ),
 ]
 
 # ---------------------------------------------------------------------------
