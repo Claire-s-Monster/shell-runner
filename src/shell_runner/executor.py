@@ -573,18 +573,19 @@ async def execute_detached(
 
     chosen = backend if backend is not None else _unit_backend
     job_dir = _job_dir_base() / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
     runtime_max_s = resolve_runtime_max_s()
+    # Built before the job dir exists: a rejected cwd/job_dir (ValueError) leaves nothing behind.
+    argv = build_unit_argv(
+        job_id,
+        command,
+        str(resolved),
+        _build_env(env_passthrough),
+        str(job_dir.resolve()),
+        resolve_memory_max(),
+        runtime_max_s,
+    )
+    job_dir.mkdir(parents=True, exist_ok=True)
     try:
-        argv = build_unit_argv(
-            job_id,
-            command,
-            str(resolved),
-            _build_env(env_passthrough),
-            str(job_dir.resolve()),
-            resolve_memory_max(),
-            runtime_max_s,
-        )
         await chosen.start(argv)
     except BaseException:
         shutil.rmtree(job_dir, ignore_errors=True)

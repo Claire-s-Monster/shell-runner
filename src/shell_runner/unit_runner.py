@@ -102,18 +102,21 @@ def unit_name(job_id: str) -> str:
     return name
 
 
-def _sd_escape(text: str) -> str:
-    # NOTE: not yet verified on a real host. systemd treats $ (variable
-    # substitution) and % (specifier) specially in command lines and several path
-    # properties, so both are doubled. Confirm with a real `systemd-run --user`
-    # that `$$` and `%%` arrive literally before relying on this for production.
-    return text.replace("$", "$$").replace("%", "%%")
+def _sd_dollar(text: str) -> str:
+    # Verified on a real host (systemd-run --user): `$` is expanded in the command
+    # argv words after `--`, so it is doubled and arrives literally. `%` is NOT
+    # expanded there (specifiers are not processed), so it must not be doubled.
+    return text.replace("$", "$$")
 
 
 def _sd_quote(text: str) -> str:
-    """Quote one word of a systemd command line (double quotes, C-style escapes)."""
+    """Quote one ExecStopPost word (double quotes, C-style escapes).
+
+    Doubles both `$` and `%`; verified on a real host (exit status and the
+    RuntimeMaxSec 'timeout' result were captured correctly).
+    """
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-    return '"' + _sd_escape(escaped) + '"'
+    return '"' + escaped.replace("$", "$$").replace("%", "%%") + '"'
 
 
 def _check_path(field: str, value: str) -> None:
@@ -121,6 +124,15 @@ def _check_path(field: str, value: str) -> None:
         raise ValueError(f"{field} must not contain newlines or NUL")
     if not value.startswith("/"):
         raise ValueError(f"{field} must be an absolute path")
+
+
+def _check_property_path(field: str, value: str) -> None:
+    # systemd expands % specifiers in -p path values and escaping there is not
+    # verified on a real host, so fail closed instead of escaping.
+    _check_path(field, value)
+    bad = [c for c in "%$\\" if c in value]
+    if bad:
+        raise ValueError(f"{field} must not contain {' or '.join(repr(c) for c in bad)}: {value!r}")
 
 
 def build_unit_argv(
@@ -138,8 +150,8 @@ def build_unit_argv(
     ``--setenv`` nor the caller's environment is ever used.
     """
     name = unit_name(job_id).removesuffix(".service")
-    _check_path("cwd", cwd)
-    _check_path("job_dir", job_dir)
+    _check_property_path("cwd", cwd)
+    _check_property_path("job_dir", job_dir)
     if not _MEMORY_RE.fullmatch(memory_max):
         raise ValueError(f"memory_max must be finite: {memory_max!r}")
     if runtime_max_s <= 0:
@@ -159,17 +171,17 @@ def build_unit_argv(
         f"RuntimeMaxSec={runtime_max_s}",
         "Type=exec",
         "KillMode=control-group",
-        f"WorkingDirectory={_sd_escape(cwd)}",
-        f"StandardOutput=append:{_sd_escape(job_dir)}/stdout.log",
-        f"StandardError=append:{_sd_escape(job_dir)}/stderr.log",
+        f"WorkingDirectory={cwd}",
+        f"StandardOutput=append:{job_dir}/stdout.log",
+        f"StandardError=append:{job_dir}/stderr.log",
         f"ExecStopPost=/bin/sh -c {_sd_quote(stop_script)}",
     ]
     argv = ["systemd-run", "--user", f"--unit={name}", "--collect", "--quiet"]
     for prop in props:
         argv += ["-p", prop]
     argv += ["--", "env", "-i"]
-    argv += [f"{k}={_sd_escape(v)}" for k, v in env.items()]
-    argv += ["/bin/bash", "-c", _sd_escape(command)]
+    argv += [f"{k}={_sd_dollar(v)}" for k, v in env.items()]
+    argv += ["/bin/bash", "-c", _sd_dollar(command)]
     return argv
 
 

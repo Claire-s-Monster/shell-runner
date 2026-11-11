@@ -169,6 +169,32 @@ async def test_start_failure_leaves_no_row_and_cleans_job_dir(
     assert not (job_dir_base / job_id).exists()
 
 
+async def test_percent_in_cwd_rejected_before_anything_starts(
+    db: Persistence, tmp_path: Path, job_dir_base: Path
+) -> None:
+    odd = tmp_path / "a%h"
+    odd.mkdir()
+    backend = FakeUnitBackend()
+    with pytest.raises(ValueError, match="cwd"):
+        await _run(db, backend, cwd=str(odd))
+    assert backend.started == []
+    assert not job_dir_base.exists() or list(job_dir_base.iterdir()) == []
+    assert db.list_running_jobs() == []
+
+
+async def test_dollar_in_job_dir_rejected_before_anything_starts(
+    db: Persistence, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = tmp_path / "j$dir"
+    monkeypatch.setenv("SHELL_RUNNER_JOB_DIR", str(base))
+    backend = FakeUnitBackend()
+    with pytest.raises(ValueError, match="job_dir"):
+        await _run(db, backend, cwd=str(tmp_path))
+    assert backend.started == []
+    assert not base.exists()
+    assert db.list_running_jobs() == []
+
+
 async def test_bad_job_id_rejected_before_mkdir(
     db: Persistence, tmp_path: Path, job_dir_base: Path
 ) -> None:

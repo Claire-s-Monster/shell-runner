@@ -84,18 +84,23 @@ def test_golden_argv() -> None:
     ]
 
 
-def test_dollar_and_percent_escaped_for_systemd() -> None:
+def test_dollar_doubled_percent_literal_in_command_words() -> None:
     argv = _argv(command="echo $HOME 50%", env={"A": "x$y%z"})
     tail = argv[argv.index("--") + 1 :]
-    assert tail == ["env", "-i", "A=x$$y%%z", "/bin/bash", "-c", "echo $$HOME 50%%"]
+    assert tail == ["env", "-i", "A=x$$y%z", "/bin/bash", "-c", "echo $$HOME 50%"]
 
 
 def test_odd_path_chars_quoted_in_exec_stop_post() -> None:
-    argv = _argv(job_dir="/jobs/it's a $dir%")
+    argv = _argv(job_dir="/jobs/it's a dir")
     stop = next(a for a in argv if a.startswith("ExecStopPost="))
-    # shell-quoted for sh, then $ and % doubled for systemd
-    assert "$$dir%%" in stop
     assert "'\"'\"'" in stop.replace("\\", "")  # the embedded single quote
+
+
+@pytest.mark.parametrize("field", ["cwd", "job_dir"])
+@pytest.mark.parametrize("bad", ["%", "$", "\n", "\\"])
+def test_property_paths_reject_special_chars(field: str, bad: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        _argv(**{field: f"/tmp/a{bad}b"})
 
 
 def test_env_is_only_the_passed_dict_no_setenv() -> None:
