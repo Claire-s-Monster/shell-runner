@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -25,6 +26,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .models import MAX_TIMEOUT_S
+from .unit_runner import (
+    SystemdBackend,
+    UnitBackend,
+    build_unit_argv,
+    resolve_memory_max,
+    resolve_runtime_max_s,
+    unit_name,
+)
 
 if TYPE_CHECKING:
     from .persistence import Persistence
@@ -532,6 +541,77 @@ def _job_is_terminal(persistence: Persistence, job_id: str) -> bool:
         )
         return False
     return row is not None and row.get("status") != "running"
+
+
+# Injectable seam: tests replace this with a fake so no systemd-run is ever spawned.
+_unit_backend: UnitBackend = SystemdBackend()
+
+
+async def execute_detached(
+    db: Persistence,
+    job_id: str,
+    command: str,
+    cwd: str,
+    env_passthrough: list[str] | None,
+    backend: UnitBackend | None = None,
+    *,
+    telemetry_id: str,
+    agent_id: str,
+) -> Path:
+    """Start command as a transient systemd unit and record a kind='unit' job row.
+
+    The sandbox matches execute_background(): cwd goes through resolve_cwd() and
+    the unit's environment is exactly _build_env()'s output. The row is written
+    only after the unit started, so a failed start leaves no row and no job dir.
+    Returns the job dir (stdout.log / stderr.log / result live there).
+    """
+    resolved, cwd_error = resolve_cwd(cwd)
+    if cwd_error is not None or resolved is None:
+        raise ValueError(cwd_error)
+    unit_name(job_id)  # validates job_id before it is used as a path component
+
+    chosen = backend if backend is not None else _unit_backend
+    job_dir = _job_dir_base() / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    runtime_max_s = resolve_runtime_max_s()
+    try:
+        argv = build_unit_argv(
+            job_id,
+            command,
+            str(resolved),
+            _build_env(env_passthrough),
+            str(job_dir.resolve()),
+            resolve_memory_max(),
+            runtime_max_s,
+        )
+        await chosen.start(argv)
+    except BaseException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+
+    try:
+        await asyncio.to_thread(
+            db.create_job,
+            job_id=job_id,
+            telemetry_id=telemetry_id,
+            raw_cmd=command,
+            cwd=cwd,
+            agent_id=agent_id,
+            timeout_s=runtime_max_s,
+            stdout_path=str(job_dir / "stdout.log"),
+            stderr_path=str(job_dir / "stderr.log"),
+            pid=None,
+            kind="unit",
+        )
+    except BaseException:
+        logger.exception("Failed to persist job row for unit job %s; stopping its unit", job_id)
+        try:
+            await chosen.kill(job_id)
+        except Exception:
+            logger.exception("Error stopping orphaned unit for job %s", job_id)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    return job_dir
 
 
 async def execute_background(
