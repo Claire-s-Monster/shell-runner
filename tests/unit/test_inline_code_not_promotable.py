@@ -79,8 +79,9 @@ def _seed(db: Persistence, command: str, verb: str, cwd: Path) -> None:
 
 def test_catalog_marks_exactly_the_inline_code_rules_non_promotable() -> None:
     flagged = [r.pattern for r in T4_ALWAYS_APPROVE if not r.promotable]
-    assert len(flagged) == 3
+    assert len(flagged) == 4  # bash family, python, source, interpreter fed by <heredoc>
     assert r"^source\s+\S+$" in flagged
+    assert any(p.endswith(r"\s+<heredoc>(?:\s|$)") for p in flagged)
     assert any(p.startswith("^python") for p in flagged)
     assert any(p.startswith("^(?:bash|sh") for p in flagged)
 
