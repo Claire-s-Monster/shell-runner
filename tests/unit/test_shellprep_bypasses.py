@@ -14,6 +14,7 @@ import pytest
 from shell_runner import executor
 from shell_runner.catalog import Tier
 from shell_runner.classifier import PERMISSIVENESS, classify
+from shell_runner.shellprep import prepare
 from shell_runner.write_targets import analyze
 
 AGENT = "some-agent"
@@ -178,3 +179,97 @@ FAIL_SAFE = [
 @pytest.mark.parametrize("command", FAIL_SAFE)
 def test_fail_safe_forms_stay_guarded(repo: Path, command: str) -> None:
     _assert_blocked(command, repo)
+
+
+# Process substitution: bash runs the inner command wherever `<(..)`/`>(..)` is expanded
+# (not inside double quotes or heredoc bodies, where it is literal text).
+PROCESS_SUBST = [
+    "echo x >(tee .git/config)",
+    "echo x > >(dd of=.git/config)",
+    "cat < <(touch .git/config)",
+    "diff <(touch .git/config) /dev/null",
+    "echo x >(cat >(tee .git/config))",
+    "cat <(cat <(touch .git/config))",
+    'echo "$(cat <(touch .git/config))"',
+    "cat <<EOF\n$(cat <(touch .git/config))\nEOF",
+    "echo x >(echo ')' ; touch .git/config)",
+    "cat <<< <(touch .git/config)",
+]
+
+
+@pytest.mark.parametrize("command", PROCESS_SUBST)
+def test_process_substitution_contents_are_classified(repo: Path, command: str) -> None:
+    _assert_git_guarded(command, repo)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "<(touch .git/config)"',
+        'echo "x >(tee .git/config)"',
+        "echo '<(touch .git/config)'",
+        "cat <<EOF\n<(touch .git/config)\n>(tee .git/config)\nEOF",
+    ],
+)
+def test_process_substitution_is_literal_in_quotes_and_heredoc_bodies(
+    repo: Path, command: str
+) -> None:
+    assert not _cls(command, repo).path_guarded, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash < <(echo hi)",
+        "sh < <(echo hi)",
+        "python3 < <(echo hi)",
+        "bash -e < <(touch x)",
+        "/bin/bash < <(echo hi)",
+        "bash <(echo hi)",
+    ],
+)
+def test_interpreter_fed_by_process_substitution_is_t4_non_promotable(
+    repo: Path, command: str
+) -> None:
+    cls = _cls(command, repo)
+    assert cls.command_tier == T4, (command, cls.command_tier)
+    assert cls.non_promotable, command
+
+
+def test_non_interpreter_process_substitution_is_promotable(repo: Path) -> None:
+    assert not _cls("diff <(cat a.txt) <(cat b.txt)", repo).non_promotable
+
+
+def test_decode_ansi_c_out_of_range_code_point_fails_closed(repo: Path) -> None:
+    assert not prepare("echo $'\\UFFFFFFFF'").ok
+    cls = _cls("echo $'\\UFFFFFFFF'", repo)
+    assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "((1 # )); touch .git/config",
+        "echo $[1 # ]; touch .git/config",
+        "(( 1 # ))\ntouch .git/config",
+    ],
+)
+def test_hash_after_blank_inside_arithmetic_is_not_a_comment(repo: Path, command: str) -> None:
+    _assert_git_guarded(command, repo)
+
+
+PINNED = [
+    "echo .git/config | xargs touch",
+    "nice -n 5 touch .git/config",
+    "env -u HOME touch .git/config",
+    "if true; then touch .git/config; fi",
+    "{ touch .git/config; }",
+    "! touch .git/config",
+    "coproc touch .git/config",
+]
+
+
+@pytest.mark.parametrize("command", PINNED)
+def test_pinned_wrapper_and_compound_forms_are_not_auto_executed(repo: Path, command: str) -> None:
+    cls = _cls(command, repo)
+    assert PERMISSIVENESS[cls.command_tier] <= PERMISSIVENESS[T3], (command, cls.command_tier)
