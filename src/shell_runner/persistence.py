@@ -724,6 +724,15 @@ class Persistence:
                 "matched_rule_category": row["matched_rule_category"],
             }
 
+    def restore_approval(self, prompt_id: str) -> None:
+        """Un-consume a prompt (clear consumed_at) when its approved run never started.
+
+        Only used when a detach cap recheck refuses after the approval was consumed.
+        Expiry still applies, so this never extends an approval's lifetime.
+        """
+        with self._write_conn() as conn:
+            conn.execute("UPDATE pending_prompts SET consumed_at = NULL WHERE id = ?", (prompt_id,))
+
     def get_pending_prompt(self, prompt_id: str) -> dict | None:
         """Fetch a pending prompt by id (full row as dict)."""
         with self._conn() as conn:

@@ -673,6 +673,7 @@ async def _execute_approved_command(
             normalizer_warnings=[],
             protected_path_match=recheck_cls.protected_path_json,
             flagged=int(recheck_cls.flagged),
+            approval_id=prompt["id"],
         ),
         telemetry_writer,
         catalog_writer,
@@ -698,6 +699,29 @@ class _DispatchContext:
     normalizer_warnings: list[str]
     protected_path_match: str | None
     flagged: int
+    approval_id: str | None = None  # consumed pending_prompts row, restored on a cap refusal
+
+
+def _detach_cap_error(cap: int) -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail=(
+            f"detach refused: {cap} detached jobs already running "
+            f"(SHELL_RUNNER_MAX_DETACHED={cap}); nothing was spawned. "
+            "Wait for one to finish or shell_kill it, then retry."
+        ),
+    )
+
+
+async def _refuse_if_detach_full() -> None:
+    """Unlocked early cap peek: refuse BEFORE a one-shot approval is consumed.
+
+    The locked recheck in _dispatch_approved stays authoritative; this only keeps
+    the common refusal from burning the approval.
+    """
+    cap = resolve_max_detached()
+    if await asyncio.to_thread(db.count_running_units) >= cap:
+        raise _detach_cap_error(cap)
 
 
 async def _dispatch_approved(
@@ -771,29 +795,41 @@ async def _dispatch_approved(
         async with _detach_lock:
             cap = resolve_max_detached()
             if await asyncio.to_thread(db.count_running_units) >= cap:
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        f"detach refused: {cap} detached jobs already running "
-                        f"(SHELL_RUNNER_MAX_DETACHED={cap}); nothing was spawned. "
-                        "Wait for one to finish or shell_kill it, then retry."
-                    ),
-                )
+                # Lost a race with another dispatch after the early peek: give the
+                # already-consumed approval back so the caller can retry.
+                if ctx.approval_id is not None:
+                    await asyncio.to_thread(db.restore_approval, ctx.approval_id)
+                raise _detach_cap_error(cap)
             await _record(
                 telemetry_id,
                 _written_row("running", None, [*ctx.decision_path, "detached"]),
                 wait=True,
             )
             await _upsert_catalog()
-            await execute_detached(
-                db,
-                job_id,
-                req.command,
-                req.cwd,
-                None,
-                telemetry_id=telemetry_id,
-                agent_id=req.agent_id,
-            )
+            try:
+                await execute_detached(
+                    db,
+                    job_id,
+                    req.command,
+                    req.cwd,
+                    None,
+                    telemetry_id=telemetry_id,
+                    agent_id=req.agent_id,
+                )
+            except BaseException:
+                # The unit never started: do not leave the pre-written row 'running'.
+                await asyncio.to_thread(
+                    db.finalize_call,
+                    telemetry_id,
+                    decision="failed",
+                    exit_code=None,
+                    stdout_bytes=0,
+                    stderr_bytes=0,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    decision_path=[*ctx.decision_path, "detached", "start_failed"],
+                    only_if_running=True,
+                )
+                raise
         return ExecuteResponse(
             decision="running",
             tier=ctx.final_tier,
@@ -984,6 +1020,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 status_code=403,
                 detail="approve_token does not match: " + "; ".join(mismatches),
             )
+        if req.detach:
+            await _refuse_if_detach_full()  # before consume: a refusal must not burn the token
         prompt = await asyncio.to_thread(db.consume_approve_token, token=req.approve_token)
         if prompt is None:
             raise HTTPException(
@@ -1100,6 +1138,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
     # (raw_cmd, cwd, agent_id) consumes it once instead of re-prompting.
     # Single-use + TTL-bounded + exact (cmd, cwd, agent) match = same trust
     # boundary as consuming an approve_token, just without requiring the token.
+    if req.detach:
+        await _refuse_if_detach_full()  # before consume: a refusal must not burn the approval
     consumed = await asyncio.to_thread(
         db.consume_approval_by_command,
         raw_cmd=req.command,

@@ -195,6 +195,91 @@ def test_prompted_command_checks_cap_at_dispatch_after_approval(
     assert len(backend.started) == cap2
 
 
+def _approved(client: TestClient, cwd: Path) -> dict:
+    prompt = client.post("/execute", json=_body(cwd, T3_CMD)).json()["prompt"]
+    return client.post(
+        "/approve_pending",
+        json={
+            "prompt_id": prompt["id"],
+            "decision": "approve_once",
+            "approver_agent_id": "primary",
+        },
+    ).json()
+
+
+def _fill(client: TestClient, cwd: Path, n: int) -> list[str]:
+    return [client.post("/execute", json=_body(cwd)).json()["job_id"] for _ in range(n)]
+
+
+def test_cap_refusal_does_not_burn_token_and_retry_succeeds(
+    db: Persistence, backend: FakeUnitBackend, cap2: int, tmp_path: Path
+) -> None:
+    client = TestClient(srv.app)
+    token = _approved(client, tmp_path)["approve_token"]
+    ids = _fill(client, tmp_path, cap2)
+    body = _body(tmp_path, T3_CMD, approve_token=token)
+    assert client.post("/execute", json=body).status_code == 429
+    db.update_job_status(ids[0], status="killed", exit_code=None, finished_at="2026-01-01")
+    retry = client.post("/execute", json=body)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["decision"] == "running"
+    db.update_job_status(ids[1], status="killed", exit_code=None, finished_at="2026-01-01")
+    assert client.post("/execute", json=body).status_code == 403  # now consumed for real
+
+
+def test_cap_refusal_does_not_burn_tokenless_approval(
+    db: Persistence, backend: FakeUnitBackend, cap2: int, tmp_path: Path
+) -> None:
+    client = TestClient(srv.app)
+    _approved(client, tmp_path)
+    ids = _fill(client, tmp_path, cap2)
+    assert client.post("/execute", json=_body(tmp_path, T3_CMD)).status_code == 429
+    db.update_job_status(ids[0], status="killed", exit_code=None, finished_at="2026-01-01")
+    retry = client.post("/execute", json=_body(tmp_path, T3_CMD))
+    assert retry.json()["decision"] == "running"
+    db.update_job_status(ids[1], status="killed", exit_code=None, finished_at="2026-01-01")
+    assert client.post("/execute", json=_body(tmp_path, T3_CMD)).json()["decision"] == (
+        "prompt_required"
+    )
+
+
+def test_locked_recheck_refusal_restores_consumed_approval(
+    db: Persistence,
+    backend: FakeUnitBackend,
+    cap2: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = TestClient(srv.app)
+    token = _approved(client, tmp_path)["approve_token"]
+    ids = _fill(client, tmp_path, cap2)
+
+    async def _no_peek() -> None:  # simulate losing the race after the early peek
+        return None
+
+    monkeypatch.setattr(srv, "_refuse_if_detach_full", _no_peek)
+    body = _body(tmp_path, T3_CMD, approve_token=token)
+    assert client.post("/execute", json=body).status_code == 429
+    db.update_job_status(ids[0], status="killed", exit_code=None, finished_at="2026-01-01")
+    assert client.post("/execute", json=body).json()["decision"] == "running"
+
+
+def test_start_failure_finalizes_running_telemetry_row(
+    db: Persistence, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Boom(FakeUnitBackend):
+        async def start(self, argv: list[str]) -> None:
+            raise RuntimeError("systemd-run failed")
+
+    monkeypatch.setattr(executor, "_unit_backend", Boom())
+    client = TestClient(srv.app, raise_server_exceptions=False)
+    assert client.post("/execute", json=_body(tmp_path)).status_code == 500
+    with db._conn() as conn:
+        decisions = [r[0] for r in conn.execute("SELECT decision FROM shell_calls")]
+    assert decisions == ["failed"]
+    assert db.count_running_units() == 0
+
+
 async def test_concurrent_dispatches_cannot_exceed_cap(
     db: Persistence, monkeypatch: pytest.MonkeyPatch, cap2: int, tmp_path: Path
 ) -> None:
