@@ -30,7 +30,7 @@ pixi run check-all
 |------|-------------|
 | `test` | Run tests (excludes live and debug) |
 | `test-unit` | Run unit tests only |
-| `test-systemd` | Real-systemd smoke test for detached jobs (marker `systemd`, off by default) |
+| `pixi run -e dev pytest tests/integration/test_unit_systemd_smoke.py -v -m systemd` | Real-systemd smoke test for detached jobs (marker `systemd`, off by default) |
 | `test-cov` | Run tests with coverage report |
 | `lint` | Run ruff linter with auto-fix |
 | `format` | Run black formatter |
@@ -316,7 +316,7 @@ real user manager (special characters, env allowlist, exit status, `RuntimeMaxSe
 timeout, unit collection), run:
 
 ```bash
-pixi run -e dev test-systemd
+pixi run -e dev pytest tests/integration/test_unit_systemd_smoke.py -v -m systemd
 ```
 
 It is selected by the `systemd` pytest marker, deselected by default, and skips

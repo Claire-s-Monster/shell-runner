@@ -2,7 +2,7 @@
 
 Runs real transient units through SystemdBackend, so it needs a reachable user
 manager (XDG_RUNTIME_DIR / DBUS, lingering for headless hosts). Deselected by
-default; run it with:  pixi run -e dev test-systemd
+default; run it with:  pixi run -e dev pytest tests/integration/test_unit_systemd_smoke.py -v -m systemd
 """
 
 from __future__ import annotations
