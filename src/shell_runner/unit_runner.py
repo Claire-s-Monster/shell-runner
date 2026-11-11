@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MEMORY_MAX = "8G"
 DEFAULT_RUNTIME_MAX_S = 14400
+DEFAULT_MAX_DETACHED = 4
 
+MAX_DETACHED_ENV = "SHELL_RUNNER_MAX_DETACHED"
 MEMORY_MAX_ENV = "SHELL_RUNNER_UNIT_MEMORY_MAX"
 RUNTIME_MAX_ENV = "SHELL_RUNNER_UNIT_RUNTIME_MAX_S"
 
@@ -69,6 +71,17 @@ def resolve_runtime_max_s(environ: Mapping[str, str] | None = None) -> int:
         return int(raw)
     logger.warning("ignoring invalid %s=%r; using %d", RUNTIME_MAX_ENV, raw, DEFAULT_RUNTIME_MAX_S)
     return DEFAULT_RUNTIME_MAX_S
+
+
+def resolve_max_detached(environ: Mapping[str, str] | None = None) -> int:
+    """Cap on concurrently running unit jobs: env override if a positive integer, else 4."""
+    raw = (environ if environ is not None else os.environ).get(MAX_DETACHED_ENV)
+    if raw is None:
+        return DEFAULT_MAX_DETACHED
+    if _RUNTIME_RE.fullmatch(raw):  # same shape: positive integer
+        return int(raw)
+    logger.warning("ignoring invalid %s=%r; using %d", MAX_DETACHED_ENV, raw, DEFAULT_MAX_DETACHED)
+    return DEFAULT_MAX_DETACHED
 
 
 def _check_job_id(job_id: str) -> None:

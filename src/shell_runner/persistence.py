@@ -1201,6 +1201,14 @@ class Persistence:
             )
         return [dict(r) for r in rows]
 
+    def count_running_units(self) -> int:
+        """Number of detached (kind='unit') jobs still marked running."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE kind = 'unit' AND status = 'running'"
+            ).fetchone()
+        return int(row[0])
+
     def get_job(self, job_id: str) -> dict | None:
         with self._conn() as conn:
             row = conn.execute(

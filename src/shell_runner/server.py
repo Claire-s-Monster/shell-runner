@@ -89,6 +89,7 @@ from .persistence import (
     parse_time_bound,
 )
 from .seeds import DEFAULT_SEED_APPROVALS
+from .unit_runner import resolve_max_detached
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,9 @@ _db_path = os.environ.get("SHELL_RUNNER_DB", str(DEFAULT_DB_PATH))
 db = Persistence(db_path=_db_path)
 
 _cleanup_task: asyncio.Task[None] | None = None
+
+# Serialises the detached-unit cap check with the spawn that makes it count.
+_detach_lock = asyncio.Lock()
 
 RETENTION_S = int(os.environ.get("SHELL_RUNNER_JOB_RETENTION_S", str(7 * 24 * 3600)))
 DEFAULT_RETENTION_DAYS = 14
@@ -761,22 +765,35 @@ async def _dispatch_approved(
     if req.detach:
         # timeout_s is deliberately not passed: the unit's RuntimeMaxSec is the ceiling.
         telemetry_id = str(uuid.uuid4())
-        await _record(
-            telemetry_id,
-            _written_row("running", None, [*ctx.decision_path, "detached"]),
-            wait=True,
-        )
-        await _upsert_catalog()
         job_id = str(uuid.uuid4())
-        await execute_detached(
-            db,
-            job_id,
-            req.command,
-            req.cwd,
-            None,
-            telemetry_id=telemetry_id,
-            agent_id=req.agent_id,
-        )
+        # The cap check and the spawn (which writes the kind='unit' job row) are
+        # one critical section, or concurrent dispatches could all pass the check.
+        async with _detach_lock:
+            cap = resolve_max_detached()
+            if await asyncio.to_thread(db.count_running_units) >= cap:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"detach refused: {cap} detached jobs already running "
+                        f"(SHELL_RUNNER_MAX_DETACHED={cap}); nothing was spawned. "
+                        "Wait for one to finish or shell_kill it, then retry."
+                    ),
+                )
+            await _record(
+                telemetry_id,
+                _written_row("running", None, [*ctx.decision_path, "detached"]),
+                wait=True,
+            )
+            await _upsert_catalog()
+            await execute_detached(
+                db,
+                job_id,
+                req.command,
+                req.cwd,
+                None,
+                telemetry_id=telemetry_id,
+                agent_id=req.agent_id,
+            )
         return ExecuteResponse(
             decision="running",
             tier=ctx.final_tier,
