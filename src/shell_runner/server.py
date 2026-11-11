@@ -2119,9 +2119,12 @@ async def handle_mcp_sse(request: Request) -> StreamingResponse:
 
 
 def _running_jobs_summary() -> list[dict[str, Any]]:
+    """Running jobs a shell-runner restart would orphan. Detached units (kind='unit')
+    are excluded: they are systemd services that survive restarts by design."""
     return [
         {"job_id": j["job_id"], "raw_cmd": j["raw_cmd"], "started_at": j["started_at"]}
         for j in db.list_running_jobs()
+        if j["kind"] != "unit"
     ]
 
 
