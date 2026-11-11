@@ -61,7 +61,8 @@ ENV = {"HOME": "/home/test"}
             "dd if=<system_path> of=<cwd_path> bs=<n> count=<n>",
         ),
         # Backtick subshell
-        ("echo `whoami`", "echo <subshell:whoami>"),
+        # (the command inside is also a command of its own: shellprep.prepare extracts it)
+        ("echo `whoami`", "echo <subshell:whoami> ; whoami"),
         # Background
         ("python ./server.py &", "python <cwd_path>"),  # & stripped, segment.is_background=True
         # Redirect with append — B3: destination → <file_arg>

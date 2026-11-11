@@ -576,6 +576,15 @@ T4_ALWAYS_APPROVE: list[Rule] = [
         promotable=False,
     ),
     Rule(r"^source\s+\S+$", Tier.ALWAYS_APPROVE, "process", promotable=False),
+    # Interpreter fed its program on stdin: `bash <<EOF`, `python3 <<< "..."`. The body
+    # never reaches the template (`bash <heredoc>`), so it is inline code like `-c`.
+    # Over-matches `python3 script.py <<EOF` (stdin data): stricter, never looser.
+    Rule(
+        r"^(?:bash|sh|dash|zsh|ksh|python(?:3(?:\.\d+)?)?)(?=\s)(?:\s+\S+)*?\s+<heredoc>(?:\s|$)",
+        Tier.ALWAYS_APPROVE,
+        "process",
+        promotable=False,
+    ),
 ]
 
 # ---------------------------------------------------------------------------
