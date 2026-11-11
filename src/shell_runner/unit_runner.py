@@ -43,6 +43,10 @@ class UnitStartError(RuntimeError):
     """systemd-run failed to start the unit."""
 
 
+class UnitBackendError(RuntimeError):
+    """systemd could not be queried (so the state of running units is unknown)."""
+
+
 @dataclass(frozen=True)
 class UnitResult:
     """Contents of the ExecStopPost result file (systemd's $EXIT_STATUS, $SERVICE_RESULT)."""
@@ -205,7 +209,7 @@ class SystemdBackend:
         await _run("systemctl", "--user", "stop", unit_name(job_id))
 
     async def active_units(self) -> set[str]:
-        rc, out, _ = await _run(
+        rc, out, err = await _run(
             "systemctl",
             "--user",
             "list-units",
@@ -216,7 +220,10 @@ class SystemdBackend:
             "sr-job-*",
         )
         if rc != 0:
-            return set()
+            # Not "no units": callers must not conclude jobs are gone from a failed query.
+            raise UnitBackendError(
+                f"systemctl list-units exited {rc}: {err.decode(errors='replace').strip()}"
+            )
         found: set[str] = set()
         for line in out.decode(errors="replace").splitlines():
             parts = line.split()

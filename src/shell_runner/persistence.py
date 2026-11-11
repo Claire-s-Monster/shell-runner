@@ -1238,25 +1238,27 @@ class Persistence:
 
         Returns rows that were removed so the caller can delete stdout/stderr files.
 
+        A kind='unit' job that is still running is never removed, however old:
+        its unit outlives restarts and its row and job_dir are the only way to
+        reach its result.
+
         Uses julianday() for timestamp arithmetic because strftime('%s', ...)
         returns NULL for ISO 8601 strings with timezone suffix (e.g. '+00:00'),
         which is the format produced by _now_iso().
         """
+        expired = (
+            "(julianday('now') - julianday(started_at)) * 86400.0 > ? "
+            "AND NOT (kind = 'unit' AND status = 'running')"
+        )
         with self._write_conn() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM jobs
-                WHERE (julianday('now') - julianday(started_at)) * 86400.0 > ?
-                """,
+                f"SELECT * FROM jobs WHERE {expired}",  # noqa: S608 - constant fragment
                 (retention_seconds,),
             ).fetchall()
             removed = [dict(r) for r in rows]
             if removed:
                 conn.execute(
-                    """
-                    DELETE FROM jobs
-                    WHERE (julianday('now') - julianday(started_at)) * 86400.0 > ?
-                    """,
+                    f"DELETE FROM jobs WHERE {expired}",  # noqa: S608 - constant fragment
                     (retention_seconds,),
                 )
         return removed

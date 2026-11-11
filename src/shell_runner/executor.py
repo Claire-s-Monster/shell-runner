@@ -681,6 +681,50 @@ def refresh_unit_job(db: Persistence, job: dict, backend: UnitBackend | None = N
     return db.get_job(job["job_id"]) or job
 
 
+def _settle_gone_unit(db: Persistence, job: dict, backend: UnitBackend) -> None:
+    """A running unit row whose unit is no longer active: take the outcome from the
+    result file, or mark it 'unit_missing' (the existing terminal status for a unit
+    that vanished without recording a result)."""
+    result = backend.read_result(Path(job["stdout_path"]).parent) if job["stdout_path"] else None
+    if result is None:
+        finalize_unit_job(db, job, status="unit_missing")
+    else:
+        finalize_unit_job(
+            db, job, status=_unit_terminal_status(result), exit_code=_unit_exit_code(result)
+        )
+
+
+async def reconcile_units(db: Persistence, backend: UnitBackend | None = None) -> int:
+    """Settle running kind='unit' rows against systemd; returns how many were changed.
+
+    Active unit: left running. Gone unit: terminal from its result file, else
+    'unit_missing'. If the backend cannot be queried NOTHING is changed (a failed
+    query is not evidence that units are gone); the next tick retries.
+    """
+    chosen = backend if backend is not None else _unit_backend
+    # Rows are read BEFORE the active set: a row is only written after its unit
+    # started, so every row read here has a unit that exists in the later snapshot
+    # if it is still alive. The reverse order could mark a just-started job missing.
+    rows = [j for j in await asyncio.to_thread(db.list_running_jobs) if j["kind"] == "unit"]
+    if not rows:
+        return 0
+    try:
+        active = await chosen.active_units()
+    except Exception as exc:
+        logger.warning("unit reconcile skipped: cannot query systemd (%s); will retry", exc)
+        return 0
+    changed = 0
+    for job in rows:
+        if job["job_id"] in active:
+            continue
+        try:
+            await asyncio.to_thread(_settle_gone_unit, db, job, chosen)
+            changed += 1
+        except Exception:
+            logger.exception("Failed to reconcile unit job %s", job["job_id"])
+    return changed
+
+
 async def execute_background(
     *,
     command: str,

@@ -291,10 +291,23 @@ def _apply_template_approval(
     )
 
 
+async def _reconcile_units() -> None:
+    """Settle running kind='unit' rows against systemd. Never raises: a failure is
+    logged and retried on the next tick."""
+    try:
+        changed = await executor.reconcile_units(db)
+        if changed:
+            logger.info("Reconciled %d detached unit job(s)", changed)
+    except Exception:
+        logger.exception("Error during unit reconcile")
+
+
 async def _periodic_cleanup(interval_s: int = 60) -> None:
-    """Delete expired pending prompts and stale jobs every *interval_s* seconds."""
+    """Reconcile unit jobs, delete expired pending prompts and stale jobs every
+    *interval_s* seconds."""
     while True:
         await asyncio.sleep(interval_s)
+        await _reconcile_units()
         try:
             # Decided prompts (they carry approver_agent_id) are kept forever:
             # the audit rows they explain are never pruned either.
@@ -375,6 +388,7 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     orphaned = await asyncio.to_thread(monitor.reconcile_orphans, db)
     if orphaned:
         logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
+    await _reconcile_units()  # detached units survive restarts; settle any that finished
 
     try:
         yield

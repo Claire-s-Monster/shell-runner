@@ -259,6 +259,18 @@ async def test_active_units_parses_and_filters(monkeypatch: pytest.MonkeyPatch) 
     assert await SystemdBackend().active_units() == {JOB_ID}
 
 
+async def test_active_units_raises_when_systemctl_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed query is not 'no units': reconcile must be able to tell them apart."""
+    _patch_exec(monkeypatch, _FakeProc(rc=1, err=b"Failed to connect to bus"))
+    with pytest.raises(unit_runner.UnitBackendError, match="Failed to connect"):
+        await SystemdBackend().active_units()
+
+
+async def test_active_units_empty_listing_is_an_empty_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_exec(monkeypatch, _FakeProc(rc=0, out=b""))
+    assert await SystemdBackend().active_units() == set()
+
+
 # --- read_result -----------------------------------------------------------------
 
 
