@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -278,11 +279,23 @@ class SystemdBackend:
 
     def read_result(self, job_dir: Path) -> UnitResult | None:
         """None when there is no result file; UNPARSEABLE_RESULT when it is invalid."""
+        path = Path(job_dir) / _RESULT_FILE
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
-            with (Path(job_dir) / _RESULT_FILE).open("rb") as fh:
-                data = fh.read(_MAX_RESULT_BYTES + 1)
-        except OSError:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
             return None
+        except OSError:
+            # ELOOP (symlink) or anything else unopenable: not a trustworthy result.
+            return UNPARSEABLE_RESULT
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return UNPARSEABLE_RESULT
+            data = os.read(fd, _MAX_RESULT_BYTES + 1)
+        except OSError:
+            return UNPARSEABLE_RESULT
+        finally:
+            os.close(fd)
         match = _RESULT_RE.fullmatch(data) if len(data) <= _MAX_RESULT_BYTES else None
         if match is None:
             return UNPARSEABLE_RESULT

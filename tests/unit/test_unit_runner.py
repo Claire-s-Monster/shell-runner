@@ -6,6 +6,7 @@ Nothing here spawns systemd-run or systemctl: subprocess creation is faked.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -302,6 +303,29 @@ def test_read_result_garbage_is_unparseable(tmp_path: Path, text: str) -> None:
 
 def test_read_result_oversized_is_unparseable(tmp_path: Path) -> None:
     (tmp_path / "result").write_bytes(b"0 success\n" + b"\0" * 10_000)
+    assert SystemdBackend().read_result(tmp_path) == UNPARSEABLE_RESULT
+
+
+def test_read_result_oversized_wellformed_is_unparseable(tmp_path: Path) -> None:
+    (tmp_path / "result").write_bytes(b"0 " + b"a" * 10_000 + b"\n")
+    assert SystemdBackend().read_result(tmp_path) == UNPARSEABLE_RESULT
+
+
+@pytest.mark.timeout(5)
+def test_read_result_fifo_is_unparseable(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "result")
+    assert SystemdBackend().read_result(tmp_path) == UNPARSEABLE_RESULT
+
+
+def test_read_result_symlink_is_unparseable(tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere"
+    target.write_text("0 success\n")
+    (tmp_path / "result").symlink_to(target)
+    assert SystemdBackend().read_result(tmp_path) == UNPARSEABLE_RESULT
+
+
+def test_read_result_directory_is_unparseable(tmp_path: Path) -> None:
+    (tmp_path / "result").mkdir()
     assert SystemdBackend().read_result(tmp_path) == UNPARSEABLE_RESULT
 
 

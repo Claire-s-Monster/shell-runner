@@ -300,6 +300,12 @@ is left running, a gone unit takes its outcome from the result file, else
 retries. Units are independent of the server, so a restart is never blocked by
 running units and does not stop them.
 
+**Residual risk.** The `result` file is opened without following symlinks and is
+only read if it is a regular file (a FIFO, device, directory or symlink counts as
+unparseable and the job is marked `failed`). A job that escapes its unit's cgroup
+(for example by starting its own `systemd-run --user` child) can still rewrite its
+result file after the unit stops, so the status of a detached job is advisory.
+
 **Requirements.** The server needs a reachable systemd user manager:
 `XDG_RUNTIME_DIR` (and the user bus) must be set in the server's environment, and
 for jobs to run with no login session, enable lingering
