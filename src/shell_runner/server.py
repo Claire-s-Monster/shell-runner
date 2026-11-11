@@ -1659,11 +1659,27 @@ async def audit_route(body: AuditRequest) -> AuditResponse:
     return AuditResponse(**result)
 
 
+async def _refresh_unit_job(job: dict) -> dict:
+    """Lazily settle a running kind='unit' row from its result file (no-op otherwise).
+
+    Runs before shell_status / shell_wait read the row. A backend or DB error
+    here must not fail the read: the row is returned unchanged.
+    """
+    if job["kind"] != "unit" or job["status"] != "running":
+        return job
+    try:
+        return await asyncio.to_thread(executor.refresh_unit_job, db, job)
+    except Exception:
+        logger.exception("Failed to refresh unit job %s", job["job_id"])
+        return job
+
+
 @app.post("/tools/shell_status", response_model=ShellStatusResponse)
 async def shell_status_route(body: ShellStatusRequest) -> ShellStatusResponse:
     job = db.get_job(body.job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"job {body.job_id} not found")
+    job = await _refresh_unit_job(job)
     # shell_monitor jobs also expose their parsed events.
     events = (
         await asyncio.to_thread(monitor.read_events, job["stdout_path"] or "")
@@ -1820,6 +1836,8 @@ async def _wait_for_terminal(job_id: str, wait_s: float) -> dict | None:
     deadline = time.monotonic() + wait_s
     while True:
         job = db.get_job(job_id)
+        if job is not None:
+            job = await _refresh_unit_job(job)
         if job is None or _is_terminal(job):
             return job
         remaining = deadline - time.monotonic()
@@ -1893,6 +1911,16 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
                 only_if_running=True,
             )
         return ShellKillResponse(killed=True, reason="monitor stopped")
+    if job["kind"] == "unit":
+        # The unit name is derived from the DB row's job_id (validated inside the
+        # backend), never from anything the client supplied beyond the lookup key.
+        await executor._unit_backend.kill(job["job_id"])
+        # only_if_running: a terminal state recorded meanwhile is never clobbered,
+        # and any refresh that comes later cannot overwrite 'killed'.
+        await asyncio.to_thread(
+            executor.finalize_unit_job, db, job, status="killed", exit_code=None
+        )
+        return ShellKillResponse(killed=True, reason="unit stopped")
     sig = getattr(signal, body.sig, signal.SIGTERM)
     try:
         os.kill(job["pid"], sig)

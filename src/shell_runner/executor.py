@@ -29,6 +29,7 @@ from .models import MAX_TIMEOUT_S
 from .unit_runner import (
     SystemdBackend,
     UnitBackend,
+    UnitResult,
     build_unit_argv,
     resolve_memory_max,
     resolve_runtime_max_s,
@@ -612,6 +613,72 @@ async def execute_detached(
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
     return job_dir
+
+
+def _unit_exit_code(result: UnitResult) -> int | None:
+    """The numeric $EXIT_STATUS, or None when systemd reported a signal name."""
+    return int(result.exit_status) if result.exit_status.isdigit() else None
+
+
+def _unit_terminal_status(result: UnitResult) -> str:
+    if result.service_result == "timeout":
+        return "timed_out"
+    return "completed" if result.exit_status == "0" else "failed"
+
+
+def _unit_duration_ms(job: dict) -> int:
+    try:
+        started = datetime.fromisoformat(job["started_at"])
+    except (KeyError, TypeError, ValueError):
+        return 0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return max(0, int((datetime.now(UTC) - started).total_seconds() * 1000))
+
+
+def finalize_unit_job(
+    db: Persistence, job: dict, *, status: str, exit_code: int | None = None
+) -> None:
+    """Move a running kind='unit' row to a terminal status and finalize its telemetry call.
+
+    Both writes are only_if_running: a row already terminal (e.g. 'killed') is
+    never overwritten, whichever of kill / refresh / reconcile gets there first.
+    """
+    db.update_job_status(
+        job["job_id"],
+        status=status,
+        exit_code=exit_code,
+        finished_at=_now_iso(),
+        only_if_running=True,
+    )
+    db.finalize_call(
+        job["telemetry_id"],
+        decision="executed",  # the command did run, even if killed / lost
+        exit_code=exit_code,
+        stdout_bytes=_log_size_bytes(job.get("stdout_path")),
+        stderr_bytes=_log_size_bytes(job.get("stderr_path")),
+        duration_ms=_unit_duration_ms(job),
+        decision_path=None,
+        only_if_running=True,
+    )
+
+
+def refresh_unit_job(db: Persistence, job: dict, backend: UnitBackend | None = None) -> dict:
+    """If job is a running kind='unit' row whose result file exists, record the outcome.
+
+    Returns the (possibly updated) row. A unit with no result file is still
+    active (or gone; reconcile_units handles that) and is left as it is.
+    """
+    if job["kind"] != "unit" or job["status"] != "running" or not job.get("stdout_path"):
+        return job
+    chosen = backend if backend is not None else _unit_backend
+    result = chosen.read_result(Path(job["stdout_path"]).parent)
+    if result is None:
+        return job
+    finalize_unit_job(
+        db, job, status=_unit_terminal_status(result), exit_code=_unit_exit_code(result)
+    )
+    return db.get_job(job["job_id"]) or job
 
 
 async def execute_background(
