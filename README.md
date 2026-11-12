@@ -329,6 +329,12 @@ whole filesystem is read-only except `/dev`, `/proc`, `/sys` and the writable
 paths `/tmp`, `/var/tmp` and the runtime dir (`$XDG_RUNTIME_DIR`, needed for the
 systemd user bus). Missing paths are tolerated.
 
+**`PrivateUsers=yes` is required.** systemd user managers silently skip
+`ProtectSystem=` unless the unit also gets its own user and mount namespace, so
+`ProtectSystem=strict` alone leaves `/usr` writable (#82). Side effects inside the
+sandbox: other users' and root's uids and gids display as `nobody`/`nogroup`, and
+setuid binaries such as `sudo` cannot gain privileges.
+
 **`/home` is NOT sandboxed.** systemd 252 user units silently skip `ProtectHome=`
 and `ReadOnlyPaths=` under `/home`, so a sandboxed process can still write there
 (#82). Do not treat this as protection for your home directory.
