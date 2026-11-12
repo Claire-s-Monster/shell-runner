@@ -36,6 +36,7 @@ def _argv(**over: object) -> list[str]:
         job_dir="/jobs/" + JOB_ID,
         memory_max="8G",
         runtime_max_s=14400,
+        environ={"XDG_RUNTIME_DIR": "/run/user/1234"},
     )
     kwargs.update(over)
     return build_unit_argv(**kwargs)  # type: ignore[arg-type]
@@ -75,6 +76,10 @@ def test_golden_argv() -> None:
         f"StandardError=append:{jd}/stderr.log",
         "-p",
         f'ExecStopPost=/bin/sh -c "{stop_script}"',
+        "-p",
+        "ProtectSystem=strict",
+        "-p",
+        "ReadWritePaths=-/tmp -/var/tmp -/run/user/1234",
         "--",
         "env",
         "-i",
@@ -84,6 +89,16 @@ def test_golden_argv() -> None:
         "-c",
         "echo hi",
     ]
+
+
+def test_sandbox_props_omitted_when_disabled() -> None:
+    argv = _argv(environ={"SHELL_RUNNER_SANDBOX": "0"})
+    assert not any(a.startswith(("ProtectSystem=", "ReadWritePaths=")) for a in argv)
+
+
+def test_sandbox_extra_rw_paths_reach_argv() -> None:
+    argv = _argv(environ={"XDG_RUNTIME_DIR": "/r", "SHELL_RUNNER_SANDBOX_RW_PATHS": "/srv/x"})
+    assert "ReadWritePaths=-/tmp -/var/tmp -/r -/srv/x" in argv
 
 
 def test_dollar_doubled_percent_literal_in_command_words() -> None:

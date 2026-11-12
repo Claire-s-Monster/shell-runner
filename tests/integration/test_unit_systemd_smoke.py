@@ -112,6 +112,23 @@ def test_special_chars_env_allowlist_and_exit_status(
     _assert_collected(backend, job_id)
 
 
+def test_sandbox_blocks_usr_but_allows_tmp_job_dir(
+    backend: SystemdBackend, start_unit: Callable[..., tuple[str, Path]]
+) -> None:
+    job_id, job_dir = start_unit("touch /usr/.sr-canary-$$")
+    result = _wait_result(backend, job_dir)
+    assert result.exit_status != "0"
+    assert _unit_terminal_status(result) == "failed"
+    assert not list(Path("/usr").glob(".sr-canary-*"))
+    _assert_collected(backend, job_id)
+
+    job_id, job_dir = start_unit(f"touch {job_dir}/sandbox-ok")
+    result = _wait_result(backend, job_dir)
+    assert result.exit_status == "0"
+    assert (job_dir / "sandbox-ok").exists()
+    _assert_collected(backend, job_id)
+
+
 def test_runtime_max_maps_to_timed_out(
     backend: SystemdBackend, start_unit: Callable[..., tuple[str, Path]]
 ) -> None:

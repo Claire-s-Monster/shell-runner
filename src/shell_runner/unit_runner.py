@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .sandbox_config import sandbox_properties
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEMORY_MAX = "8G"
@@ -172,11 +174,13 @@ def build_unit_argv(
     job_dir: str,
     memory_max: str,
     runtime_max_s: int,
+    environ: Mapping[str, str] | None = None,
 ) -> list[str]:
-    """Build the systemd-run argv for a detached job. Pure: no I/O, no os.environ.
+    """Build the systemd-run argv for a detached job. No I/O.
 
     The child's environment is exactly ``env`` (via ``env -i``); neither
-    ``--setenv`` nor the caller's environment is ever used.
+    ``--setenv`` nor the caller's environment is ever used. ``environ`` (default
+    os.environ) only configures the sandbox properties (issue #82).
     """
     name = unit_name(job_id).removesuffix(".service")
     _check_property_path("cwd", cwd)
@@ -204,6 +208,8 @@ def build_unit_argv(
         f"StandardOutput=append:{job_dir}/stdout.log",
         f"StandardError=append:{job_dir}/stderr.log",
         f"ExecStopPost=/bin/sh -c {_sd_quote(stop_script)}",
+        # Paths are validated in sandbox_config, not by _check_property_path.
+        *sandbox_properties(environ),
     ]
     argv = ["systemd-run", "--user", f"--unit={name}", "--collect", "--quiet"]
     for prop in props:
