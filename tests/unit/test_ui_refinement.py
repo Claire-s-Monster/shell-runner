@@ -1,9 +1,23 @@
 """Unit tests for ui.refinement."""
-# ruff: noqa: E402  # imports are deliberately grouped next to the tests that use them
 
+import json as _json
+import sys
+
+import httpx as _httpx
 import pytest
 
-from ui.refinement import redact
+from ui.refinement import (
+    AnalysisError,
+    _build_argv,
+    _scrubbed_env,
+    build_analysis_prompt,
+    build_issue_body,
+    file_github_issue,
+    find_open_issue,
+    redact,
+    run_claude_analysis,
+    validate_proposal,
+)
 
 R = "‹REDACTED›"
 
@@ -47,9 +61,6 @@ def test_redact_keeps_query_key_names_visible():
 
 def test_redact_empty():
     assert redact("") == ""
-
-
-from ui.refinement import build_analysis_prompt, validate_proposal
 
 
 def _valid_proposal():
@@ -142,12 +153,6 @@ def test_build_analysis_prompt_contains_context_and_schema():
         assert key in p
 
 
-import json as _json
-import sys
-
-from ui.refinement import AnalysisError, _build_argv, _scrubbed_env, run_claude_analysis
-
-
 def _write_fake_claude(tmp_path, envelope, exit_code=0):
     script = tmp_path / "fakeclaude.py"
     script.write_text(
@@ -203,11 +208,6 @@ def test_scrubbed_env_removes_tokens(monkeypatch):
     assert "SHELL_RUNNER_GH_TOKEN" not in env
     assert "GITHUB_TOKEN" not in env
     assert "GH_TOKEN" not in env
-
-
-import httpx as _httpx
-
-from ui.refinement import build_issue_body, file_github_issue, find_open_issue
 
 
 def test_build_issue_body_has_marker_and_labels():
