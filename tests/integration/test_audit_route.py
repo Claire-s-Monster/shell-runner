@@ -98,23 +98,23 @@ def test_approver_recorded_on_verb_approval_and_upsert_updates_it(client: TestCl
 def _call(
     agent_id: str, decision: str = "executed", ago: timedelta = timedelta(0), **kw: Any
 ) -> str:
-    defaults: dict[str, Any] = dict(
-        agent_id=agent_id,
-        cwd="/tmp",
-        raw_cmd="echo hi",
-        normalized_template="echo <word>",
-        command_tier=1,
-        final_tier=1,
-        decision=decision,
-        matched_rule_pattern="p",
-        matched_rule_category="c",
-        exit_code=0,
-        stdout_bytes=0,
-        stderr_bytes=0,
-        duration_ms=1,
-        decision_path=[],
-        normalizer_warnings=[],
-    )
+    defaults: dict[str, Any] = {
+        "agent_id": agent_id,
+        "cwd": "/tmp",
+        "raw_cmd": "echo hi",
+        "normalized_template": "echo <word>",
+        "command_tier": 1,
+        "final_tier": 1,
+        "decision": decision,
+        "matched_rule_pattern": "p",
+        "matched_rule_category": "c",
+        "exit_code": 0,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "duration_ms": 1,
+        "decision_path": [],
+        "normalizer_warnings": [],
+    }
     defaults.update(kw)
     call_id = srv.db.record_call(**defaults)
     ts = (datetime.now(UTC) - ago).isoformat()

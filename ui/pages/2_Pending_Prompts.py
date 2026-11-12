@@ -1,4 +1,5 @@
 """Pending Prompts page — approve/deny T3/T4 prompts, explain why, propose rule refinements."""
+# ruff: noqa: N999  # Streamlit derives page order/title from the numeric-prefixed file name
 
 import os
 from pathlib import Path

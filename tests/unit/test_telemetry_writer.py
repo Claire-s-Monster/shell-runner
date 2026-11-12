@@ -30,23 +30,23 @@ async def writer(persistence: Persistence) -> TelemetryWriter:  # type: ignore[m
 
 
 def _call_kwargs(**overrides: Any) -> dict[str, Any]:
-    defaults: dict[str, Any] = dict(
-        agent_id="test-agent",
-        cwd="/tmp",
-        raw_cmd="echo hello",
-        normalized_template="echo <word>",
-        command_tier=1,
-        final_tier=1,
-        decision="observed_externally",
-        matched_rule_pattern=None,
-        matched_rule_category=None,
-        exit_code=0,
-        stdout_bytes=0,
-        stderr_bytes=0,
-        duration_ms=5,
-        decision_path=["observe_endpoint"],
-        normalizer_warnings=[],
-    )
+    defaults: dict[str, Any] = {
+        "agent_id": "test-agent",
+        "cwd": "/tmp",
+        "raw_cmd": "echo hello",
+        "normalized_template": "echo <word>",
+        "command_tier": 1,
+        "final_tier": 1,
+        "decision": "observed_externally",
+        "matched_rule_pattern": None,
+        "matched_rule_category": None,
+        "exit_code": 0,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "duration_ms": 5,
+        "decision_path": ["observe_endpoint"],
+        "normalizer_warnings": [],
+    }
     defaults.update(overrides)
     return defaults
 

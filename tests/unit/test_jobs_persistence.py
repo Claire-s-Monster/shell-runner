@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
-
-import pytest
 
 from shell_runner.persistence import Persistence
 
@@ -37,17 +34,17 @@ def _insert_shell_call(db: Persistence) -> str:
 
 def _create_job(db: Persistence, telemetry_id: str, **overrides: object) -> str:
     job_id = "test-job-" + str(id(overrides))
-    kwargs: dict[str, object] = dict(
-        job_id=job_id,
-        telemetry_id=telemetry_id,
-        raw_cmd="echo hi",
-        cwd="/tmp",
-        agent_id="test-agent",
-        timeout_s=30,
-        stdout_path="/tmp/stdout.log",
-        stderr_path="/tmp/stderr.log",
-        pid=12345,
-    )
+    kwargs: dict[str, object] = {
+        "job_id": job_id,
+        "telemetry_id": telemetry_id,
+        "raw_cmd": "echo hi",
+        "cwd": "/tmp",
+        "agent_id": "test-agent",
+        "timeout_s": 30,
+        "stdout_path": "/tmp/stdout.log",
+        "stderr_path": "/tmp/stderr.log",
+        "pid": 12345,
+    }
     kwargs.update(overrides)
     db.create_job(**kwargs)  # type: ignore[arg-type]
     return str(kwargs["job_id"])

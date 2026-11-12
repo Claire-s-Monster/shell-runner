@@ -1,15 +1,14 @@
-import pytest
 import re
+
+import pytest
+
 from shell_runner.catalog import (
-    Tier,
-    Rule,
     T0_DENY,
     T1_AUTO_LOG,
     T2_AUTO_CAPPED,
     T4_ALWAYS_APPROVE,
+    Tier,
     all_rules,
-    rules_by_tier,
-    rules_by_category,
     compiled_for,
 )
 
@@ -51,7 +50,7 @@ def test_t1_t2_t4_rules_use_template_target():
 
 
 @pytest.mark.parametrize(
-    "raw,expected_tier",
+    ("raw", "expected_tier"),
     [
         # T0 raw matches
         ("rm -rf /", Tier.DENY),
@@ -74,16 +73,15 @@ def test_t0_raw_matches(raw, expected_tier):
     """T0 raw-target rules must catch their canonical examples."""
     matched = False
     for rule in T0_DENY:
-        if rule.match_target == "raw":
-            if compiled_for(rule).search(raw):
-                matched = True
-                assert rule.tier == expected_tier
-                break
+        if rule.match_target == "raw" and compiled_for(rule).search(raw):
+            matched = True
+            assert rule.tier == expected_tier
+            break
     assert matched, f"No T0 rule matched: {raw!r}"
 
 
 @pytest.mark.parametrize(
-    "template,expected_tier,expected_category",
+    ("template", "expected_tier", "expected_category"),
     [
         # T1
         ("ls -la <cwd_path>", Tier.AUTO_LOG, "fs-read"),
@@ -124,10 +122,13 @@ def test_template_matches(template, expected_tier, expected_category):
     """Template-target rules must catch their canonical examples."""
     matched_rule = None
     for rule in [r for r in all_rules() if r.match_target == "template"]:
-        if compiled_for(rule).fullmatch(template) or compiled_for(rule).match(template):
-            if rule.tier == expected_tier and rule.category == expected_category:
-                matched_rule = rule
-                break
+        if (
+            (compiled_for(rule).fullmatch(template) or compiled_for(rule).match(template))
+            and rule.tier == expected_tier
+            and rule.category == expected_category
+        ):
+            matched_rule = rule
+            break
     assert matched_rule is not None, (
         f"No rule matched template={template!r} for tier={expected_tier.name} cat={expected_category}"
     )
@@ -144,7 +145,7 @@ def test_no_template_rule_matches_raw_t0_canonical():
 
 def test_categories_are_known_set():
     """All rules use categories from the documented set."""
-    KNOWN = {
+    known = {
         "destructive",
         "privilege",
         "pipe-exec",
@@ -165,4 +166,4 @@ def test_categories_are_known_set():
         "system-info",
     }
     for rule in all_rules():
-        assert rule.category in KNOWN, f"Unknown category {rule.category!r} in {rule}"
+        assert rule.category in known, f"Unknown category {rule.category!r} in {rule}"

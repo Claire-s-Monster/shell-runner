@@ -436,7 +436,8 @@ def test_reload_cwd_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
         monkeypatch.delenv("SHELL_RUNNER_CWD_ROOTS", raising=False)
         monkeypatch.setenv("SHELL_RUNNER_CWD_ROOT", "/nonexistent-initial-root")
         importlib.reload(shell_runner.executor)
-        from shell_runner.executor import execute as _execute, reload_cwd_roots
+        from shell_runner.executor import execute as _execute
+        from shell_runner.executor import reload_cwd_roots
 
         # Confirm new_root is currently rejected
         result = _execute(command="echo hi", cwd=str(sub))

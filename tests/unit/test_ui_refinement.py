@@ -1,4 +1,5 @@
 """Unit tests for ui.refinement."""
+# ruff: noqa: E402  # imports are deliberately grouped next to the tests that use them
 
 import pytest
 
@@ -8,7 +9,7 @@ R = "‹REDACTED›"
 
 
 @pytest.mark.parametrize(
-    "raw,secret",
+    ("raw", "secret"),
     [
         (
             'curl -H "Authorization: Bearer sk-abc1234567890TOKENVALUE" https://api.x',
@@ -39,7 +40,9 @@ def test_redact_preserves_benign_command():
 
 def test_redact_keeps_query_key_names_visible():
     out = redact("curl 'https://api.x?api_key=ABC123XYZ&page=2'")
-    assert "api_key=" in out and "page=2" in out and "ABC123XYZ" not in out
+    assert "api_key=" in out
+    assert "page=2" in out
+    assert "ABC123XYZ" not in out
 
 
 def test_redact_empty():
@@ -82,21 +85,21 @@ def test_validate_proposal_accepts_existing_lever_null_rule():
 def test_validate_proposal_missing_key_raises():
     p = _valid_proposal()
     del p["dedupe_key"]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"missing keys: \['dedupe_key'\]"):
         validate_proposal(p)
 
 
 def test_validate_proposal_bad_tier_raises():
     p = _valid_proposal()
     p["proposed_rule"]["tier"] = "T9"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"proposed_rule\.tier must be one of"):
         validate_proposal(p)
 
 
 def test_validate_proposal_bad_confidence_raises():
     p = _valid_proposal()
     p["confidence"] = "high"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"confidence must be a number in \[0\.0, 1\.0\]"):
         validate_proposal(p)
 
 
@@ -188,7 +191,8 @@ def test_build_argv_enforces_readonly():
     assert "the-prompt" in argv
     assert "--strict-mcp-config" in argv
     di = argv[argv.index("--disallowedTools") + 1]
-    assert "mcp__*" in di and "Bash" in di
+    assert "mcp__*" in di
+    assert "Bash" in di
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
 
 

@@ -1,8 +1,9 @@
 """Unit tests for shell_runner.classifier module."""
 
 import pytest
+
 from shell_runner.catalog import Tier
-from shell_runner.classifier import classify, lookup_agent_cap, PERMISSIVENESS
+from shell_runner.classifier import classify, lookup_agent_cap
 
 CWD = "/home/test/work"
 ENV = {"HOME": "/home/test"}

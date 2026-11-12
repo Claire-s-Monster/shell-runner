@@ -10,7 +10,7 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -35,15 +35,15 @@ def _make_db(tmp_path: Path) -> Persistence:
 
 
 def _make_prompt(db: Persistence, **overrides: object) -> str:
-    defaults: dict[str, object] = dict(
-        agent_id="agent",
-        cwd="/tmp",
-        raw_cmd="pip install x",
-        normalized_template="pip install <pkg>",
-        command_tier=4,
-        matched_rule_category=None,
-        decision_path=[],
-    )
+    defaults: dict[str, object] = {
+        "agent_id": "agent",
+        "cwd": "/tmp",
+        "raw_cmd": "pip install x",
+        "normalized_template": "pip install <pkg>",
+        "command_tier": 4,
+        "matched_rule_category": None,
+        "decision_path": [],
+    }
     defaults.update(overrides)
     return db.create_pending_prompt(**defaults)  # type: ignore[arg-type]
 
@@ -217,7 +217,7 @@ def test_list_pending_prompts_ordered_by_created_at_desc(tmp_path: Path) -> None
     middle_id = _make_prompt(db, raw_cmd="echo middle")
     newest_id = _make_prompt(db, raw_cmd="echo newest")
 
-    base = datetime.now(timezone.utc)
+    base = datetime.now(UTC)
     with db._conn() as conn:
         conn.execute(
             "UPDATE pending_prompts SET created_at = ? WHERE id = ?",

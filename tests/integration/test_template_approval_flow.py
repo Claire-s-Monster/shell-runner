@@ -69,8 +69,7 @@ def _approve(
     }
     if promote_to_tier is not None:
         body["promote_to_tier"] = promote_to_tier
-    resp = client.post("/approve_pending", json=body)
-    return resp
+    return client.post("/approve_pending", json=body)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +137,7 @@ def test_approve_template_agent_only_does_not_unlock_other_agent(client: TestCli
 # ---------------------------------------------------------------------------
 
 
-def test_approve_template_default_promote_to_tier_is_T2(client: TestClient) -> None:
+def test_approve_template_default_promote_to_tier_is_t2(client: TestClient) -> None:
     data = _execute(client, _T3_CMD, _AGENT_A)
     assert data["decision"] == "prompt_required"
     prompt_id = data["prompt"]["id"]
@@ -178,7 +177,6 @@ def test_approve_template_with_non_promoting_tier_returns_400(client: TestClient
     # T3 command → command_tier = 3 (APPROVE_ONCE)
     data = _execute(client, _T3_CMD, _AGENT_A)
     assert data["decision"] == "prompt_required"
-    original_tier = data["prompt"]["tier"]  # effective tier (may be capped)
     prompt_id = data["prompt"]["id"]
 
     # promote_to_tier = 3 (same as original) should fail

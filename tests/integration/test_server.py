@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -10,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from shell_runner.catalog import all_rules
 from shell_runner.persistence import Persistence
-from shell_runner.server import app, db
+from shell_runner.server import app
 
 
 @pytest.fixture(autouse=True)

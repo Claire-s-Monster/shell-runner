@@ -1,7 +1,6 @@
 """Unit tests for shell-runner models."""
 
 import importlib
-import os
 import sys
 
 import pytest

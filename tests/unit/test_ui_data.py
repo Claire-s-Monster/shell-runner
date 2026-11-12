@@ -6,8 +6,6 @@ Uses a tmp SQLite DB with the real schema from persistence.py.
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from ui.data import (
     get_health,
     get_pending_prompts,
@@ -246,7 +244,8 @@ def test_get_similar_approvals_ranks_and_filters(tmp_path):
     templates = [row["template"] for row in out]
     assert "wget <safe_url>" not in templates
     assert "curl <safe_url> extra" not in templates
-    assert templates and templates[0].startswith("curl")
+    assert templates
+    assert templates[0].startswith("curl")
     top = out[0]
     assert set(top) >= {"template", "approved_tier", "example_raw_cmd", "similarity"}
 

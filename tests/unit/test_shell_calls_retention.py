@@ -27,23 +27,23 @@ def _make_db(tmp_path: Path) -> Persistence:
 
 
 def _record_call(db: Persistence, **overrides: object) -> str:
-    defaults: dict[str, object] = dict(
-        agent_id="test-agent",
-        cwd="/tmp",
-        raw_cmd="echo hello",
-        normalized_template="echo <word>",
-        command_tier=1,
-        final_tier=1,
-        decision="observed_externally",
-        matched_rule_pattern=None,
-        matched_rule_category=None,
-        exit_code=0,
-        stdout_bytes=10,
-        stderr_bytes=0,
-        duration_ms=5,
-        decision_path=["observed"],
-        normalizer_warnings=[],
-    )
+    defaults: dict[str, object] = {
+        "agent_id": "test-agent",
+        "cwd": "/tmp",
+        "raw_cmd": "echo hello",
+        "normalized_template": "echo <word>",
+        "command_tier": 1,
+        "final_tier": 1,
+        "decision": "observed_externally",
+        "matched_rule_pattern": None,
+        "matched_rule_category": None,
+        "exit_code": 0,
+        "stdout_bytes": 10,
+        "stderr_bytes": 0,
+        "duration_ms": 5,
+        "decision_path": ["observed"],
+        "normalizer_warnings": [],
+    }
     defaults.update(overrides)
     return db.record_call(**defaults)  # type: ignore[arg-type]
 

@@ -1,6 +1,7 @@
 """Classifier tests for systemd user-scope rules (issue #56 part 3)."""
 
 import pytest
+
 from shell_runner.catalog import Tier
 from shell_runner.classifier import classify
 

@@ -144,7 +144,8 @@ def test_home_relative_path(repo: Path, tmp_path: Path) -> None:
     cls = classify(
         "echo x >> ~/repo/.git/config", str(repo), AGENT, env={"HOME": str(tmp_path.resolve())}
     )
-    assert cls.matched_rule is not None and cls.matched_rule.pattern == RULE
+    assert cls.matched_rule is not None
+    assert cls.matched_rule.pattern == RULE
 
 
 def test_symlink_into_git_dir(repo: Path) -> None:
@@ -278,7 +279,8 @@ def test_flag_not_lost_when_other_guard_also_fires(repo: Path) -> None:
     cls = _cls("echo x > /var/tmp/sr84 && echo y >> .git/config", repo)
     assert cls.command_tier == T3
     assert cls.flagged
-    assert cls.matched_rule is not None and cls.matched_rule.pattern == RULE
+    assert cls.matched_rule is not None
+    assert cls.matched_rule.pattern == RULE
 
 
 def test_credential_deny_still_wins(repo: Path) -> None:
