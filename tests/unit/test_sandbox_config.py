@@ -35,23 +35,24 @@ def test_disabled_with_zero() -> None:
 def test_default_properties() -> None:
     assert sandbox_properties(ENV) == [
         "ProtectSystem=strict",
+        "PrivateUsers=yes",
         f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME}",
     ]
 
 
 def test_runtime_dir_fallback_uses_uid() -> None:
     props = sandbox_properties({})
-    assert props[1].endswith(f" -/run/user/{os.getuid()}")
+    assert props[2].endswith(f" -/run/user/{os.getuid()}")
 
 
 def test_extra_paths_appended_in_order() -> None:
     props = sandbox_properties({**ENV, EXTRA_RW_ENV: "/data/a:/data/b"})
-    assert props[1] == f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/data/a -/data/b"
+    assert props[2] == f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/data/a -/data/b"
 
 
 def test_extra_paths_deduplicated() -> None:
     props = sandbox_properties({**ENV, EXTRA_RW_ENV: f"/tmp:/data/a:/data/a:{RUNTIME}"})
-    assert props[1] == f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/data/a"
+    assert props[2] ==f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/data/a"
 
 
 @pytest.mark.parametrize(
@@ -63,7 +64,7 @@ def test_invalid_extra_entries_dropped_with_warning(
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="shell_runner.sandbox_config"):
         props = sandbox_properties({**ENV, EXTRA_RW_ENV: f"/ok:{bad}:/ok2"})
-    assert props[1] == f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/ok -/ok2"
+    assert props[2] == f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/ok -/ok2"
     assert EXTRA_RW_ENV in caplog.text
 
 

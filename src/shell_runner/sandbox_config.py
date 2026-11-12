@@ -54,7 +54,13 @@ def sandbox_properties(environ: Mapping[str, str] | None = None) -> list[str]:
     if not sandbox_enabled(env):
         return []
     paths = list(dict.fromkeys([*BASE_RW_PATHS, _runtime_dir(env), *_extra_paths(env)]))
-    return ["ProtectSystem=strict", "ReadWritePaths=" + " ".join("-" + p for p in paths)]
+    # PrivateUsers=yes is required: user managers silently skip ProtectSystem
+    # unless the unit gets its own mount/user namespace (#82).
+    return [
+        "ProtectSystem=strict",
+        "PrivateUsers=yes",
+        "ReadWritePaths=" + " ".join("-" + p for p in paths),
+    ]
 
 
 def sandbox_canary(
