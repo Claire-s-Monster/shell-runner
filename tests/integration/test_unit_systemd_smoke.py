@@ -11,7 +11,7 @@ import asyncio
 import shutil
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -45,10 +45,9 @@ def backend() -> SystemdBackend:
 
 @pytest.fixture
 def start_unit(
-    backend: SystemdBackend, tmp_path: Path, request: pytest.FixtureRequest
-) -> Callable[..., tuple[str, Path]]:
+    backend: SystemdBackend, tmp_path: Path
+) -> Iterator[Callable[..., tuple[str, Path]]]:
     started: list[str] = []
-    request.addfinalizer(lambda: [asyncio.run(backend.kill(jid)) for jid in started])
 
     def start(command: str, runtime_max_s: int = 60) -> tuple[str, Path]:
         job_id = str(uuid.uuid4())
@@ -61,7 +60,9 @@ def start_unit(
         asyncio.run(backend.start(argv))
         return job_id, job_dir
 
-    return start
+    yield start
+    for jid in started:
+        asyncio.run(backend.kill(jid))
 
 
 def _wait_result(backend: SystemdBackend, job_dir: Path) -> UnitResult:

@@ -28,16 +28,16 @@ JOB_ID = "123e4567-e89b-42d3-a456-426614174000"
 
 
 def _argv(**over: object) -> list[str]:
-    kwargs: dict[str, object] = dict(
-        job_id=JOB_ID,
-        command="echo hi",
-        cwd="/work/dir",
-        env={"PATH": "/usr/bin", "HOME": "/home/u"},
-        job_dir="/jobs/" + JOB_ID,
-        memory_max="8G",
-        runtime_max_s=14400,
-        environ={"XDG_RUNTIME_DIR": "/run/user/1234"},
-    )
+    kwargs: dict[str, object] = {
+        "job_id": JOB_ID,
+        "command": "echo hi",
+        "cwd": "/work/dir",
+        "env": {"PATH": "/usr/bin", "HOME": "/home/u"},
+        "job_dir": "/jobs/" + JOB_ID,
+        "memory_max": "8G",
+        "runtime_max_s": 14400,
+        "environ": {"XDG_RUNTIME_DIR": "/run/user/1234"},
+    }
     kwargs.update(over)
     return build_unit_argv(**kwargs)  # type: ignore[arg-type]
 
