@@ -122,11 +122,12 @@ def test_sandbox_blocks_usr_but_allows_tmp_job_dir(
     assert not list(Path("/usr").glob(".sr-canary-*"))
     _assert_collected(backend, job_id)
 
-    job_id, job_dir = start_unit(f"touch {job_dir}/sandbox-ok")
-    result = _wait_result(backend, job_dir)
+    ok_target = job_dir / "sandbox-ok"
+    ok_id, ok_dir = start_unit(f"touch {ok_target}")
+    result = _wait_result(backend, ok_dir)
     assert result.exit_status == "0"
-    assert (job_dir / "sandbox-ok").exists()
-    _assert_collected(backend, job_id)
+    assert ok_target.exists()
+    _assert_collected(backend, ok_id)
 
 
 def test_runtime_max_maps_to_timed_out(
