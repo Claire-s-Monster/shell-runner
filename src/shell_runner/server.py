@@ -88,6 +88,7 @@ from .persistence import (
     TelemetryWriter,
     parse_time_bound,
 )
+from .sandbox_config import SandboxState, sandbox_canary
 from .seeds import DEFAULT_SEED_APPROVALS
 from .unit_runner import resolve_max_detached
 
@@ -97,6 +98,7 @@ _db_path = os.environ.get("SHELL_RUNNER_DB", str(DEFAULT_DB_PATH))
 db = Persistence(db_path=_db_path)
 
 _cleanup_task: asyncio.Task[None] | None = None
+_sandbox_state: SandboxState | None = None  # set once at startup (issue #82)
 
 # Serialises the detached-unit cap check with the spawn that makes it count.
 _detach_lock = asyncio.Lock()
@@ -355,7 +357,7 @@ def _on_sighup() -> None:
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
-    global _cleanup_task
+    global _cleanup_task, _sandbox_state
     logger.info(
         "observed_externally retention: %s (executed/denied/prompt_required/running "
         "audit rows are never pruned)",
@@ -389,6 +391,13 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     if orphaned:
         logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
     await _reconcile_units()  # detached units survive restarts; settle any that finished
+
+    _sandbox_state = sandbox_canary()
+    if _sandbox_state == "absent":
+        logger.warning(
+            "sandbox not enforced on this process (/ is writable); "
+            "install scripts/shell-runner.service.d/sandbox.conf (issue #82)"
+        )
 
     try:
         yield
@@ -2019,6 +2028,7 @@ async def health_route() -> HealthResponse:
         p99_latency_ms=stats.get("p99_latency_ms", 0),
         catalog_size=len(all_rules()),
         pending_prompts=stats.get("pending_prompts_count", 0),
+        sandbox=_sandbox_state or sandbox_canary(),
         last_error=roots_error or stats.get("last_error"),
     )
 

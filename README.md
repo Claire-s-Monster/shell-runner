@@ -322,6 +322,29 @@ pixi run -e dev pytest tests/integration/test_unit_systemd_smoke.py -v -m system
 It is selected by the `systemd` pytest marker, deselected by default, and skips
 itself if no user manager is reachable.
 
+## Sandbox (ProtectSystem=strict)
+
+Detached job units and the service itself run with `ProtectSystem=strict`: the
+whole filesystem is read-only except `/dev`, `/proc`, `/sys` and the writable
+paths `/tmp`, `/var/tmp` and the runtime dir (`$XDG_RUNTIME_DIR`, needed for the
+systemd user bus). Missing paths are tolerated.
+
+**`/home` is NOT sandboxed.** systemd 252 user units silently skip `ProtectHome=`
+and `ReadOnlyPaths=` under `/home`, so a sandboxed process can still write there
+(#82). Do not treat this as protection for your home directory.
+
+- **Jobs:** the properties come from `src/shell_runner/sandbox_config.py`.
+  `SHELL_RUNNER_SANDBOX=0` turns them off for job units only. Extra writable
+  absolute paths: `SHELL_RUNNER_SANDBOX_RW_PATHS=/data/a:/data/b` (entries that are
+  relative or contain whitespace, `%`, `$` or `\` are dropped with a warning).
+- **Service:** the drop-in `scripts/shell-runner.service.d/sandbox.conf` (installed
+  by `install-systemd.sh`). Edit its `ReadWritePaths=` to add paths, or remove the
+  file to disable. `SHELL_RUNNER_SANDBOX` does not affect the service.
+- **`shell_health` `sandbox` field:** `enforced` (this process sees a read-only `/`
+  and `/usr`), `absent` (not enforced, e.g. drop-in not installed; a warning is
+  logged at startup) or `disabled` (`SHELL_RUNNER_SANDBOX=0`). Checked once at
+  startup; it does not change `status`.
+
 ## Audit trail: approver columns, retention, `shell_audit`
 
 **Approver columns.** Every approve *and* deny decision stores the supplied

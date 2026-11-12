@@ -59,7 +59,7 @@ try:
         headers={"Content-Type": "application/json"},
         timeout=5.0,
     )
-    assert r2.status_code != 404, f"/mcp returned 404 — mount failed"
+    assert r2.status_code != 404, "/mcp returned 404 — mount failed"
     print(f"[OK] /mcp => HTTP {r2.status_code} (not 404)")
     print(f"     body: {r2.text[:200]}")
 

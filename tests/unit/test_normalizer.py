@@ -9,7 +9,7 @@ ENV = {"HOME": "/home/test"}
 
 
 @pytest.mark.parametrize(
-    "raw,expected_template",
+    ("raw", "expected_template"),
     [
         # Basic
         ("ls -la /tmp/foo", "ls <tmp_path>"),  # -la stripped (ls in SAFE_FLAG_STRIP_VERBS)

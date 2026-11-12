@@ -108,6 +108,7 @@ def test_tools_call_shell_health(client: TestClient) -> None:
     payload = json.loads(content[0]["text"])
     assert payload["status"] == "ok"
     assert isinstance(payload["catalog_size"], int)
+    assert payload["sandbox"] in ("enforced", "absent", "disabled")
 
 
 # ---------------------------------------------------------------------------

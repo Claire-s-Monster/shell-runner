@@ -1,4 +1,5 @@
 """Dashboard page — live health stats and recent calls."""
+# ruff: noqa: N999  # Streamlit derives page order/title from the numeric-prefixed file name
 
 import time
 from datetime import datetime

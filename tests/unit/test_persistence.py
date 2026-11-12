@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 from shell_runner.persistence import Persistence
 
@@ -19,23 +17,23 @@ def _make_db(tmp_path: Path) -> Persistence:
 
 
 def _record_call(db: Persistence, **overrides: object) -> str:
-    defaults: dict[str, object] = dict(
-        agent_id="test-agent",
-        cwd="/tmp",
-        raw_cmd="echo hello",
-        normalized_template="echo <word>",
-        command_tier=1,
-        final_tier=1,
-        decision="executed",
-        matched_rule_pattern=None,
-        matched_rule_category=None,
-        exit_code=0,
-        stdout_bytes=10,
-        stderr_bytes=0,
-        duration_ms=5,
-        decision_path=["T1 match"],
-        normalizer_warnings=[],
-    )
+    defaults: dict[str, object] = {
+        "agent_id": "test-agent",
+        "cwd": "/tmp",
+        "raw_cmd": "echo hello",
+        "normalized_template": "echo <word>",
+        "command_tier": 1,
+        "final_tier": 1,
+        "decision": "executed",
+        "matched_rule_pattern": None,
+        "matched_rule_category": None,
+        "exit_code": 0,
+        "stdout_bytes": 10,
+        "stderr_bytes": 0,
+        "duration_ms": 5,
+        "decision_path": ["T1 match"],
+        "normalizer_warnings": [],
+    }
     defaults.update(overrides)
     return db.record_call(**defaults)  # type: ignore[arg-type]
 
@@ -48,7 +46,8 @@ def _record_call(db: Persistence, **overrides: object) -> str:
 def test_record_call_inserts_row_and_returns_id(tmp_path: Path) -> None:
     db = _make_db(tmp_path)
     tid = _record_call(db)
-    assert isinstance(tid, str) and len(tid) == 36  # UUID4
+    assert isinstance(tid, str)
+    assert len(tid) == 36  # UUID4
 
     rows = db.telemetry_query()
     assert len(rows) == 1
@@ -93,7 +92,7 @@ def test_upsert_template_tracks_distinct_agents(tmp_path: Path) -> None:
 
 def test_create_pending_prompt_returns_id_and_sets_expiry(tmp_path: Path) -> None:
     db = _make_db(tmp_path)
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     pid = db.create_pending_prompt(
         agent_id="agent",
         cwd="/tmp",
@@ -103,7 +102,8 @@ def test_create_pending_prompt_returns_id_and_sets_expiry(tmp_path: Path) -> Non
         matched_rule_category="package",
         decision_path=["T4 match"],
     )
-    assert isinstance(pid, str) and len(pid) == 36
+    assert isinstance(pid, str)
+    assert len(pid) == 36
     with db._conn() as conn:
         row = conn.execute("SELECT * FROM pending_prompts WHERE id = ?", (pid,)).fetchone()
     expires = datetime.fromisoformat(row["expires_at"])
@@ -124,7 +124,8 @@ def test_approve_prompt_approve_once_issues_token(tmp_path: Path) -> None:
         decision_path=[],
     )
     token = db.approve_prompt(prompt_id=pid, decision="approve_once")
-    assert isinstance(token, str) and len(token) == 36
+    assert isinstance(token, str)
+    assert len(token) == 36
 
 
 def test_approve_prompt_deny_returns_none(tmp_path: Path) -> None:
@@ -179,7 +180,7 @@ def test_consume_approve_token_after_expiry_returns_none(tmp_path: Path) -> None
         ttl_seconds=0,  # immediately expired
     )
     # Patch: set expires_at to past
-    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    past = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
     with db._conn() as conn:
         conn.execute("UPDATE pending_prompts SET expires_at = ? WHERE id = ?", (past, pid))
 
@@ -223,7 +224,7 @@ def test_approve_once_extends_expiry_for_durability(tmp_path: Path) -> None:
     assert prompt_after["expires_at"] > original_expires_at
 
     # The durable expiry is well beyond the immediate future (still valid).
-    soon = (datetime.now(timezone.utc) + timedelta(seconds=310)).isoformat()
+    soon = (datetime.now(UTC) + timedelta(seconds=310)).isoformat()
     assert prompt_after["expires_at"] > soon
 
 
@@ -251,7 +252,7 @@ def test_cleanup_expired_prompts_deletes_only_expired(tmp_path: Path) -> None:
         decision_path=[],
         ttl_seconds=300,
     )
-    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+    past = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
     with db._conn() as conn:
         conn.execute("UPDATE pending_prompts SET expires_at = ? WHERE id = ?", (past, expired_id))
 

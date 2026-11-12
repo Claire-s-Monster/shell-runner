@@ -1,14 +1,29 @@
 """Unit tests for ui.refinement."""
 
+import json as _json
+import sys
+
+import httpx as _httpx
 import pytest
 
-from ui.refinement import redact
+from ui.refinement import (
+    AnalysisError,
+    _build_argv,
+    _scrubbed_env,
+    build_analysis_prompt,
+    build_issue_body,
+    file_github_issue,
+    find_open_issue,
+    redact,
+    run_claude_analysis,
+    validate_proposal,
+)
 
 R = "‹REDACTED›"
 
 
 @pytest.mark.parametrize(
-    "raw,secret",
+    ("raw", "secret"),
     [
         (
             'curl -H "Authorization: Bearer sk-abc1234567890TOKENVALUE" https://api.x',
@@ -39,14 +54,13 @@ def test_redact_preserves_benign_command():
 
 def test_redact_keeps_query_key_names_visible():
     out = redact("curl 'https://api.x?api_key=ABC123XYZ&page=2'")
-    assert "api_key=" in out and "page=2" in out and "ABC123XYZ" not in out
+    assert "api_key=" in out
+    assert "page=2" in out
+    assert "ABC123XYZ" not in out
 
 
 def test_redact_empty():
     assert redact("") == ""
-
-
-from ui.refinement import build_analysis_prompt, validate_proposal
 
 
 def _valid_proposal():
@@ -82,21 +96,21 @@ def test_validate_proposal_accepts_existing_lever_null_rule():
 def test_validate_proposal_missing_key_raises():
     p = _valid_proposal()
     del p["dedupe_key"]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"missing keys: \['dedupe_key'\]"):
         validate_proposal(p)
 
 
 def test_validate_proposal_bad_tier_raises():
     p = _valid_proposal()
     p["proposed_rule"]["tier"] = "T9"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"proposed_rule\.tier must be one of"):
         validate_proposal(p)
 
 
 def test_validate_proposal_bad_confidence_raises():
     p = _valid_proposal()
     p["confidence"] = "high"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"confidence must be a number in \[0\.0, 1\.0\]"):
         validate_proposal(p)
 
 
@@ -137,12 +151,6 @@ def test_build_analysis_prompt_contains_context_and_schema():
         "risk_notes",
     ]:
         assert key in p
-
-
-import json as _json
-import sys
-
-from ui.refinement import AnalysisError, _build_argv, _scrubbed_env, run_claude_analysis
 
 
 def _write_fake_claude(tmp_path, envelope, exit_code=0):
@@ -188,7 +196,8 @@ def test_build_argv_enforces_readonly():
     assert "the-prompt" in argv
     assert "--strict-mcp-config" in argv
     di = argv[argv.index("--disallowedTools") + 1]
-    assert "mcp__*" in di and "Bash" in di
+    assert "mcp__*" in di
+    assert "Bash" in di
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
 
 
@@ -199,11 +208,6 @@ def test_scrubbed_env_removes_tokens(monkeypatch):
     assert "SHELL_RUNNER_GH_TOKEN" not in env
     assert "GITHUB_TOKEN" not in env
     assert "GH_TOKEN" not in env
-
-
-import httpx as _httpx
-
-from ui.refinement import build_issue_body, file_github_issue, find_open_issue
 
 
 def test_build_issue_body_has_marker_and_labels():

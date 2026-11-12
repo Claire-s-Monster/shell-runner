@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from shell_runner.catalog import Tier
 from shell_runner.classifier import classify
 from shell_runner.executor import trusted_bin_dirs

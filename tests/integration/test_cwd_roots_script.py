@@ -121,7 +121,7 @@ def test_add_writes_path_to_toml(tmp_path: Path) -> None:
     env = _make_env(tmp_path)
 
     # Use /tmp because it always exists
-    result = _run(["add", "/tmp"], env=env)
+    _run(["add", "/tmp"], env=env)
     # reload will fail (no PID file) with exit 2; that's acceptable here
     # — we only care that the TOML mutation happened
     toml = _toml_path(tmp_path)
@@ -162,7 +162,7 @@ def test_remove_nonexistent_path_is_silent(tmp_path: Path) -> None:
     # Ensure TOML exists with no entries
     _run(["list"], env=env)
 
-    result = _run(["remove", "/tmp"], env=env)
+    _run(["remove", "/tmp"], env=env)
     # Should not error (just silently succeed)
     # Exit code may be 2 from the reload-without-pid step, but TOML stays intact
     toml = _toml_path(tmp_path)

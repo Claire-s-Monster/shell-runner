@@ -30,12 +30,12 @@ async def writer(persistence: Persistence) -> CatalogWriter:  # type: ignore[mis
 
 
 def _call_kwargs(**overrides: Any) -> dict[str, Any]:
-    defaults: dict[str, Any] = dict(
-        template="echo <word>",
-        agent_id="test-agent",
-        current_tier=1,
-        was_denied=False,
-    )
+    defaults: dict[str, Any] = {
+        "template": "echo <word>",
+        "agent_id": "test-agent",
+        "current_tier": 1,
+        "was_denied": False,
+    }
     defaults.update(overrides)
     return defaults
 

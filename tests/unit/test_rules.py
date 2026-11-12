@@ -489,13 +489,13 @@ def test_base_dir_changes_do_not_evade_protection(
     assert (verdict.denying_match is not None) == (mode == "deny")
 
 
-def test_make_C_is_only_a_touch(guarded: Path) -> None:
+def test_make_dash_c_is_only_a_touch(guarded: Path) -> None:
     verdict = rules.evaluate("make -C tests/acceptance all", str(guarded))
     assert verdict.matches
     assert not verdict.write_matches
 
 
-def test_git_C_base_applies_to_its_own_segment_only(guarded: Path) -> None:
+def test_git_dash_c_base_applies_to_its_own_segment_only(guarded: Path) -> None:
     assert not rules.evaluate("git -C tests status && rm x", str(guarded)).matches
     assert not rules.evaluate("git -C other checkout -- x", str(guarded)).matches
 

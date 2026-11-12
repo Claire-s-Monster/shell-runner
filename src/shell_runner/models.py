@@ -200,6 +200,10 @@ class HealthResponse(BaseModel):
         total_calls_24h - observed_24h) that were denied / required a
         prompt. Passive observations are excluded from the denominator so
         these rates reflect actual gating behavior.
+    sandbox: whether this process runs with a read-only / and /usr
+        (ProtectSystem=strict, issue #82): 'enforced', 'absent' (not
+        enforced), or 'disabled' (SHELL_RUNNER_SANDBOX=0). Computed once at
+        startup; informational only, it does not affect status.
     """
 
     status: Literal["ok", "degraded"]
@@ -211,6 +215,7 @@ class HealthResponse(BaseModel):
     p99_latency_ms: int
     catalog_size: int
     pending_prompts: int
+    sandbox: Literal["enforced", "absent", "disabled"]
     last_error: str | None = None
 
 

@@ -275,7 +275,7 @@ def test_detach_dispatch_spawns_unit_and_ignores_timeout(
     assert body["job_id"]
     assert len(backend.started) == 1
     assert f"RuntimeMaxSec={executor.resolve_runtime_max_s()}" in backend.started[0]
-    assert not any("RuntimeMaxSec=5" == a for a in backend.started[0])
+    assert not any(a == "RuntimeMaxSec=5" for a in backend.started[0])
     job = db.get_job(body["job_id"])
     assert job is not None
     assert job["kind"] == "unit"
