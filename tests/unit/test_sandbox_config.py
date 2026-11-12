@@ -52,7 +52,7 @@ def test_extra_paths_appended_in_order() -> None:
 
 def test_extra_paths_deduplicated() -> None:
     props = sandbox_properties({**ENV, EXTRA_RW_ENV: f"/tmp:/data/a:/data/a:{RUNTIME}"})
-    assert props[2] ==f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/data/a"
+    assert props[2] == f"ReadWritePaths=-/tmp -/var/tmp -{RUNTIME} -/data/a"
 
 
 @pytest.mark.parametrize(

@@ -95,7 +95,9 @@ def test_golden_argv() -> None:
 
 def test_sandbox_props_omitted_when_disabled() -> None:
     argv = _argv(environ={"SHELL_RUNNER_SANDBOX": "0"})
-    assert not any(a.startswith(("ProtectSystem=", "PrivateUsers=", "ReadWritePaths=")) for a in argv)
+    assert not any(
+        a.startswith(("ProtectSystem=", "PrivateUsers=", "ReadWritePaths=")) for a in argv
+    )
 
 
 def test_sandbox_extra_rw_paths_reach_argv() -> None:
