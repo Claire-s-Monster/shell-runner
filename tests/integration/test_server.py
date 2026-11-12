@@ -477,3 +477,12 @@ def test_health_returns_ok(client: TestClient) -> None:
     assert data["status"] == "ok"
     assert data["catalog_size"] == len(all_rules())
     assert isinstance(data["total_calls_24h"], int)
+    assert data["sandbox"] in ("enforced", "absent", "disabled")
+
+
+def test_health_sandbox_reflects_startup_canary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("shell_runner.server._sandbox_state", "enforced")
+    assert client.get("/health").json()["sandbox"] == "enforced"
+    assert client.get("/health").json()["status"] == "ok"
