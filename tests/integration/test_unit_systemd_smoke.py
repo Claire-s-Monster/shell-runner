@@ -121,6 +121,8 @@ def test_sandbox_blocks_usr_but_allows_tmp_job_dir(
     assert result.exit_status != "0"
     assert _unit_terminal_status(result) == "failed"
     assert not list(Path("/usr").glob(".sr-canary-*"))
+    # EROFS proves the namespace sandbox is active; EACCES would mean it was skipped.
+    assert "Read-only file system" in (job_dir / "stderr.log").read_text()
     _assert_collected(backend, job_id)
 
     ok_target = job_dir / "sandbox-ok"
@@ -129,6 +131,21 @@ def test_sandbox_blocks_usr_but_allows_tmp_job_dir(
     assert result.exit_status == "0"
     assert ok_target.exists()
     _assert_collected(backend, ok_id)
+
+
+def test_sandboxed_unit_can_launch_nested_transient_unit(
+    backend: SystemdBackend, start_unit: Callable[..., tuple[str, Path]]
+) -> None:
+    # Jobs run with a cleared env, so point systemd-run at the user bus like the service does.
+    job_id, job_dir = start_unit(
+        "export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+        "systemd-run --user --wait --collect --quiet true; echo rc=$? >&2; exit 0"
+    )
+    result = _wait_result(backend, job_dir)
+    stderr = (job_dir / "stderr.log").read_text()
+    assert "rc=0" in stderr, stderr
+    assert result.exit_status == "0"
+    _assert_collected(backend, job_id)
 
 
 def test_runtime_max_maps_to_timed_out(
