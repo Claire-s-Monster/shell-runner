@@ -94,6 +94,42 @@ def test_execute_pip_install_prompts(client: TestClient) -> None:
     assert "id" in data["prompt"]
 
 
+def test_execute_denied_prompt_cannot_be_reexecuted(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #92: a denied T3 prompt must not be consumable by a token-less resubmit."""
+    from shell_runner.executor import ExecutionResult
+
+    executed: list[str] = []
+
+    def _fake_execute(*, command: str, cwd: str, timeout_s: float, **_: object) -> ExecutionResult:
+        executed.append(command)
+        return ExecutionResult(0, "", "", None, None, 0, False)
+
+    monkeypatch.setattr("shell_runner.server.execute", _fake_execute)
+    # Disable the inline budget so the faked execute() is the only execution path
+    # (never divert to a real background job).
+    monkeypatch.setattr("shell_runner.server.inline_budget_s", lambda: 0)
+
+    body = {"command": "pip install requests", "cwd": "/tmp", "agent_id": "focused-ghc-ci-analyzer"}
+    first = client.post("/execute", json=body).json()
+    assert first["decision"] == "prompt_required"
+
+    resp = client.post(
+        "/approve_pending",
+        json={
+            "prompt_id": first["prompt"]["id"],
+            "decision": "deny",
+            "approver_agent_id": "primary",
+        },
+    )
+    assert resp.status_code == 200
+
+    second = client.post("/execute", json=body).json()
+    assert executed == []
+    assert second["decision"] in ("prompt_required", "denied", "deny")
+
+
 def test_execute_sudo_is_denied(client: TestClient) -> None:
     resp = client.post(
         "/execute",

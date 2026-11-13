@@ -138,3 +138,76 @@ def test_consume_approval_by_command_single_use(tmp_path: Path) -> None:
         raw_cmd="nonexistent_cmd_xyz --flag", cwd="/tmp", agent_id="agent-a"
     )
     assert second is None
+
+
+# ---------------------------------------------------------------------------
+# consume_approval_by_command — deny must never be consumable (issue #92)
+# ---------------------------------------------------------------------------
+
+_CMD = "nonexistent_cmd_xyz --flag"
+
+
+def _new_prompt(db: Persistence) -> str:
+    return db.create_pending_prompt(
+        agent_id="agent-a",
+        cwd="/tmp",
+        raw_cmd=_CMD,
+        normalized_template="nonexistent_cmd_xyz <flag>",
+        command_tier=3,
+        matched_rule_category=None,
+        decision_path=["T3_fallthrough"],
+    )
+
+
+def _consume(db: Persistence) -> dict | None:
+    return db.consume_approval_by_command(raw_cmd=_CMD, cwd="/tmp", agent_id="agent-a")
+
+
+def test_consume_by_command_ignores_denied_prompt(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    prompt_id = _new_prompt(db)
+    db.approve_prompt(prompt_id=prompt_id, decision="deny")
+    assert _consume(db) is None
+
+
+def test_consume_by_command_deny_after_approve_once_revokes(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    prompt_id = _new_prompt(db)
+    db.approve_prompt(prompt_id=prompt_id, decision="approve_once")
+    db.approve_prompt(prompt_id=prompt_id, decision="deny")
+    assert _consume(db) is None
+
+
+def test_consume_by_command_newer_deny_supersedes_older_approve_once(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    older = _new_prompt(db)
+    db.approve_prompt(prompt_id=older, decision="approve_once")
+    newer = _new_prompt(db)
+    db.approve_prompt(prompt_id=newer, decision="deny")
+    assert _consume(db) is None
+
+
+def test_consume_by_command_deny_wins_timestamp_tie(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    denied = _new_prompt(db)
+    db.approve_prompt(prompt_id=denied, decision="deny")
+    once = _new_prompt(db)  # newer rowid, so only the deny-first term can make deny win
+    db.approve_prompt(prompt_id=once, decision="approve_once")
+    with db._write_conn() as conn:
+        conn.execute("UPDATE pending_prompts SET approved_at = '2026-01-01T00:00:00+00:00'")
+    assert _consume(db) is None
+
+
+def test_consume_by_command_ignores_template_decision(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    prompt_id = _new_prompt(db)
+    db.approve_prompt(prompt_id=prompt_id, decision="approve_template")
+    assert _consume(db) is None
+
+
+def test_consume_by_command_approve_once_still_consumable(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    prompt_id = _new_prompt(db)
+    db.approve_prompt(prompt_id=prompt_id, decision="approve_once")
+    assert _consume(db) is not None
+    assert _consume(db) is None
