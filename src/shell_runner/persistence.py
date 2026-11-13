@@ -12,14 +12,41 @@ import threading
 import uuid
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .seeds import SeedApproval
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PromotionRule:
+    """A reusable rule to create atomically with an approve decision (issue #94).
+
+    kind="template": ``key`` is the normalized template.
+    kind="verb": ``key`` is the verb and ``cwd_prefix`` the scoped subtree.
+    """
+
+    kind: Literal["template", "verb"]
+    key: str
+    agent_id: str | None
+    approved_tier: int
+    approved_by: str | None = None
+    cwd_prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class PromptDecision:
+    """Result of decide_prompt. token is None for a deny or an unknown prompt."""
+
+    token: str | None
+    rule_id: int | None = None
+    revoked_rules: int = 0
+
 
 DEFAULT_DB_PATH = Path.home() / ".local/share/shell-runner/telemetry.sqlite3"
 
@@ -577,8 +604,42 @@ class Persistence:
         """Record a decision on a prompt (approve or deny) and who made it.
 
         approver_agent_id is self-asserted by the caller (issue #29): it records
-        the claim, not a verified identity.
+        the claim, not a verified identity. Thin wrapper over decide_prompt
+        (no rule creation); a deny revokes the prompt's rules (issue #94).
         """
+        return self.decide_prompt(
+            prompt_id=prompt_id, decision=decision, approver_agent_id=approver_agent_id
+        ).token
+
+    def decide_prompt(
+        self,
+        *,
+        prompt_id: str,
+        decision: str,
+        approver_agent_id: str | None = None,
+        rule: PromotionRule | None = None,
+    ) -> PromptDecision:
+        """Atomically record a decision and apply its rule side effects (issue #94).
+
+        Everything happens in ONE write transaction (BEGIN IMMEDIATE ... COMMIT):
+        - the decision update on the prompt row;
+        - for an approve, creation of ``rule`` (if given), linked to this prompt;
+        - for a deny, deletion of the rows in template_approvals and
+          verb_approvals WHERE approved_via_prompt_id = prompt_id, and nothing
+          else. Seed rows (NULL prompt id) and rows since replaced by a later
+          prompt (re-linked to that prompt's id) survive.
+        A concurrent deny therefore can never leave a rule behind, and a deny
+        can never observe a decision without its rule.
+
+        Invariant: rules linked to a prompt always match its current decision.
+        Every decision first revokes the prompt's existing rules, then creates
+        ``rule`` if given (so approve_template -> approve_once leaves no rule,
+        and re-approving after a deny leaves exactly the new rule). A deny for a
+        prompt row that no longer exists still removes its orphaned rules.
+        Raises ValueError if ``rule`` does not match ``decision``; approve_*
+        with rule=None is allowed (guarded/detach downgrades).
+        """
+        self._validate_rule_for_decision(decision, rule)
         now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         is_approved = decision in (
@@ -589,12 +650,23 @@ class Persistence:
         )
         token = str(uuid.uuid4()) if is_approved else None
         with self._write_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT id, expires_at FROM pending_prompts WHERE id = ?",
                 (prompt_id,),
             ).fetchone()
             if row is None:
-                return None
+                orphaned = (
+                    self._revoke_rules_for_prompt(conn, prompt_id) if decision == "deny" else 0
+                )
+                conn.execute("COMMIT")
+                if orphaned:
+                    logger.info(
+                        "deny of purged prompt %s revoked %d orphaned rule(s) (issue #94)",
+                        prompt_id,
+                        orphaned,
+                    )
+                return PromptDecision(token=None, revoked_rules=orphaned)
             if decision == "approve_once":
                 # Durability (issue #26 P2 Part B): extend the TTL well past the
                 # default pending-prompt window so a token-less re-submit
@@ -629,7 +701,60 @@ class Persistence:
                     """,
                     (token, decision, now, approver_agent_id, prompt_id),
                 )
-        return token
+            revoked = self._revoke_rules_for_prompt(conn, prompt_id)
+            rule_id = self._apply_rule(conn, rule, prompt_id) if rule is not None else None
+            conn.execute("COMMIT")
+        if revoked and decision == "deny":
+            logger.info(
+                "deny of prompt %s revoked %d reusable rule(s) (issue #94)", prompt_id, revoked
+            )
+        return PromptDecision(token=token, rule_id=rule_id, revoked_rules=revoked)
+
+    @staticmethod
+    def _validate_rule_for_decision(decision: str, rule: PromotionRule | None) -> None:
+        if rule is None:
+            return
+        expected = {
+            "approve_template": ("template", False),
+            "approve_template_global": ("template", True),
+            "approve_verb": ("verb", False),
+        }.get(decision)
+        if expected is None:
+            raise ValueError(f"rule not allowed with decision {decision!r}")
+        kind, is_global = expected
+        if rule.kind != kind or (kind == "template" and (rule.agent_id is None) != is_global):
+            raise ValueError(f"rule kind {rule.kind!r} does not match decision {decision!r}")
+
+    @staticmethod
+    def _revoke_rules_for_prompt(conn: sqlite3.Connection, prompt_id: str) -> int:
+        """Delete rules created via ``prompt_id`` only (issue #94). Returns the count."""
+        n = 0
+        for table in ("template_approvals", "verb_approvals"):
+            n += conn.execute(
+                f"DELETE FROM {table} WHERE approved_via_prompt_id = ?",  # noqa: S608
+                (prompt_id,),
+            ).rowcount
+        return n
+
+    def _apply_rule(self, conn: sqlite3.Connection, rule: PromotionRule, prompt_id: str) -> int:
+        if rule.kind == "verb":
+            return self._insert_verb_approval(
+                conn,
+                verb=rule.key,
+                cwd_prefix=rule.cwd_prefix or "",
+                agent_id=rule.agent_id,
+                approved_tier=rule.approved_tier,
+                approved_via_prompt_id=prompt_id,
+                approved_by=rule.approved_by,
+            )
+        return self._insert_template_approval(
+            conn,
+            template=rule.key,
+            agent_id=rule.agent_id,
+            approved_tier=rule.approved_tier,
+            approved_via_prompt_id=prompt_id,
+            approved_by=rule.approved_by,
+        )
 
     def consume_approve_token(self, *, token: str) -> dict | None:
         """Atomically validate and consume an approve token.
@@ -826,31 +951,54 @@ class Persistence:
         """Persist a template approval. Replaces any prior approval for the
         same (template, agent_id) pair. agent_id=None means global approval.
         approved_by is the (self-asserted) approver identity. Returns the row id.
+        Delete+insert run in one transaction. Prompt-driven approvals should use
+        decide_prompt so the decision and rule are atomic (issue #94).
         """
-        now = _now_utc()
-        scope_key = agent_id if agent_id is not None else ""
         with self._write_conn() as conn:
-            # Delete any existing approval for this scope (replace semantics)
-            conn.execute(
-                """
-                DELETE FROM template_approvals
-                WHERE template = ? AND COALESCE(agent_id, '') = ?
-                """,
-                (template, scope_key),
+            conn.execute("BEGIN IMMEDIATE")
+            row_id = self._insert_template_approval(
+                conn,
+                template=template,
+                agent_id=agent_id,
+                approved_tier=approved_tier,
+                approved_via_prompt_id=approved_via_prompt_id,
+                approved_by=approved_by,
             )
-            cur = conn.execute(
-                """
-                INSERT INTO template_approvals
-                    (template, agent_id, approved_tier, approved_at,
-                     approved_via_prompt_id, approved_by)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (template, agent_id, approved_tier, now, approved_via_prompt_id, approved_by),
-            )
-            row_id = cur.lastrowid
-            if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
-                raise RuntimeError("INSERT did not produce a rowid")
+            conn.execute("COMMIT")
             return row_id
+
+    @staticmethod
+    def _insert_template_approval(
+        conn: sqlite3.Connection,
+        *,
+        template: str,
+        agent_id: str | None,
+        approved_tier: int,
+        approved_via_prompt_id: str | None,
+        approved_by: str | None,
+    ) -> int:
+        """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT)."""
+        scope_key = agent_id if agent_id is not None else ""
+        conn.execute(
+            """
+            DELETE FROM template_approvals
+            WHERE template = ? AND COALESCE(agent_id, '') = ?
+            """,
+            (template, scope_key),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO template_approvals
+                (template, agent_id, approved_tier, approved_at,
+                 approved_via_prompt_id, approved_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (template, agent_id, approved_tier, _now_utc(), approved_via_prompt_id, approved_by),
+        )
+        row_id = cur.lastrowid
+        if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
+            raise RuntimeError("INSERT did not produce a rowid")
+        return row_id
 
     def seed_approvals(self, seeds: Iterable[SeedApproval]) -> int:
         """Idempotently insert seed approvals as global (agent_id IS NULL) rows.
@@ -924,40 +1072,63 @@ class Persistence:
         triple (UPSERT semantics), race-safe via BEGIN IMMEDIATE — same pattern
         as create_template_approval. agent_id=None means the approval applies
         to any agent operating under cwd_prefix. Returns the row id.
+        Prompt-driven approvals should use decide_prompt (issue #94).
         """
-        now = _now_utc()
-        scope_key = agent_id if agent_id is not None else ""
         with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                """
-                DELETE FROM verb_approvals
-                WHERE verb = ? AND cwd_prefix = ? AND COALESCE(agent_id, '') = ?
-                """,
-                (verb, cwd_prefix, scope_key),
-            )
-            cur = conn.execute(
-                """
-                INSERT INTO verb_approvals
-                    (verb, cwd_prefix, agent_id, approved_tier, approved_at,
-                     approved_via_prompt_id, approved_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    verb,
-                    cwd_prefix,
-                    agent_id,
-                    approved_tier,
-                    now,
-                    approved_via_prompt_id,
-                    approved_by,
-                ),
+            row_id = self._insert_verb_approval(
+                conn,
+                verb=verb,
+                cwd_prefix=cwd_prefix,
+                agent_id=agent_id,
+                approved_tier=approved_tier,
+                approved_via_prompt_id=approved_via_prompt_id,
+                approved_by=approved_by,
             )
             conn.execute("COMMIT")
-            row_id = cur.lastrowid
-            if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
-                raise RuntimeError("INSERT did not produce a rowid")
             return row_id
+
+    @staticmethod
+    def _insert_verb_approval(
+        conn: sqlite3.Connection,
+        *,
+        verb: str,
+        cwd_prefix: str,
+        agent_id: str | None,
+        approved_tier: int,
+        approved_via_prompt_id: str | None,
+        approved_by: str | None,
+    ) -> int:
+        """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT)."""
+        scope_key = agent_id if agent_id is not None else ""
+        conn.execute(
+            """
+            DELETE FROM verb_approvals
+            WHERE verb = ? AND cwd_prefix = ? AND COALESCE(agent_id, '') = ?
+            """,
+            (verb, cwd_prefix, scope_key),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO verb_approvals
+                (verb, cwd_prefix, agent_id, approved_tier, approved_at,
+                 approved_via_prompt_id, approved_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                verb,
+                cwd_prefix,
+                agent_id,
+                approved_tier,
+                _now_utc(),
+                approved_via_prompt_id,
+                approved_by,
+            ),
+        )
+        row_id = cur.lastrowid
+        if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
+            raise RuntimeError("INSERT did not produce a rowid")
+        return row_id
 
     def get_verb_approved_tier(self, verb: str, cwd: str, agent_id: str) -> int | None:
         """Get the most restrictive approved tier among verb+cwd-prefix approvals

@@ -85,6 +85,7 @@ from .persistence import (
     DEFAULT_DB_PATH,
     CatalogWriter,
     Persistence,
+    PromotionRule,
     TelemetryWriter,
     parse_time_bound,
 )
@@ -1539,16 +1540,6 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             ),
         )
 
-    # approver_agent_id is self-asserted (issue #29): recorded as a claim only.
-    token = await asyncio.to_thread(
-        db.approve_prompt,
-        prompt_id=req.prompt_id,
-        decision=req.decision,
-        approver_agent_id=req.approver_agent_id,
-    )
-    if token is None and req.decision != "deny":
-        raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
-
     template_promoted = False
     verb_promoted = False
     catalog_entry_id: str | None = None
@@ -1556,8 +1547,9 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
 
     reusable = req.decision in ("approve_template", "approve_template_global", "approve_verb")
     guarded_note: str | None = None
+    rule: PromotionRule | None = None
     if reusable:
-        pending = db.get_pending_prompt(req.prompt_id)
+        pending = prompt_for_guard
         guard = path_guard.evaluate(pending["raw_cmd"], pending["cwd"]) if pending else None
         if pending is not None and pending["detach"]:
             guarded_note = (
@@ -1582,27 +1574,24 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     if guarded_note is not None:
         pass
     elif req.decision in ("approve_template", "approve_template_global"):
-        prompt = db.get_pending_prompt(req.prompt_id)
+        prompt = prompt_for_guard
         if prompt is None:
             raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
 
         promoted_tier = _validate_promotion_tier(req.promote_to_tier, int(prompt["command_tier"]))
 
         agent_scope = None if req.decision == "approve_template_global" else prompt["agent_id"]
-        entry_id = await asyncio.to_thread(
-            db.create_template_approval,
-            template=prompt["normalized_template"],
+        rule = PromotionRule(
+            kind="template",
+            key=prompt["normalized_template"],
             agent_id=agent_scope,
             approved_tier=promoted_tier,
-            approved_via_prompt_id=req.prompt_id,
             approved_by=req.approver_agent_id,
         )
-        template_promoted = True
         promoted_tier_out = promoted_tier
-        catalog_entry_id = str(entry_id)
 
     elif req.decision == "approve_verb":
-        prompt = db.get_pending_prompt(req.prompt_id)
+        prompt = prompt_for_guard
         if prompt is None:
             raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
 
@@ -1613,18 +1602,32 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         prompt_cls = classify(prompt["raw_cmd"], prompt["cwd"], prompt["agent_id"])
         verb = prompt_cls.segments[0].segment.verb if prompt_cls.segments else ""
         cwd_prefix = os.path.realpath(prompt["cwd"])
-        entry_id = await asyncio.to_thread(
-            db.create_verb_approval,
-            verb=verb,
-            cwd_prefix=cwd_prefix,
+        rule = PromotionRule(
+            kind="verb",
+            key=verb,
             agent_id=prompt["agent_id"],
             approved_tier=promoted_tier,
-            approved_via_prompt_id=req.prompt_id,
             approved_by=req.approver_agent_id,
+            cwd_prefix=cwd_prefix,
         )
-        verb_promoted = True
         promoted_tier_out = promoted_tier
-        catalog_entry_id = str(entry_id)
+
+    # One transaction: decision + rule creation (approve) or rule revocation
+    # (deny) -- issue #94. approver_agent_id is self-asserted (issue #29).
+    outcome = await asyncio.to_thread(
+        db.decide_prompt,
+        prompt_id=req.prompt_id,
+        decision=req.decision,
+        approver_agent_id=req.approver_agent_id,
+        rule=rule,
+    )
+    token = outcome.token
+    if token is None and req.decision != "deny":
+        raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
+    if rule is not None and outcome.rule_id is not None:
+        catalog_entry_id = str(outcome.rule_id)
+        template_promoted = rule.kind == "template"
+        verb_promoted = rule.kind == "verb"
 
     # issue #37 — echo back the post-approval state of the prompt so the
     # caller can verify what was actually acted on.
