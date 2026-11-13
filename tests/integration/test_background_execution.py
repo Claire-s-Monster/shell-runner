@@ -467,10 +467,8 @@ async def test_background_timeout_sends_sigterm_before_sigkill(
 
     The `trap` builtin is an unrecognised verb, so it classifies as T3
     (prompt_required) rather than auto-executing. Same two-step
-    prompt -> approve_verb -> retry dance as
-    test_approve_verb_promotion_auto_executes_variant_in_subdir in
-    test_verb_approval_flow.py: promote the verb to T2 (AUTO_CAPPED) so the
-    resubmitted command actually reaches the background execution path.
+    prompt -> approve_once -> token-less resubmit dance so the resubmitted
+    command actually reaches the background execution path.
     """
     marker = tmp_path / "termed"
     command = f"trap 'touch {marker}; exit 42' TERM; sleep 30 & wait"
@@ -490,13 +488,13 @@ async def test_background_timeout_sends_sigterm_before_sigkill(
             "/approve_pending",
             json={
                 "prompt_id": prompt_id,
-                "decision": "approve_verb",
-                "promote_to_tier": 2,
+                # #92: approve_verb rows are no longer consumable token-less;
+                # approve_once is the only token-less-consumable decision.
+                "decision": "approve_once",
                 "approver_agent_id": "primary",
             },
         )
         assert approve_resp.status_code == 200
-        assert approve_resp.json()["verb_promoted"] is True
 
         resp = await client.post(
             "/execute",

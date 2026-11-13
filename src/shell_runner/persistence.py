@@ -688,6 +688,12 @@ class Persistence:
         approve_once extends expires_at to APPROVE_ONCE_DURABLE_TTL_S, this
         lets a token-less re-submit consume the approval once even after the
         subagent that generated the pending prompt has exited.
+
+        Issue #92: only approve_once and deny decisions are candidates. The
+        newest candidate wins; if it is a deny, nothing is consumed (a newer
+        deny supersedes an older unconsumed approve_once). approve_template,
+        approve_template_global and approve_verb rows are never consumable
+        here; their rules apply through the classifier instead.
         """
         now = _now_utc()
         with self._write_conn() as conn:
@@ -695,15 +701,18 @@ class Persistence:
             row = conn.execute(
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
-                       command_tier, matched_rule_category, expires_at, consumed_at
+                       command_tier, matched_rule_category, expires_at, consumed_at,
+                       approve_decision
                 FROM pending_prompts
                 WHERE raw_cmd = ? AND cwd = ? AND agent_id = ? AND detach = ?
                   AND approved_at IS NOT NULL AND consumed_at IS NULL
-                ORDER BY approved_at DESC LIMIT 1
+                  AND approve_decision IN (?, ?)
+                ORDER BY approved_at DESC, (approve_decision = 'deny') DESC, rowid DESC
+                LIMIT 1
                 """,
-                (raw_cmd, cwd, agent_id, int(detach)),
+                (raw_cmd, cwd, agent_id, int(detach), "approve_once", "deny"),
             ).fetchone()
-            if row is None:
+            if row is None or row["approve_decision"] == "deny":
                 conn.execute("ROLLBACK")
                 return None
             if row["expires_at"] < now:
