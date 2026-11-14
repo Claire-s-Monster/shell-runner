@@ -351,6 +351,55 @@ and `ReadOnlyPaths=` under `/home`, so a sandboxed process can still write there
   logged at startup) or `disabled` (`SHELL_RUNNER_SANDBOX=0`). Checked once at
   startup; it does not change `status`.
 
+## Script and manifest content pinning (#95)
+
+Approvals match on the command text, so a script could be rewritten between approval
+and execution. When a prompt is created for a command that runs a script file
+(`bash x.sh`, `./x.sh`, `. ./x.sh`, `cat x.sh | python3`, `-c` bodies, wrappers like
+`env`/`timeout`/`sudo`, `awk|sed -f`, `python -m localmod`, ...), the script's sha256
+is stored on the prompt (`pending_prompts.script_sha256`, paths in `script_paths`). The
+approved run re-hashes before executing; a change, a missing file or a newly created
+file burns the approval and issues a fresh prompt. Such commands are never promotable:
+`approve_template`, `approve_template_global` and `approve_verb` degrade to one-shot.
+
+- **Best effort, fails closed.** This is static analysis of the command text, not a
+  sandbox. Anything it cannot resolve to a literal file (variables, globs, `~user`,
+  command substitution, `eval`, `xargs`, an unknown stdin producer, unparseable wrapper
+  chains, unknown launchers that name an interpreter such as `ssh host bash`) is
+  *unpinnable*: `shell_approve_pending` refuses every `approve_*` decision for it
+  ("script path can't be pinned; rerun with a literal script path"). Deny still works.
+- **Unlisted heads.** Only known launcher heads (`tmux`, `screen`, `script`, `watch`,
+  `parallel`, `ssh`, `su`, `runuser`, `chroot`, `unshare`, `nsenter`, `firejail`, `bwrap`,
+  `strace`, `ltrace`, `fakeroot`, `busybox`, `trap`, `alias`, `at`, `batch`, ...) are
+  unpinnable when an argument names an interpreter/runner. Any other unlisted head is
+  unpinnable only when a `-c` / `--command` value is a command string that runs a
+  script (`mytool -c 'bash x.sh'`). `mytool python` style commands are an accepted
+  residual gap. A bare `.` argument (`ruff check .`) is a path, never the `source` builtin.
+- **`systemd-run` is unwrapped**: the inner command is analysed and pinned. Script paths
+  resolve under `--working-directory=DIR`, or the caller's cwd with `--scope` /
+  `--same-dir`/`-d`. Otherwise a transient service starts in the manager's default
+  directory (home or `/`), which is not guessed: relative script operands
+  (`systemd-run --user bash x.sh`, `./x.sh`) are unpinnable, absolute ones stay pinned;
+  `--working-directory` together with `--same-dir` is unpinnable. Also unpinnable: `-H/--host`,
+  `-M/--machine`, any `--on-*` timer, `--timer/path/socket-property`, `-S/--shell`, no
+  inner command, an unknown option, or a `-p/--property` outside a resource-limit
+  allowlist (`MemoryMax`, `CPUQuota`, `TasksMax`, ...; `ExecStartPre=`, `BindPaths=`, ...
+  are refused).
+- **`pixi`**: an unrecognised option before the subcommand (`pixi -C dir run x`) is
+  unpinnable rather than misparsed.
+- **Not a boundary.** The security boundary is the approval itself plus the systemd
+  sandbox (see above). Pinning narrows the approve/execute gap; it does not contain
+  what an approved script does.
+- **Residual TOCTOU.** The hash is taken just before dispatch and the shell opens the
+  file afterwards; a swap in that window is not detected.
+- **Runner rules are not content-bound.** `make`, `pixi run`, `uv run`, `npm run|test`
+  and `yarn`/`pnpm` run-style commands stay promotable: their template/verb approvals are
+  honoured as before. Their makefile / manifest is pinned only for one-shot
+  (`approve_once`) approvals; a runner that also runs a script (`uv run x.py`,
+  `pixi run bash x.sh`) is non-promotable.
+- Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
+  (directories, FIFOs and devices are unreadable and refused at approval time).
+
 ## Audit trail: approver columns, retention, `shell_audit`
 
 **Approver columns.** Every approve *and* deny decision stores the supplied
