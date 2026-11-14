@@ -184,6 +184,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("shell_calls", "flagged", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "kind", "TEXT NOT NULL DEFAULT 'process'"),
     ("pending_prompts", "detach", "INTEGER NOT NULL DEFAULT 0"),
+    # issue #95: content pin of the script file(s) the command runs (NULL = none/unpinned)
+    ("pending_prompts", "script_sha256", "TEXT"),
+    ("pending_prompts", "script_paths", "TEXT"),
 )
 
 JOB_KINDS = frozenset({"process", "monitor", "unit"})
@@ -569,7 +572,10 @@ class Persistence:
         decision_path: list[str],
         ttl_seconds: int = 300,
         detach: bool = False,
+        script_sha256: str | None = None,
+        script_paths: str | None = None,
     ) -> str:
+        """Insert a pending prompt; script_sha256/script_paths hold the #95 content pin."""
         prompt_id = str(uuid.uuid4())
         now = datetime.now(UTC)
         expires_at = (now + timedelta(seconds=ttl_seconds)).isoformat()
@@ -579,8 +585,8 @@ class Persistence:
                 INSERT INTO pending_prompts (
                     id, created_at, expires_at, agent_id, cwd, raw_cmd,
                     normalized_template, command_tier, matched_rule_category,
-                    decision_path_json, detach
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    decision_path_json, detach, script_sha256, script_paths
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     prompt_id,
@@ -594,6 +600,8 @@ class Persistence:
                     matched_rule_category,
                     json.dumps(decision_path),
                     int(detach),
+                    script_sha256,
+                    script_paths,
                 ),
             )
         return prompt_id
@@ -769,7 +777,8 @@ class Persistence:
             row = conn.execute(
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
-                       command_tier, matched_rule_category, expires_at, consumed_at
+                       command_tier, matched_rule_category, expires_at, consumed_at,
+                       script_sha256
                 FROM pending_prompts
                 WHERE approve_token = ?
                 """,
@@ -799,6 +808,7 @@ class Persistence:
                 "normalized_template": row["normalized_template"],
                 "command_tier": row["command_tier"],
                 "matched_rule_category": row["matched_rule_category"],
+                "script_sha256": row["script_sha256"],
             }
 
     def consume_approval_by_command(
@@ -827,7 +837,7 @@ class Persistence:
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                        command_tier, matched_rule_category, expires_at, consumed_at,
-                       approve_decision
+                       approve_decision, script_sha256
                 FROM pending_prompts
                 WHERE raw_cmd = ? AND cwd = ? AND agent_id = ? AND detach = ?
                   AND approved_at IS NOT NULL AND consumed_at IS NULL
@@ -856,6 +866,7 @@ class Persistence:
                 "normalized_template": row["normalized_template"],
                 "command_tier": row["command_tier"],
                 "matched_rule_category": row["matched_rule_category"],
+                "script_sha256": row["script_sha256"],
             }
 
     def restore_approval(self, prompt_id: str) -> bool:
@@ -881,7 +892,7 @@ class Persistence:
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                        command_tier, matched_rule_category, expires_at,
                        approve_token, approve_decision, approved_at, consumed_at,
-                       detach
+                       detach, script_sha256
                 FROM pending_prompts WHERE id = ?
                 """,
                 (prompt_id,),

@@ -156,7 +156,9 @@ def test_interpreter_fed_by_heredoc_is_t4_non_promotable(repo: Path, command: st
 
 @pytest.mark.parametrize(
     "command",
-    ["cat <<EOF\nx\nEOF", "cat <<< hello", "echo hi", "python3 script.py", "bash script.sh"],
+    # `python3 script.py` / `bash script.sh` are non-promotable since #95 (script content
+    # is not pinned by reusable approvals); see test_script_content_binding.py.
+    ["cat <<EOF\nx\nEOF", "cat <<< hello", "echo hi"],
 )
 def test_non_interpreter_stdin_is_promotable(repo: Path, command: str) -> None:
     assert not _cls(command, repo).non_promotable, command

@@ -32,7 +32,7 @@ from typing import Any, Literal, cast
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import executor, monitor, path_guard, restart
+from . import executor, monitor, path_guard, restart, script_pin
 from .catalog import Tier, all_rules
 from .classifier import (
     PERMISSIVENESS,
@@ -578,6 +578,100 @@ async def _run_with_inline_budget(
     return result, None
 
 
+_UNPINNABLE_MESSAGE = (
+    "script path can't be pinned; rerun with a literal script path "
+    "(no variables, globs, command substitution or unidentified stdin producer; the "
+    "script must be a readable regular file): the command runs a script whose content "
+    "cannot be bound to an approval (issue #95)"
+)
+
+
+async def _reprompt_script_changed(
+    req: ExecuteRequest, cls: ClassificationResult, t0: float
+) -> ExecuteResponse:
+    """Refuse an approved script run whose script changed since approval (issue #95).
+
+    The approval stays consumed (never restored: a mismatch burns it). A fresh
+    pending prompt for the same command, pinned to the script's current content,
+    is created so the approver can review the new content.
+    """
+    pin = await asyncio.to_thread(script_pin.compute_pin, req.command, req.cwd)
+    prompt_id = await asyncio.to_thread(
+        db.create_pending_prompt,
+        agent_id=req.agent_id,
+        cwd=req.cwd,
+        raw_cmd=req.command,
+        normalized_template=cls.template,
+        command_tier=int(cls.command_tier),
+        matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+        decision_path=[*cls.decision_path, "script_changed_since_approval"],
+        detach=req.detach,
+        script_sha256=pin.storage_sha if pin else None,
+        script_paths=pin.paths_json if pin else None,
+    )
+    refused = cls.script_unpinnable or (
+        pin is not None and pin.storage_sha == script_pin.UNPINNABLE
+    )
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    telemetry_id = str(uuid.uuid4())
+    await asyncio.to_thread(
+        db.record_call,
+        call_id=telemetry_id,
+        agent_id=req.agent_id,
+        cwd=req.cwd,
+        raw_cmd=req.command,
+        normalized_template=cls.template,
+        command_tier=int(cls.command_tier),
+        final_tier=int(cls.tier),
+        decision="prompt_required",
+        matched_rule_pattern=cls.matched_rule.pattern if cls.matched_rule else None,
+        matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
+        exit_code=None,
+        stdout_bytes=0,
+        stderr_bytes=0,
+        duration_ms=duration_ms,
+        decision_path=[*cls.decision_path, "script_changed_since_approval"],
+        normalizer_warnings=list(cls.normalizer_warnings),
+        protected_path_match=cls.protected_path_json,
+        flagged=int(cls.flagged),
+    )
+    return ExecuteResponse(
+        decision="prompt_required",
+        tier=int(cls.tier),
+        matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
+        exit_code=None,
+        stdout="",
+        stderr="",
+        stdout_full_path=None,
+        stderr_full_path=None,
+        duration_ms=duration_ms,
+        telemetry_id=telemetry_id,
+        prompt=ExecutePromptInfo(
+            id=prompt_id,
+            raw_cmd=req.command,
+            template=cls.template,
+            category=cls.matched_rule.category if cls.matched_rule else None,
+            tier=int(cls.tier),
+            why=(
+                _UNPINNABLE_MESSAGE
+                if refused
+                else (
+                    "the script this command runs changed (or is missing/unreadable) since it "
+                    "was approved; the earlier approval is consumed and the command was NOT "
+                    "executed. Review the script and approve again via shell_approve_pending"
+                )
+            ),
+            next_steps=(
+                f"A primary session must approve prompt {prompt_id} via shell_approve_pending. "
+                f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
+                "until state is 'approved', then re-run shell_execute with the identical "
+                "command, cwd and agent_id plus approve_token."
+            ),
+            detach=req.detach,
+        ),
+    )
+
+
 async def _execute_approved_command(
     req: ExecuteRequest,
     prompt: dict,
@@ -684,6 +778,13 @@ async def _execute_approved_command(
             duration_ms=duration_ms,
             telemetry_id=telemetry_id,
         )
+
+    # Legacy / raced approvals of an unpinnable command never execute either.
+    # A prompt stored without a pin that now has something to pin counts as changed.
+    if recheck_cls.script_unpinnable or not await asyncio.to_thread(
+        script_pin.pin_unchanged, req.command, req.cwd, prompt.get("script_sha256")
+    ):
+        return await _reprompt_script_changed(req, recheck_cls, t0)
 
     return await _dispatch_approved(
         req,
@@ -1245,6 +1346,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         )
 
     # T3/T4 — create pending prompt, return prompt_required
+    pin = await asyncio.to_thread(script_pin.compute_pin, req.command, req.cwd)
     prompt_id = await asyncio.to_thread(
         db.create_pending_prompt,
         agent_id=req.agent_id,
@@ -1255,6 +1357,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
         decision_path=list(cls.decision_path),
         detach=req.detach,
+        script_sha256=pin.storage_sha if pin else None,
+        script_paths=pin.paths_json if pin else None,
     )
     duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
@@ -1540,6 +1644,14 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             ),
         )
 
+    # issue #95: a script whose content cannot be bound is never approvable (deny works).
+    if (
+        req.decision != "deny"
+        and prompt_for_guard is not None
+        and prompt_for_guard.get("script_sha256") == script_pin.UNPINNABLE
+    ):
+        raise HTTPException(status_code=403, detail=_UNPINNABLE_MESSAGE)
+
     template_promoted = False
     verb_promoted = False
     catalog_entry_id: str | None = None
@@ -1566,10 +1678,14 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             pending is not None
             and classify(pending["raw_cmd"], pending["cwd"], pending["agent_id"]).non_promotable
         ):
-            guarded_note = (
-                f"{req.decision} downgraded to a one-shot approval: inline code "
-                "(-c, source) is never promotable"
+            what = (
+                "running a script file is never promotable: its content is not pinned "
+                "by a reusable approval (issue #95); only a one-shot approval, bound to "
+                "the script's sha256, is possible"
+                if script_pin.runs_script(pending["raw_cmd"], pending["cwd"])
+                else "inline code (-c, source) is never promotable"
             )
+            guarded_note = f"{req.decision} downgraded to a one-shot approval: {what}"
 
     if guarded_note is not None:
         pass

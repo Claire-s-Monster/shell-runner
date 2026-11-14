@@ -15,7 +15,7 @@ import json
 import re
 from dataclasses import dataclass, field, replace
 
-from . import path_guard, rules
+from . import path_guard, rules, script_pin
 from .catalog import (
     T0_DENY,
     T1_AUTO_LOG,
@@ -191,6 +191,9 @@ class ClassificationResult:
     # some segment matched a non-promotable (inline code) rule: persisted approvals
     # must not lower it and reusable approval decisions degrade to one-shot
     non_promotable: bool = False
+    # issue #95: the command runs a script whose content cannot be bound (variable path,
+    # unknown stdin producer, eval, ...): every approval is refused (fail closed)
+    script_unpinnable: bool = False
     # the command left after folding a leading `cd DIR &&` (what `segments` describes)
     folded_command: str | None = None
 
@@ -466,6 +469,20 @@ def classify(
             decision_path=(*result.decision_path, note),
         )
     result = _apply_path_guard(result, command, cwd, env)
+    plan = script_pin.analyze(command, cwd)
+    if plan.blocks_reuse:
+        # issue #95: a script file's content is not part of the template, so no
+        # reusable (template/verb) approval may cover it; tiers are unchanged.
+        # (A runner's manifest/makefile is pinned for one-shot approvals only.)
+        note = "script content not pinned by reusable approvals: non-promotable"
+        if plan.unpinnable:
+            note = f"script_unpinnable: {plan.reasons[0]}; approvals refused"
+        result = replace(
+            result,
+            non_promotable=True,
+            script_unpinnable=plan.unpinnable,
+            decision_path=(*result.decision_path, note),
+        )
     labels = path_guard.write_labels(command)
     if labels:
         result = replace(result, decision_path=(*result.decision_path, *labels))
