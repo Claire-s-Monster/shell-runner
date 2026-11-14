@@ -244,6 +244,45 @@ def test_rows_include_approver_from_matching_prompt(client: TestClient) -> None:
     assert rows["ls"]["approver_agent_id"] is None
 
 
+def test_revocations_mode_via_route(client: TestClient) -> None:
+    pid = _prompt(agent_id="agent-a")
+    for decision in ("approve_template", "deny"):
+        resp = client.post(
+            "/approve_pending",
+            json={
+                "prompt_id": pid,
+                "decision": decision,
+                "approver_agent_id": "primary",
+                "reason": "no longer wanted",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+    data = _audit(client, mode="revocations", since="1h", prompt_id=pid, rule_kind="template")
+
+    assert data["mode"] == "revocations"
+    assert data["count"] == 1
+    assert data["truncated"] is False
+    (row,) = data["rows"]
+    assert row["prompt_id"] == pid
+    assert row["approver_agent_id"] == "primary"
+    assert row["rule_agent_id"] == "agent-a"
+    assert row["reason"] == "no longer wanted"
+    assert row["rule_text"] == "pip install <pkg>"
+    assert _audit(client, mode="revocations", rule_kind="verb")["count"] == 0
+    assert _audit(client, mode="revocations", agent_id="primary")["count"] == 1
+    assert _audit(client, mode="summary")["revocations"] == 1
+    assert client.post("/audit", json={"mode": "revocations", "since": "x"}).status_code == 400
+    assert (
+        client.post("/audit", json={"mode": "revocations", "rule_kind": "bogus"}).status_code == 422
+    )
+    assert client.post("/audit", json={"mode": "revocations", "cause": "bogus"}).status_code == 422
+    assert _audit(client, mode="revocations", cause="deny")["count"] == 1
+    assert _audit(client, mode="revocations", cause="replaced")["count"] == 0
+    assert data["rows"][0]["cause"] == "deny"
+    assert data["rows"][0]["rule_prompt_id"] == pid
+
+
 def test_audit_via_mcp_tool(client: TestClient, seeded: None) -> None:
     resp = client.post(
         "/mcp",

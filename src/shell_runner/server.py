@@ -1736,6 +1736,7 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         decision=req.decision,
         approver_agent_id=req.approver_agent_id,
         rule=rule,
+        reason=req.reason,
     )
     token = outcome.token
     if token is None and req.decision != "deny":
@@ -1781,7 +1782,10 @@ async def get_pending_route(body: GetPendingRequest) -> GetPendingResponse:
 
 @app.post("/audit", response_model=AuditResponse)
 async def audit_route(body: AuditRequest) -> AuditResponse:
-    """Read-only audit query over shell_calls (+ approver info from pending_prompts)."""
+    """Read-only audit query over shell_calls (+ approver info from pending_prompts).
+
+    mode="revocations" lists the rules removed by deny/re-decision (rule_revocations).
+    """
     try:
         since = parse_time_bound(body.since) if body.since else None
         until = parse_time_bound(body.until) if body.until else None
@@ -1797,6 +1801,9 @@ async def audit_route(body: AuditRequest) -> AuditResponse:
         flagged_only=body.flagged_only,
         mode=body.mode,
         limit=body.limit,
+        prompt_id=body.prompt_id,
+        rule_kind=body.rule_kind,
+        cause=body.cause,
     )
     return AuditResponse(**result)
 

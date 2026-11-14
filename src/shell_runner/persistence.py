@@ -40,6 +40,16 @@ class PromotionRule:
 
 
 @dataclass(frozen=True)
+class RevocationContext:
+    """Who/why for rule_revocations rows written during a decision (issue #100)."""
+
+    prompt_id: str
+    cause: str
+    approver_agent_id: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
 class PromptDecision:
     """Result of decide_prompt. token is None for a deny or an unknown prompt."""
 
@@ -162,6 +172,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_verb_approvals_unique
     ON verb_approvals(verb, cwd_prefix, COALESCE(agent_id, ''));
 
 CREATE INDEX IF NOT EXISTS idx_verb_approvals_verb ON verb_approvals(verb);
+
+-- issue #100: one row per reusable rule removed by a decision on a prompt.
+-- Never purged by retention: it is the record of why a rule stopped applying.
+CREATE TABLE IF NOT EXISTS rule_revocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revoked_at TEXT NOT NULL,
+    prompt_id TEXT NOT NULL,
+    approver_agent_id TEXT,
+    rule_kind TEXT NOT NULL CHECK(rule_kind IN ('template','template_global','verb')),
+    rule_id INTEGER NOT NULL,
+    rule_text TEXT NOT NULL,
+    rule_agent_id TEXT,
+    cwd_prefix TEXT,
+    reason TEXT,
+    -- decision that triggered the revocation, or 'replaced' when a newer rule
+    -- with the same unique key displaced it
+    cause TEXT NOT NULL CHECK(cause IN ('deny','approve_once','approve_template',
+        'approve_template_global','approve_verb','replaced')),
+    -- prompt that originally created the rule (differs from prompt_id if replaced)
+    rule_prompt_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_rule_revocations_revoked_at ON rule_revocations(revoked_at);
+CREATE INDEX IF NOT EXISTS idx_rule_revocations_prompt ON rule_revocations(prompt_id);
 """
 
 # approve_once durability TTL (issue #26 P2 Part B): an approve_once approval
@@ -626,6 +660,7 @@ class Persistence:
         decision: str,
         approver_agent_id: str | None = None,
         rule: PromotionRule | None = None,
+        reason: str | None = None,
     ) -> PromptDecision:
         """Atomically record a decision and apply its rule side effects (issue #94).
 
@@ -638,6 +673,8 @@ class Persistence:
           prompt (re-linked to that prompt's id) survive.
         A concurrent deny therefore can never leave a rule behind, and a deny
         can never observe a decision without its rule.
+        Each revoked rule is also recorded in rule_revocations in that same
+        transaction (issue #100), with the approver and the free-text ``reason``.
 
         Invariant: rules linked to a prompt always match its current decision.
         Every decision first revokes the prompt's existing rules, then creates
@@ -657,6 +694,7 @@ class Persistence:
             "approve_verb",
         )
         token = str(uuid.uuid4()) if is_approved else None
+        ctx = RevocationContext(prompt_id, decision, approver_agent_id, reason)
         with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -664,9 +702,7 @@ class Persistence:
                 (prompt_id,),
             ).fetchone()
             if row is None:
-                orphaned = (
-                    self._revoke_rules_for_prompt(conn, prompt_id) if decision == "deny" else 0
-                )
+                orphaned = self._revoke_rules_for_prompt(conn, ctx) if decision == "deny" else 0
                 conn.execute("COMMIT")
                 if orphaned:
                     logger.info(
@@ -709,8 +745,8 @@ class Persistence:
                     """,
                     (token, decision, now, approver_agent_id, prompt_id),
                 )
-            revoked = self._revoke_rules_for_prompt(conn, prompt_id)
-            rule_id = self._apply_rule(conn, rule, prompt_id) if rule is not None else None
+            revoked = self._revoke_rules_for_prompt(conn, ctx)
+            rule_id = self._apply_rule(conn, rule, prompt_id, ctx) if rule is not None else None
             conn.execute("COMMIT")
         if revoked and decision == "deny":
             logger.info(
@@ -734,8 +770,83 @@ class Persistence:
             raise ValueError(f"rule kind {rule.kind!r} does not match decision {decision!r}")
 
     @staticmethod
-    def _revoke_rules_for_prompt(conn: sqlite3.Connection, prompt_id: str) -> int:
-        """Delete rules created via ``prompt_id`` only (issue #94). Returns the count."""
+    def _record_revocation(
+        conn: sqlite3.Connection,
+        ctx: RevocationContext,
+        *,
+        cause: str,
+        rule_prompt_id: str | None,
+        kind: str,
+        rule_id: int,
+        text: str,
+        rule_agent_id: str | None,
+        cwd_prefix: str | None,
+    ) -> None:
+        """Insert one rule_revocations row on the caller's open write transaction.
+
+        revoked_at is sampled here, i.e. after the write lock was taken, so
+        timestamps follow commit order.
+        """
+        conn.execute(
+            "INSERT INTO rule_revocations (revoked_at, prompt_id, approver_agent_id, "
+            "rule_kind, rule_id, rule_text, rule_agent_id, cwd_prefix, reason, cause, "
+            "rule_prompt_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _now_utc(),
+                ctx.prompt_id,
+                ctx.approver_agent_id,
+                kind,
+                rule_id,
+                text,
+                rule_agent_id,
+                cwd_prefix,
+                ctx.reason,
+                cause,
+                rule_prompt_id,
+            ),
+        )
+
+    @staticmethod
+    def _revoke_rules_for_prompt(conn: sqlite3.Connection, ctx: RevocationContext) -> int:
+        """Delete rules created via ``ctx.prompt_id`` only (issue #94). Returns the count.
+
+        Runs on the caller's open transaction: each rule is first copied into
+        rule_revocations (issue #100), so a failed audit insert rolls back the
+        delete too.
+        """
+        prompt_id = ctx.prompt_id
+        templates = conn.execute(
+            "SELECT id, template, agent_id FROM template_approvals "
+            "WHERE approved_via_prompt_id = ?",
+            (prompt_id,),
+        ).fetchall()
+        verbs = conn.execute(
+            "SELECT id, verb, cwd_prefix, agent_id FROM verb_approvals "
+            "WHERE approved_via_prompt_id = ?",
+            (prompt_id,),
+        ).fetchall()
+        audit_rows = [
+            (
+                "template" if r["agent_id"] is not None else "template_global",
+                r["id"],
+                r["template"],
+                r["agent_id"],
+                None,
+            )
+            for r in templates
+        ] + [("verb", r["id"], r["verb"], r["agent_id"], r["cwd_prefix"]) for r in verbs]
+        for kind, rule_id, text, rule_agent, cwd_prefix in audit_rows:
+            Persistence._record_revocation(
+                conn,
+                ctx,
+                cause=ctx.cause,
+                rule_prompt_id=prompt_id,
+                kind=kind,
+                rule_id=rule_id,
+                text=text,
+                rule_agent_id=rule_agent,
+                cwd_prefix=cwd_prefix,
+            )
         n = 0
         for table in ("template_approvals", "verb_approvals"):
             n += conn.execute(
@@ -744,7 +855,13 @@ class Persistence:
             ).rowcount
         return n
 
-    def _apply_rule(self, conn: sqlite3.Connection, rule: PromotionRule, prompt_id: str) -> int:
+    def _apply_rule(
+        self,
+        conn: sqlite3.Connection,
+        rule: PromotionRule,
+        prompt_id: str,
+        ctx: RevocationContext,
+    ) -> int:
         if rule.kind == "verb":
             return self._insert_verb_approval(
                 conn,
@@ -754,6 +871,7 @@ class Persistence:
                 approved_tier=rule.approved_tier,
                 approved_via_prompt_id=prompt_id,
                 approved_by=rule.approved_by,
+                audit=ctx,
             )
         return self._insert_template_approval(
             conn,
@@ -762,6 +880,7 @@ class Persistence:
             approved_tier=rule.approved_tier,
             approved_via_prompt_id=prompt_id,
             approved_by=rule.approved_by,
+            audit=ctx,
         )
 
     def consume_approve_token(self, *, token: str) -> dict | None:
@@ -987,9 +1106,31 @@ class Persistence:
         approved_tier: int,
         approved_via_prompt_id: str | None,
         approved_by: str | None,
+        audit: RevocationContext | None = None,
     ) -> int:
-        """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT)."""
+        """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT).
+
+        With ``audit``, a rule displaced by the replace is recorded in
+        rule_revocations (cause='replaced', issue #100) before it is deleted.
+        """
         scope_key = agent_id if agent_id is not None else ""
+        old = conn.execute(
+            "SELECT id, template, agent_id, approved_via_prompt_id FROM template_approvals "
+            "WHERE template = ? AND COALESCE(agent_id, '') = ?",
+            (template, scope_key),
+        ).fetchone()
+        if old is not None and audit is not None:
+            Persistence._record_revocation(
+                conn,
+                audit,
+                cause="replaced",
+                rule_prompt_id=old["approved_via_prompt_id"],
+                kind="template" if old["agent_id"] is not None else "template_global",
+                rule_id=old["id"],
+                text=old["template"],
+                rule_agent_id=old["agent_id"],
+                cwd_prefix=None,
+            )
         conn.execute(
             """
             DELETE FROM template_approvals
@@ -1109,9 +1250,31 @@ class Persistence:
         approved_tier: int,
         approved_via_prompt_id: str | None,
         approved_by: str | None,
+        audit: RevocationContext | None = None,
     ) -> int:
-        """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT)."""
+        """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT).
+
+        With ``audit``, a rule displaced by the replace is recorded in
+        rule_revocations (cause='replaced', issue #100) before it is deleted.
+        """
         scope_key = agent_id if agent_id is not None else ""
+        old = conn.execute(
+            "SELECT id, verb, cwd_prefix, agent_id, approved_via_prompt_id FROM verb_approvals "
+            "WHERE verb = ? AND cwd_prefix = ? AND COALESCE(agent_id, '') = ?",
+            (verb, cwd_prefix, scope_key),
+        ).fetchone()
+        if old is not None and audit is not None:
+            Persistence._record_revocation(
+                conn,
+                audit,
+                cause="replaced",
+                rule_prompt_id=old["approved_via_prompt_id"],
+                kind="verb",
+                rule_id=old["id"],
+                text=old["verb"],
+                rule_agent_id=old["agent_id"],
+                cwd_prefix=old["cwd_prefix"],
+            )
         conn.execute(
             """
             DELETE FROM verb_approvals
@@ -1558,8 +1721,17 @@ class Persistence:
         flagged_only: bool = False,
         mode: str = "rows",
         limit: int = 100,
+        prompt_id: str | None = None,
+        rule_kind: str | None = None,
+        cause: str | None = None,
     ) -> dict[str, Any]:
         """Read-only audit view of shell_calls (parameterized SQL only).
+
+        mode="revocations" instead lists rule_revocations (issue #100), newest
+        first (commit order); agent_id/agent_id_prefix then match the approver
+        OR the rule's agent, and prompt_id/rule_kind/cause apply only there
+        (ignored with a note in other modes; decision/flagged_only are ignored
+        with a note in this mode). Summary mode also reports the revocation count.
 
         since/until must already be ISO-8601 UTC strings (see parse_time_bound).
         rows mode adds the approver recorded on the matching pending prompt;
@@ -1570,6 +1742,35 @@ class Persistence:
         """
         limit = max(1, min(limit, MAX_AUDIT_LIMIT))
         notes: list[str] = []
+        if mode == "revocations":
+            for name, supplied in (
+                ("decision", decision is not None),
+                ("flagged_only", flagged_only),
+            ):
+                if supplied:
+                    notes.append(f"{name} ignored: it does not apply to mode='revocations'.")
+            with self._conn() as conn:
+                result = self._audit_revocations(
+                    conn,
+                    agent_id=agent_id,
+                    agent_id_prefix=agent_id_prefix,
+                    since=since,
+                    until=until,
+                    prompt_id=prompt_id,
+                    rule_kind=rule_kind,
+                    cause=cause,
+                    limit=limit,
+                )
+            result["mode"] = mode
+            result["notes"] = notes
+            return result
+        for name, value in (
+            ("prompt_id", prompt_id),
+            ("rule_kind", rule_kind),
+            ("cause", cause),
+        ):
+            if value is not None:
+                notes.append(f"{name} ignored: it applies only to mode='revocations'.")
         with self._conn() as conn:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(shell_calls)")}
             clauses: list[str] = []
@@ -1601,12 +1802,56 @@ class Persistence:
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             if mode == "summary":
                 result = self._audit_summary(conn, where, params, limit)
+                result["revocations"] = self._count_revocations(conn, since, until)
             else:
                 optional = [c for c in OPTIONAL_AUDIT_COLUMNS if c in cols]
                 result = self._audit_rows(conn, where, params, limit, optional)
         result["mode"] = mode
         result["notes"] = notes
         return result
+
+    @staticmethod
+    def _count_revocations(conn: sqlite3.Connection, since: str | None, until: str | None) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM rule_revocations "
+            "WHERE (?1 IS NULL OR revoked_at >= ?1) AND (?2 IS NULL OR revoked_at <= ?2)",
+            (since, until),
+        ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _audit_revocations(
+        conn: sqlite3.Connection,
+        *,
+        agent_id: str | None,
+        agent_id_prefix: str | None,
+        since: str | None,
+        until: str | None,
+        prompt_id: str | None,
+        rule_kind: str | None,
+        cause: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        # Empty prefix means "no prefix filter" (same as before).
+        prefix = agent_id_prefix or None
+        # id DESC = commit order (writes are serialized); revoked_at is informational.
+        fetched = conn.execute(
+            "SELECT revoked_at AS ts, prompt_id, approver_agent_id, rule_kind, rule_id, "
+            "rule_text, rule_agent_id, cwd_prefix, reason, cause, rule_prompt_id "
+            "FROM rule_revocations "
+            "WHERE (?1 IS NULL OR approver_agent_id = ?1 OR rule_agent_id = ?1) "
+            "AND (?2 IS NULL OR substr(approver_agent_id, 1, length(?2)) = ?2 "
+            "OR substr(rule_agent_id, 1, length(?2)) = ?2) "
+            "AND (?3 IS NULL OR revoked_at >= ?3) "
+            "AND (?4 IS NULL OR revoked_at <= ?4) "
+            "AND (?5 IS NULL OR prompt_id = ?5) "
+            "AND (?6 IS NULL OR rule_kind = ?6) "
+            "AND (?7 IS NULL OR cause = ?7) "
+            "ORDER BY id DESC LIMIT ?8",
+            (agent_id, prefix, since, until, prompt_id, rule_kind, cause, limit + 1),
+        ).fetchall()
+        rows = [dict(r) for r in fetched[:limit]]
+        return {"rows": rows, "count": len(rows), "truncated": len(fetched) > limit}
 
     @staticmethod
     def _audit_rows(
