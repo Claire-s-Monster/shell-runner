@@ -181,6 +181,17 @@ class AuditRequest(BaseModel):
     # mode="revocations" only (issue #100); ignored with a note in other modes.
     prompt_id: str | None = None
     rule_kind: Literal["template", "template_global", "verb"] | None = None
+    cause: (
+        Literal[
+            "deny",
+            "approve_once",
+            "approve_template",
+            "approve_template_global",
+            "approve_verb",
+            "replaced",
+        ]
+        | None
+    ) = None
 
 
 class AuditResponse(BaseModel):

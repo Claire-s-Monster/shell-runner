@@ -196,11 +196,14 @@ TOOLS: dict[str, dict[str, Any]] = {
             "the same agent_id+raw_cmd+cwd within its lifetime. mode='summary' returns, per "
             "agent_id: total_calls, by_decision, denied_count, prompt_count, first_ts, last_ts, "
             "plus a top-level `revocations` count for the window. mode='revocations' lists, "
-            "newest first, the reusable rules (template, template_global, verb) removed when a "
-            "prompt was denied or re-decided: ts, prompt_id, approver_agent_id, rule_kind, "
-            "rule_id, rule_text, rule_agent_id, cwd_prefix, reason; there agent_id/"
-            "agent_id_prefix match the approver or the rule's agent, and prompt_id/rule_kind "
-            "filter (ignored with a note in other modes). All filters are optional and combine with AND. since/until take ISO-8601 or a "
+            "newest first (commit order), the reusable rules (template, template_global, verb) "
+            "removed when a prompt was denied, re-decided or its rule replaced by a newer one: "
+            "ts, prompt_id, approver_agent_id, rule_kind, rule_id, rule_text, rule_agent_id, "
+            "cwd_prefix, reason, cause (the decision, or 'replaced'), rule_prompt_id (the prompt "
+            "that created the rule); there agent_id/agent_id_prefix match the approver or the "
+            "rule's agent, prompt_id/rule_kind/cause filter (ignored with a note in other "
+            "modes), and decision/flagged_only are ignored with a note. Other filters are "
+            "optional and combine with AND. since/until take ISO-8601 or a "
             "relative age ('30m', '24h', '7d', '2w'). decision is an exact match, e.g. "
             "executed|denied|prompt_required|running|observed_externally. flagged_only "
             "applies only if the database has a 'flagged' column; otherwise it is ignored "
@@ -246,6 +249,19 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": ["string", "null"],
                     "enum": ["template", "template_global", "verb", None],
                     "description": "mode=revocations only: kind of revoked rule",
+                },
+                "cause": {
+                    "type": ["string", "null"],
+                    "enum": [
+                        "deny",
+                        "approve_once",
+                        "approve_template",
+                        "approve_template_global",
+                        "approve_verb",
+                        "replaced",
+                        None,
+                    ],
+                    "description": "mode=revocations only: decision that caused the revocation",
                 },
                 "limit": {
                     "type": "integer",

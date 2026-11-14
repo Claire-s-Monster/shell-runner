@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from shell_runner.persistence import Persistence
+from shell_runner.persistence import Persistence, PromotionRule
 from tests.unit.test_deny_revokes_rules import (  # noqa: F401  (fixtures)
     CMD_A,
     _decide,
@@ -84,11 +84,15 @@ def test_deny_records_one_row_per_revoked_rule(db: Persistence, tmp_path: Path) 
     )
 
     assert result.revoked_rules == 3
-    rows = {r["rule_kind"]: r for r in _revocations(db)}
+    raw = _revocations(db)
+    assert len(raw) == result.revoked_rules == 3
+    rows = {r["rule_kind"]: r for r in raw}
     assert set(rows) == {"template", "template_global", "verb"}
     for kind, row in rows.items():
         assert row["rule_id"] == ids[kind]
         assert row["prompt_id"] == pid
+        assert row["rule_prompt_id"] == pid
+        assert row["cause"] == "deny"
         assert row["approver_agent_id"] == "primary"
         assert row["reason"] == "too broad"
         assert row["revoked_at"]
@@ -145,6 +149,7 @@ def test_orphaned_prompt_deny_records(db: Persistence, tmp_path: Path) -> None:
 
     assert result.revoked_rules == 3
     rows = _revocations(db)
+    assert len(rows) == result.revoked_rules == 3
     assert {r["rule_kind"] for r in rows} == {"template", "template_global", "verb"}
     assert {r["rule_id"] for r in rows} == set(ids.values())
     assert all(r["reason"] == "purged" and r["prompt_id"] == pid for r in rows)
@@ -221,6 +226,8 @@ def test_audit_revocations_row_shape_and_order(db: Persistence, tmp_path: Path) 
         "rule_agent_id",
         "cwd_prefix",
         "reason",
+        "cause",
+        "rule_prompt_id",
     }
 
 
@@ -308,6 +315,131 @@ def test_audit_summary_includes_revocation_count(db: Persistence, tmp_path: Path
     assert db.audit_query(mode="summary")["revocations"] == 4
     since = (datetime.now(UTC) - timedelta(days=1)).isoformat()
     assert db.audit_query(mode="summary", since=since)["revocations"] == 1
+
+
+def test_audit_revocations_ordered_by_id_desc_not_timestamp(
+    db: Persistence, tmp_path: Path
+) -> None:
+    _seed_revocations(db, tmp_path)
+    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+    with db._write_conn() as conn:
+        conn.execute("UPDATE rule_revocations SET revoked_at = ? WHERE id = 1", (future,))
+    with db._conn() as conn:
+        expected = [r[0] for r in conn.execute("SELECT id FROM rule_revocations ORDER BY id DESC")]
+
+    result = db.audit_query(mode="revocations")
+
+    assert expected == [4, 3, 2, 1]
+    assert [r["rule_text"] for r in result["rows"]] == [
+        "tmpl other",
+        "myverb",
+        "tmpl global",
+        "tmpl scoped",
+    ]
+
+
+def test_audit_revocations_notes_for_ignored_filters(db: Persistence, tmp_path: Path) -> None:
+    _seed_revocations(db, tmp_path)
+
+    noisy = db.audit_query(mode="revocations", decision="denied", flagged_only=True)
+
+    assert noisy["count"] == 4  # the ignored filters did not narrow anything
+    assert any("decision ignored" in n and "revocations" in n for n in noisy["notes"])
+    assert any("flagged_only ignored" in n and "revocations" in n for n in noisy["notes"])
+    assert db.audit_query(mode="revocations")["notes"] == []
+
+
+def test_audit_cause_filter_and_note_in_other_modes(db: Persistence, tmp_path: Path) -> None:
+    old, new = _new_prompt(db), _new_prompt(db)
+    rule = PromotionRule(kind="template", key="k", agent_id="worker", approved_tier=2)
+    db.decide_prompt(prompt_id=old, decision="approve_template", rule=rule)
+    db.decide_prompt(prompt_id=new, decision="approve_template", rule=rule)  # replaces old's rule
+    db.decide_prompt(prompt_id=new, decision="deny")
+
+    replaced = db.audit_query(mode="revocations", cause="replaced")
+    denied = db.audit_query(mode="revocations", cause="deny")
+
+    assert replaced["count"] == 1
+    assert replaced["rows"][0]["rule_prompt_id"] == old
+    assert denied["count"] == 1
+    assert denied["rows"][0]["rule_prompt_id"] == new
+    assert db.audit_query(mode="revocations", cause="approve_verb")["count"] == 0
+    assert db.audit_query(mode="revocations")["count"] == 2
+    assert any("cause ignored" in n for n in db.audit_query(mode="rows", cause="deny")["notes"])
+
+
+@pytest.mark.parametrize(
+    ("decision", "rule_kwargs", "kind", "text"),
+    [
+        (
+            "approve_template",
+            {"kind": "template", "key": "k", "agent_id": "worker"},
+            "template",
+            "k",
+        ),
+        (
+            "approve_template_global",
+            {"kind": "template", "key": "g", "agent_id": None},
+            "template_global",
+            "g",
+        ),
+        ("approve_verb", {"kind": "verb", "key": "v", "agent_id": "worker"}, "verb", "v"),
+    ],
+)
+def test_replaced_rule_from_another_prompt_is_recorded(
+    db: Persistence,
+    tmp_path: Path,
+    decision: str,
+    rule_kwargs: dict[str, Any],
+    kind: str,
+    text: str,
+) -> None:
+    rule = PromotionRule(approved_tier=2, cwd_prefix=str(tmp_path), **rule_kwargs)
+    old, new = _new_prompt(db), _new_prompt(db)
+    old_rule_id = db.decide_prompt(prompt_id=old, decision=decision, rule=rule).rule_id
+    assert _revocations(db) == []  # a first rule displaces nothing
+
+    result = db.decide_prompt(
+        prompt_id=new,
+        decision=decision,
+        approver_agent_id="primary",
+        reason="supersede",
+        rule=rule,
+    )
+
+    assert result.revoked_rules == 0  # behaviour unchanged: the replace is not a revocation
+    raw = _revocations(db)
+    assert len(raw) == 1
+    (row,) = raw
+    assert row["cause"] == "replaced"
+    assert row["prompt_id"] == new
+    assert row["rule_prompt_id"] == old
+    assert row["rule_id"] == old_rule_id
+    assert row["rule_kind"] == kind
+    assert row["rule_text"] == text
+    assert row["approver_agent_id"] == "primary"
+    assert row["reason"] == "supersede"
+    assert row["cwd_prefix"] == (str(tmp_path) if kind == "verb" else None)
+    assert _rule_rows(db, old) == 0
+    assert _rule_rows(db, new) == 1
+
+
+@pytest.mark.parametrize("decision", ["deny", "approve_once", "approve_template"])
+def test_cause_is_the_triggering_decision(db: Persistence, tmp_path: Path, decision: str) -> None:
+    pid = _new_prompt(db)
+    _link_rules(db, pid, tmp_path)
+    rule = (
+        PromotionRule(kind="template", key="tmpl scoped", agent_id="worker", approved_tier=2)
+        if decision == "approve_template"
+        else None
+    )
+
+    result = db.decide_prompt(prompt_id=pid, decision=decision, rule=rule)
+
+    raw = _revocations(db)
+    assert len(raw) == result.revoked_rules == 3  # re-created rule is not a 'replaced' row
+    assert {r["cause"] for r in raw} == {decision}
+    assert {r["rule_prompt_id"] for r in raw} == {pid}
 
 
 # --- schema and retention -------------------------------------------------------

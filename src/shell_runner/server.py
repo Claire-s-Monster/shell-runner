@@ -1803,6 +1803,7 @@ async def audit_route(body: AuditRequest) -> AuditResponse:
         limit=body.limit,
         prompt_id=body.prompt_id,
         rule_kind=body.rule_kind,
+        cause=body.cause,
     )
     return AuditResponse(**result)
 

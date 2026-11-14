@@ -276,6 +276,11 @@ def test_revocations_mode_via_route(client: TestClient) -> None:
     assert (
         client.post("/audit", json={"mode": "revocations", "rule_kind": "bogus"}).status_code == 422
     )
+    assert client.post("/audit", json={"mode": "revocations", "cause": "bogus"}).status_code == 422
+    assert _audit(client, mode="revocations", cause="deny")["count"] == 1
+    assert _audit(client, mode="revocations", cause="replaced")["count"] == 0
+    assert data["rows"][0]["cause"] == "deny"
+    assert data["rows"][0]["rule_prompt_id"] == pid
 
 
 def test_audit_via_mcp_tool(client: TestClient, seeded: None) -> None:
