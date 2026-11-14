@@ -1812,18 +1812,10 @@ class Persistence:
 
     @staticmethod
     def _count_revocations(conn: sqlite3.Connection, since: str | None, until: str | None) -> int:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if since is not None:
-            clauses.append("revoked_at >= ?")
-            params.append(since)
-        if until is not None:
-            clauses.append("revoked_at <= ?")
-            params.append(until)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         row = conn.execute(
-            f"SELECT COUNT(*) FROM rule_revocations {where}",  # noqa: S608 - constant fragments
-            params,
+            "SELECT COUNT(*) FROM rule_revocations "
+            "WHERE (?1 IS NULL OR revoked_at >= ?1) AND (?2 IS NULL OR revoked_at <= ?2)",
+            (since, until),
         ).fetchone()
         return int(row[0])
 
@@ -1840,34 +1832,23 @@ class Persistence:
         cause: str | None,
         limit: int,
     ) -> dict[str, Any]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if agent_id is not None:
-            clauses.append("(approver_agent_id = ? OR rule_agent_id = ?)")
-            params.extend([agent_id, agent_id])
-        if agent_id_prefix:
-            n = len(agent_id_prefix)
-            clauses.append(
-                "(substr(approver_agent_id, 1, ?) = ? OR substr(rule_agent_id, 1, ?) = ?)"
-            )
-            params.extend([n, agent_id_prefix, n, agent_id_prefix])
-        if since is not None:
-            clauses.append("revoked_at >= ?")
-            params.append(since)
-        if until is not None:
-            clauses.append("revoked_at <= ?")
-            params.append(until)
-        for column, value in (("prompt_id", prompt_id), ("rule_kind", rule_kind), ("cause", cause)):
-            if value is not None:
-                clauses.append(f"{column} = ?")  # column names are the constants above
-                params.append(value)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        # Empty prefix means "no prefix filter" (same as before).
+        prefix = agent_id_prefix or None
         # id DESC = commit order (writes are serialized); revoked_at is informational.
         fetched = conn.execute(
-            "SELECT revoked_at AS ts, prompt_id, approver_agent_id, rule_kind, rule_id, "  # noqa: S608
+            "SELECT revoked_at AS ts, prompt_id, approver_agent_id, rule_kind, rule_id, "
             "rule_text, rule_agent_id, cwd_prefix, reason, cause, rule_prompt_id "
-            f"FROM rule_revocations {where} ORDER BY id DESC LIMIT ?",
-            [*params, limit + 1],
+            "FROM rule_revocations "
+            "WHERE (?1 IS NULL OR approver_agent_id = ?1 OR rule_agent_id = ?1) "
+            "AND (?2 IS NULL OR substr(approver_agent_id, 1, length(?2)) = ?2 "
+            "OR substr(rule_agent_id, 1, length(?2)) = ?2) "
+            "AND (?3 IS NULL OR revoked_at >= ?3) "
+            "AND (?4 IS NULL OR revoked_at <= ?4) "
+            "AND (?5 IS NULL OR prompt_id = ?5) "
+            "AND (?6 IS NULL OR rule_kind = ?6) "
+            "AND (?7 IS NULL OR cause = ?7) "
+            "ORDER BY id DESC LIMIT ?8",
+            (agent_id, prefix, since, until, prompt_id, rule_kind, cause, limit + 1),
         ).fetchall()
         rows = [dict(r) for r in fetched[:limit]]
         return {"rows": rows, "count": len(rows), "truncated": len(fetched) > limit}

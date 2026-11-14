@@ -278,6 +278,34 @@ def test_audit_revocations_prompt_id_and_rule_kind(db: Persistence, tmp_path: Pa
     assert [r["rule_text"] for r in both["rows"]] == ["myverb"]
 
 
+def test_audit_revocations_combined_prefix_cause_since(db: Persistence, tmp_path: Path) -> None:
+    ps = _seed_revocations(db, tmp_path)
+    past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+
+    hit = db.audit_query(
+        mode="revocations", agent_id_prefix="work", cause="deny", since=past, limit=10
+    )
+    assert hit["count"] == 2  # p1's rules owned by "worker" (its third rule is another agent's)
+    assert {r["prompt_id"] for r in hit["rows"]} == {ps["p1"]}
+    assert (
+        db.audit_query(mode="revocations", agent_id_prefix="work", cause="deny", since=future)[
+            "count"
+        ]
+        == 0
+    )
+    assert (
+        db.audit_query(mode="revocations", agent_id_prefix="work", cause="replaced", since=past)[
+            "count"
+        ]
+        == 0
+    )
+    assert (
+        db.audit_query(mode="revocations", agent_id_prefix="bo", cause="deny", since=past)["count"]
+        == 1
+    )
+
+
 def test_audit_revocations_limit_truncates(db: Persistence, tmp_path: Path) -> None:
     _seed_revocations(db, tmp_path)
 
