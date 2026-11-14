@@ -176,16 +176,20 @@ class AuditRequest(BaseModel):
     until: str | None = None
     decision: str | None = None
     flagged_only: bool = False
-    mode: Literal["rows", "summary"] = "rows"
+    mode: Literal["rows", "summary", "revocations"] = "rows"
     limit: int = 100
+    # mode="revocations" only (issue #100); ignored with a note in other modes.
+    prompt_id: str | None = None
+    rule_kind: Literal["template", "template_global", "verb"] | None = None
 
 
 class AuditResponse(BaseModel):
-    mode: Literal["rows", "summary"]
+    mode: Literal["rows", "summary", "revocations"]
     count: int
     truncated: bool
     rows: list[dict] | None = None
     summary: list[dict] | None = None
+    revocations: int | None = None  # summary mode: rule revocations in the window
     notes: list[str] = Field(default_factory=list)
 
 

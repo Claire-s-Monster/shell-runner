@@ -441,15 +441,26 @@ the tool after the server is updated.
 | `since` / `until` | ISO-8601 or relative (`30m`, `24h`, `7d`, `2w`) |
 | `decision` | exact match, e.g. `executed`, `denied`, `prompt_required` |
 | `flagged_only` | only flagged calls; needs a `flagged` column, otherwise ignored with a note in `notes` |
-| `mode` | `rows` (default) or `summary` |
-| `limit` | default 100, capped at 1000 (rows, or agents in summary mode) |
+| `mode` | `rows` (default), `summary` or `revocations` |
+| `prompt_id` / `rule_kind` | `revocations` mode only (`template`, `template_global`, `verb`); ignored with a note in other modes |
+| `limit` | default 100, capped at 1000 (rows, agents in summary mode, or revocations) |
 
 `rows` returns `ts, agent_id, cwd, raw_cmd, command_tier, final_tier, decision,
 matched_rule_category, matched_rule_pattern, exit_code` plus `approver_agent_id`
 and `approve_decision` from the decided prompt with the same
 agent_id + raw_cmd + cwd whose lifetime covers the call (null if none).
 `summary` returns per `agent_id`: `total_calls`, `by_decision`, `denied_count`,
-`prompt_count`, `first_ts`, `last_ts`.
+`prompt_count`, `first_ts`, `last_ts`, plus a top-level `revocations` count for
+the `since`/`until` window.
+
+**Revocation audit.** When a deny (or any later re-decision) removes the
+template/verb rules a prompt created, one `rule_revocations` row is written per
+removed rule in the same transaction, so a failed audit insert leaves the rules
+in place. `mode=revocations` returns them newest first: `ts`, `prompt_id`,
+`approver_agent_id`, `rule_kind`, `rule_id`, `rule_text`, `rule_agent_id`,
+`cwd_prefix`, `reason` (the `reason` given to `shell_approve_pending`). There,
+`agent_id` / `agent_id_prefix` match the approver or the rule's agent. These
+rows are never purged by retention.
 
 ## Rules files
 

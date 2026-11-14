@@ -194,8 +194,13 @@ TOOLS: dict[str, dict[str, Any]] = {
             "command_tier, final_tier, decision, matched_rule_category, matched_rule_pattern, "
             "exit_code, plus approver_agent_id/approve_decision when a decided prompt matches "
             "the same agent_id+raw_cmd+cwd within its lifetime. mode='summary' returns, per "
-            "agent_id: total_calls, by_decision, denied_count, prompt_count, first_ts, last_ts. "
-            "All filters are optional and combine with AND. since/until take ISO-8601 or a "
+            "agent_id: total_calls, by_decision, denied_count, prompt_count, first_ts, last_ts, "
+            "plus a top-level `revocations` count for the window. mode='revocations' lists, "
+            "newest first, the reusable rules (template, template_global, verb) removed when a "
+            "prompt was denied or re-decided: ts, prompt_id, approver_agent_id, rule_kind, "
+            "rule_id, rule_text, rule_agent_id, cwd_prefix, reason; there agent_id/"
+            "agent_id_prefix match the approver or the rule's agent, and prompt_id/rule_kind "
+            "filter (ignored with a note in other modes). All filters are optional and combine with AND. since/until take ISO-8601 or a "
             "relative age ('30m', '24h', '7d', '2w'). decision is an exact match, e.g. "
             "executed|denied|prompt_required|running|observed_externally. flagged_only "
             "applies only if the database has a 'flagged' column; otherwise it is ignored "
@@ -230,8 +235,17 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["rows", "summary"],
+                    "enum": ["rows", "summary", "revocations"],
                     "default": "rows",
+                },
+                "prompt_id": {
+                    "type": ["string", "null"],
+                    "description": "mode=revocations only: exact prompt id",
+                },
+                "rule_kind": {
+                    "type": ["string", "null"],
+                    "enum": ["template", "template_global", "verb", None],
+                    "description": "mode=revocations only: kind of revoked rule",
                 },
                 "limit": {
                     "type": "integer",
