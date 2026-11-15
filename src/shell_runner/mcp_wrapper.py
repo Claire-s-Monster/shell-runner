@@ -192,7 +192,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             "Read-only audit query over the shell_calls log, to measure agent behaviour. "
             "mode='rows' (default) returns newest-first rows: ts, agent_id, cwd, raw_cmd, "
             "command_tier, final_tier, decision, matched_rule_category, matched_rule_pattern, "
-            "exit_code, plus approver_agent_id/approve_decision when a decided prompt matches "
+            "exit_code, approval_rule_kind/approval_rule_id/approval_rule_text/"
+            "approval_rule_outcome (the template/verb rule that promoted the call, or that "
+            "matched but was blocked by a changed runner manifest; text is a snapshot), "
+            "plus approver_agent_id/approve_decision when a decided prompt matches "
             "the same agent_id+raw_cmd+cwd within its lifetime. mode='summary' returns, per "
             "agent_id: total_calls, by_decision, denied_count, prompt_count, first_ts, last_ts, "
             "plus a top-level `revocations` count for the window. mode='revocations' lists, "
@@ -235,6 +238,16 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "boolean",
                     "default": False,
                     "description": "Only flagged calls (needs a 'flagged' column; else ignored)",
+                },
+                "approval_rule_kind": {
+                    "type": ["string", "null"],
+                    "enum": ["template", "template_global", "verb", None],
+                    "description": "Only calls promoted by this kind of reusable rule",
+                },
+                "approval_rule_outcome": {
+                    "type": ["string", "null"],
+                    "enum": ["honoured", "manifest_not_approved", None],
+                    "description": "Only calls whose matching rule was honoured / manifest-blocked",
                 },
                 "mode": {
                     "type": "string",

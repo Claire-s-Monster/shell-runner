@@ -173,6 +173,16 @@ class SegmentClassification:
 
 
 @dataclass(frozen=True)
+class ApprovalRuleMatch:
+    """The reusable approval rule behind a promotion (issue #104), as telemetry records it."""
+
+    kind: str  # 'template' | 'template_global' | 'verb'
+    rule_id: int
+    text: str  # snapshot of the template, or 'verb @ cwd_prefix' (ids change on replace)
+    outcome: str  # 'honoured' | 'manifest_not_approved'
+
+
+@dataclass(frozen=True)
 class ClassificationResult:
     """Final classification result including agent cap application."""
 
@@ -196,6 +206,9 @@ class ClassificationResult:
     script_unpinnable: bool = False
     # the command left after folding a leading `cd DIR &&` (what `segments` describes)
     folded_command: str | None = None
+    # issue #104: the template/verb rule that promoted the command (outcome 'honoured') or
+    # that matched it but was blocked by a changed runner manifest ('manifest_not_approved')
+    approval_rule: ApprovalRuleMatch | None = None
 
     @property
     def protected_path_json(self) -> str | None:

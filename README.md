@@ -446,6 +446,7 @@ the tool after the server is updated.
 | `since` / `until` | ISO-8601 or relative (`30m`, `24h`, `7d`, `2w`) |
 | `decision` | exact match, e.g. `executed`, `denied`, `prompt_required`; ignored with a note in `revocations` mode |
 | `flagged_only` | only flagged calls; needs a `flagged` column, otherwise ignored with a note in `notes`; ignored with a note in `revocations` mode |
+| `approval_rule_kind` / `approval_rule_outcome` | exact match on the rule columns below (`template`, `template_global`, `verb`; `honoured`, `manifest_not_approved`); `rows` and `summary` modes |
 | `mode` | `rows` (default), `summary` or `revocations` |
 | `prompt_id` / `rule_kind` / `cause` | `revocations` mode only; `rule_kind` is `template`, `template_global` or `verb`; `cause` is `deny`, `approve_once`, `approve_template`, `approve_template_global`, `approve_verb` or `replaced`; ignored with a note in other modes |
 | `limit` | default 100, capped at 1000 (rows, agents in summary mode, or revocations) |
@@ -454,6 +455,12 @@ the tool after the server is updated.
 matched_rule_category, matched_rule_pattern, exit_code` plus `approver_agent_id`
 and `approve_decision` from the decided prompt with the same
 agent_id + raw_cmd + cwd whose lifetime covers the call (null if none).
+`rows` also returns `approval_rule_kind`, `approval_rule_id`, `approval_rule_text`
+and `approval_rule_outcome`: the reusable template/verb rule that promoted the call
+(`honoured`), or that matched but was blocked because the runner manifest changed
+(`manifest_not_approved`, on the `prompt_required` row). The text is a snapshot (verb
+rules: `verb @ cwd_prefix`) because rule ids change when a rule is replaced; all four
+are null for calls no reusable rule touched.
 `summary` returns per `agent_id`: `total_calls`, `by_decision`, `denied_count`,
 `prompt_count`, `first_ts`, `last_ts`, plus a top-level `revocations` count for
 the `since`/`until` window.

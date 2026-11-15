@@ -36,6 +36,7 @@ from . import executor, monitor, path_guard, restart, script_pin
 from .catalog import Tier, all_rules
 from .classifier import (
     PERMISSIVENESS,
+    ApprovalRuleMatch,
     ClassificationResult,
     _cap_permissiveness,
     classify,
@@ -87,6 +88,7 @@ from .persistence import (
     Persistence,
     PromotionRule,
     PromptClosedError,
+    RuleMatch,
     TelemetryWriter,
     parse_time_bound,
 )
@@ -220,6 +222,23 @@ class _UnpinnableManifestError(Exception):
     """The runner's manifest cannot be pinned: no runner rule may be honoured."""
 
 
+def _approval_rule(match: RuleMatch, outcome: str) -> ApprovalRuleMatch | None:
+    """The telemetry record of the rule row behind ``match`` (None: no row identified)."""
+    if match.kind is None or match.rule_id is None or match.snapshot is None:
+        return None
+    return ApprovalRuleMatch(match.kind, match.rule_id, match.snapshot, outcome)
+
+
+def _rule_columns(rule: ApprovalRuleMatch | None) -> dict[str, Any]:
+    """shell_calls approval_rule_* column values (all None without a rule)."""
+    return {
+        "approval_rule_kind": rule.kind if rule else None,
+        "approval_rule_id": rule.rule_id if rule else None,
+        "approval_rule_text": rule.text if rule else None,
+        "approval_rule_outcome": rule.outcome if rule else None,
+    }
+
+
 def _apply_template_approval(
     cls: ClassificationResult,
     agent_id: str,
@@ -294,7 +313,7 @@ def _apply_template_approval(
         # 2. Exact-template promotion first.
         match = db.match_template_approval(cls.template, agent_id, manifest)
         promotion_label = "approved_template"
-        manifest_blocked = match.manifest_blocked
+        first_blocked = match if match.manifest_blocked else None
 
         # 3. Verb + cwd-prefix promotion only when exact-template misses.
         if match.tier is None:
@@ -302,15 +321,17 @@ def _apply_template_approval(
             if verb:
                 match = db.match_verb_approval(verb, cwd, agent_id, manifest)
                 promotion_label = "approved_verb"
-                manifest_blocked = manifest_blocked or match.manifest_blocked
+                first_blocked = first_blocked or (match if match.manifest_blocked else None)
     except _UnpinnableManifestError:
         return cls
 
     approved_int = match.tier
     if approved_int is None:
-        if manifest_blocked:
+        if first_blocked is not None:
             return dataclasses.replace(
-                cls, decision_path=(*cls.decision_path, RUNNER_MANIFEST_NOT_APPROVED)
+                cls,
+                decision_path=(*cls.decision_path, RUNNER_MANIFEST_NOT_APPROVED),
+                approval_rule=_approval_rule(first_blocked, "manifest_not_approved"),
             )
         return cls
 
@@ -335,6 +356,7 @@ def _apply_template_approval(
         tier=new_final_tier,
         command_tier=approved_tier,
         decision_path=tuple(new_path),
+        approval_rule=_approval_rule(match, "honoured"),
     )
 
 
@@ -498,6 +520,7 @@ async def _prewrite_inline_budget_telemetry(
     duration_ms: int,
     protected_path_match: str | None = None,
     flagged: int = 0,
+    approval_rule: ApprovalRuleMatch | None = None,
 ) -> None:
     """Write the shell_calls row for telemetry_id BEFORE a call to
     _run_with_inline_budget may reach execute_background() (issue #46).
@@ -538,6 +561,7 @@ async def _prewrite_inline_budget_telemetry(
             normalizer_warnings=[],
             protected_path_match=protected_path_match,
             flagged=flagged,
+            **_rule_columns(approval_rule),
             wait=True,
         )
     else:
@@ -561,6 +585,7 @@ async def _prewrite_inline_budget_telemetry(
             normalizer_warnings=[],
             protected_path_match=protected_path_match,
             flagged=flagged,
+            **_rule_columns(approval_rule),
         )
     if catalog_writer is not None:
         await catalog_writer.submit(
@@ -869,6 +894,7 @@ class _DispatchContext:
     protected_path_match: str | None
     flagged: int
     approval_id: str | None = None  # consumed pending_prompts row, restored on a cap refusal
+    approval_rule: ApprovalRuleMatch | None = None  # template/verb rule that promoted it (#104)
 
 
 def _detach_cap_error(cap: int) -> HTTPException:
@@ -927,6 +953,7 @@ async def _dispatch_approved(
             "normalizer_warnings": list(ctx.normalizer_warnings),
             "protected_path_match": ctx.protected_path_match,
             "flagged": ctx.flagged,
+            **_rule_columns(ctx.approval_rule),
         }
 
     async def _record(telemetry_id: str, row: dict, *, wait: bool = False) -> None:
@@ -1062,6 +1089,7 @@ async def _dispatch_approved(
             duration_ms=int((time.monotonic() - t0) * 1000),
             protected_path_match=ctx.protected_path_match,
             flagged=ctx.flagged,
+            approval_rule=ctx.approval_rule,
         )
 
     exec_result, diverted_job_id = await _run_with_inline_budget(req=req, telemetry_id=telemetry_id)
@@ -1295,6 +1323,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 normalizer_warnings=list(cls.normalizer_warnings),
                 protected_path_match=cls.protected_path_json,
                 flagged=int(cls.flagged),
+                approval_rule=cls.approval_rule,
             ),
             telemetry_writer,
             catalog_writer,
@@ -1353,6 +1382,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 normalizer_warnings=list(cls.normalizer_warnings),
                 protected_path_match=cls.protected_path_json,
                 flagged=int(cls.flagged),
+                **_rule_columns(cls.approval_rule),
             )
         else:
             await asyncio.to_thread(
@@ -1375,6 +1405,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 normalizer_warnings=list(cls.normalizer_warnings),
                 protected_path_match=cls.protected_path_json,
                 flagged=int(cls.flagged),
+                **_rule_columns(cls.approval_rule),
             )
         return ExecuteResponse(
             decision="denied",
@@ -1426,6 +1457,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             normalizer_warnings=list(cls.normalizer_warnings),
             protected_path_match=cls.protected_path_json,
             flagged=int(cls.flagged),
+            **_rule_columns(cls.approval_rule),
         )
     else:
         await asyncio.to_thread(
@@ -1448,6 +1480,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             normalizer_warnings=list(cls.normalizer_warnings),
             protected_path_match=cls.protected_path_json,
             flagged=int(cls.flagged),
+            **_rule_columns(cls.approval_rule),
         )
     why = (
         f"command tier={cls.command_tier.name} after agent_cap={cls.agent_cap.name}"
@@ -1865,6 +1898,8 @@ async def audit_route(body: AuditRequest) -> AuditResponse:
         until=until,
         decision=body.decision,
         flagged_only=body.flagged_only,
+        approval_rule_kind=body.approval_rule_kind,
+        approval_rule_outcome=body.approval_rule_outcome,
         mode=body.mode,
         limit=body.limit,
         prompt_id=body.prompt_id,

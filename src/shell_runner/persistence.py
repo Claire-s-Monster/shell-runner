@@ -47,6 +47,19 @@ class RuleMatch:
 
     tier: int | None
     manifest_blocked: bool = False
+    # The rule row that decided the outcome (issue #104): the row that supplied ``tier``,
+    # or, when none was honoured, the first row blocked by its manifest. None: no row.
+    kind: str | None = None  # 'template' | 'template_global' | 'verb'
+    rule_id: int | None = None
+    text: str | None = None  # template, or verb
+    cwd_prefix: str | None = None  # verb rules only
+
+    @property
+    def snapshot(self) -> str | None:
+        """Rule text as stored in shell_calls.approval_rule_text (ids change on replace)."""
+        if self.text is None or self.cwd_prefix is None:
+            return self.text
+        return f"{self.text} @ {self.cwd_prefix}"
 
 
 CurrentPins = Mapping[str, str] | Callable[[], Mapping[str, str] | None] | None
@@ -156,7 +169,11 @@ CREATE TABLE IF NOT EXISTS shell_calls (
     decision_path_json TEXT,
     normalizer_warnings_json TEXT,
     protected_path_match TEXT,
-    flagged INTEGER NOT NULL DEFAULT 0
+    flagged INTEGER NOT NULL DEFAULT 0,
+    approval_rule_kind TEXT,
+    approval_rule_id INTEGER,
+    approval_rule_text TEXT,
+    approval_rule_outcome TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_shell_calls_ts ON shell_calls(ts);
@@ -327,6 +344,11 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # issue #98: runner manifest hashes a reusable rule is bound to (JSON; NULL = none/legacy)
     ("template_approvals", "manifest_pins", "TEXT"),
     ("verb_approvals", "manifest_pins", "TEXT"),
+    # issue #104: the template/verb rule that promoted (or was blocked for) the call
+    ("shell_calls", "approval_rule_kind", "TEXT"),
+    ("shell_calls", "approval_rule_id", "INTEGER"),
+    ("shell_calls", "approval_rule_text", "TEXT"),
+    ("shell_calls", "approval_rule_outcome", "TEXT"),
 )
 
 JOB_KINDS = frozenset({"process", "monitor", "unit"})
@@ -404,9 +426,19 @@ MAX_AUDIT_LIMIT = 1000
 # (another change adds these columns), so supporting a new one is one line here.
 OPTIONAL_AUDIT_FILTERS: dict[str, tuple[str, str]] = {
     "flagged_only": ("flagged", "c.flagged = 1"),
+    # issue #104: exact-match filters (one bound parameter each)
+    "approval_rule_kind": ("approval_rule_kind", "c.approval_rule_kind = ?"),
+    "approval_rule_outcome": ("approval_rule_outcome", "c.approval_rule_outcome = ?"),
 }
 # Optional shell_calls columns echoed in audit rows when the database has them.
-OPTIONAL_AUDIT_COLUMNS: tuple[str, ...] = ("protected_path_match", "flagged")
+OPTIONAL_AUDIT_COLUMNS: tuple[str, ...] = (
+    "protected_path_match",
+    "flagged",
+    "approval_rule_kind",
+    "approval_rule_id",
+    "approval_rule_text",
+    "approval_rule_outcome",
+)
 
 _RELATIVE_RE = re.compile(r"^\s*(\d+)\s*([smhdw])\s*$", re.IGNORECASE)
 _RELATIVE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
@@ -534,6 +566,10 @@ class Persistence:
         call_id: str | None = None,
         protected_path_match: str | None = None,
         flagged: int = 0,
+        approval_rule_kind: str | None = None,
+        approval_rule_id: int | None = None,
+        approval_rule_text: str | None = None,
+        approval_rule_outcome: str | None = None,
     ) -> str:
         telemetry_id = call_id if call_id is not None else str(uuid.uuid4())
         ts = _now_utc()
@@ -546,8 +582,10 @@ class Persistence:
                     matched_rule_pattern, matched_rule_category,
                     exit_code, output_bytes_stdout, output_bytes_stderr,
                     duration_ms, decision_path_json, normalizer_warnings_json,
-                    protected_path_match, flagged
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    protected_path_match, flagged,
+                    approval_rule_kind, approval_rule_id, approval_rule_text,
+                    approval_rule_outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telemetry_id,
@@ -569,6 +607,10 @@ class Persistence:
                     json.dumps(normalizer_warnings),
                     protected_path_match,
                     flagged,
+                    approval_rule_kind,
+                    approval_rule_id,
+                    approval_rule_text,
+                    approval_rule_outcome,
                 ),
             )
         return telemetry_id
@@ -1408,32 +1450,46 @@ class Persistence:
         command has no runner manifest). A row whose manifest_pins do not cover it is
         skipped, so a global row that is not honoured falls through to the agent row.
         """
-        blocked = False
+        first_blocked: RuleMatch | None = None
         with self._conn() as conn:
-            for scoped in (
-                conn.execute(
-                    """
-                    SELECT approved_tier, manifest_pins FROM template_approvals
-                    WHERE template = ? AND agent_id IS NULL
-                    ORDER BY approved_at DESC LIMIT 1
-                    """,
-                    (template,),
-                ).fetchone(),
-                conn.execute(
-                    """
-                    SELECT approved_tier, manifest_pins FROM template_approvals
-                    WHERE template = ? AND agent_id = ?
-                    ORDER BY approved_at DESC LIMIT 1
-                    """,
-                    (template, agent_id),
-                ).fetchone(),
+            for kind, scoped in (
+                (
+                    "template_global",
+                    conn.execute(
+                        """
+                        SELECT id, approved_tier, manifest_pins FROM template_approvals
+                        WHERE template = ? AND agent_id IS NULL
+                        ORDER BY approved_at DESC LIMIT 1
+                        """,
+                        (template,),
+                    ).fetchone(),
+                ),
+                (
+                    "template",
+                    conn.execute(
+                        """
+                        SELECT id, approved_tier, manifest_pins FROM template_approvals
+                        WHERE template = ? AND agent_id = ?
+                        ORDER BY approved_at DESC LIMIT 1
+                        """,
+                        (template, agent_id),
+                    ).fetchone(),
+                ),
             ):
                 if scoped is None:
                     continue
                 if _pins_honoured(scoped["manifest_pins"], manifest_pins):
-                    return RuleMatch(int(scoped["approved_tier"]))
-                blocked = True
-        return RuleMatch(None, blocked)
+                    return RuleMatch(
+                        int(scoped["approved_tier"]),
+                        kind=kind,
+                        rule_id=int(scoped["id"]),
+                        text=template,
+                    )
+                if first_blocked is None:
+                    first_blocked = RuleMatch(
+                        None, True, kind=kind, rule_id=int(scoped["id"]), text=template
+                    )
+        return first_blocked or RuleMatch(None)
 
     def create_verb_approval(
         self,
@@ -1574,14 +1630,15 @@ class Persistence:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT cwd_prefix, approved_tier, manifest_pins FROM verb_approvals
+                SELECT id, cwd_prefix, approved_tier, manifest_pins FROM verb_approvals
                 WHERE verb = ? AND (agent_id = ? OR agent_id IS NULL)
                 """,
                 (verb, agent_id),
             ).fetchall()
 
         best: int | None = None
-        blocked = False
+        best_row: sqlite3.Row | None = None
+        blocked_row: sqlite3.Row | None = None
         for row in rows:
             prefix = Path(os.path.realpath(row["cwd_prefix"]))
             try:
@@ -1591,12 +1648,29 @@ class Persistence:
             if not within:
                 continue
             if not _pins_honoured(row["manifest_pins"], manifest_pins):
-                blocked = True
+                blocked_row = blocked_row or row
                 continue
             tier = int(row["approved_tier"])
             if best is None or tier > best:
-                best = tier
-        return RuleMatch(best, blocked and best is None)
+                best, best_row = tier, row
+        if best_row is not None:
+            return RuleMatch(
+                best,
+                kind="verb",
+                rule_id=int(best_row["id"]),
+                text=verb,
+                cwd_prefix=best_row["cwd_prefix"],
+            )
+        if blocked_row is not None:
+            return RuleMatch(
+                None,
+                True,
+                kind="verb",
+                rule_id=int(blocked_row["id"]),
+                text=verb,
+                cwd_prefix=blocked_row["cwd_prefix"],
+            )
+        return RuleMatch(None)
 
     def find_similar_approved_templates(
         self,
@@ -1979,8 +2053,13 @@ class Persistence:
         prompt_id: str | None = None,
         rule_kind: str | None = None,
         cause: str | None = None,
+        approval_rule_kind: str | None = None,
+        approval_rule_outcome: str | None = None,
     ) -> dict[str, Any]:
         """Read-only audit view of shell_calls (parameterized SQL only).
+
+        approval_rule_kind / approval_rule_outcome (issue #104) filter shell_calls on the
+        reusable rule that promoted the call (exact match; not for mode="revocations").
 
         mode="revocations" instead lists rule_revocations (issue #100), newest
         first (commit order); agent_id/agent_id_prefix then match the approver
@@ -2001,6 +2080,8 @@ class Persistence:
             for name, supplied in (
                 ("decision", decision is not None),
                 ("flagged_only", flagged_only),
+                ("approval_rule_kind", approval_rule_kind is not None),
+                ("approval_rule_outcome", approval_rule_outcome is not None),
             ):
                 if supplied:
                     notes.append(f"{name} ignored: it does not apply to mode='revocations'.")
@@ -2054,6 +2135,18 @@ class Persistence:
                         f"flagged_only ignored: shell_calls has no '{column}' column in this "
                         "database, so no rows are flagged and the filter was not applied."
                     )
+            for flag, value in (
+                ("approval_rule_kind", approval_rule_kind),
+                ("approval_rule_outcome", approval_rule_outcome),
+            ):
+                if value is None:
+                    continue
+                column, condition = OPTIONAL_AUDIT_FILTERS[flag]
+                if column in cols:
+                    clauses.append(condition)
+                    params.append(value)
+                else:
+                    notes.append(f"{flag} ignored: shell_calls has no '{column}' column.")
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             if mode == "summary":
                 result = self._audit_summary(conn, where, params, limit)
