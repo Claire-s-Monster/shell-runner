@@ -1289,6 +1289,44 @@ class ScriptPin:
         return UNPINNABLE if UNREADABLE in self.paths.values() else self.sha256
 
 
+def _hash_refs(refs: list[ScriptRef], cwd: str) -> tuple[dict[str, str], bool] | None:
+    """Hash every candidate path of `refs`: (paths, ok), or None when over the file/byte caps."""
+    paths: dict[str, str] = {}
+    budget = [MAX_TOTAL_BYTES]
+    ok = True
+    for ref in refs:
+        candidates = _ref_paths(ref, cwd)
+        for path in candidates:
+            if path not in paths:
+                if len(paths) >= MAX_FILES:
+                    return None
+                paths[path] = _file_sha256(path, budget)
+        if ref.required and all(paths[p] in _UNHASHED for p in candidates):
+            ok = False
+    if _OVER_BUDGET in paths.values():
+        return None
+    return paths, ok
+
+
+def manifest_pins(command: str, cwd: str) -> dict[str, str] | None | str:
+    """Current content of the runner manifest(s) `command` depends on (issue #98).
+
+    {realpath: sha256|missing|unreadable} over the manifest refs only (make, pixi run,
+    ... ; ScriptRef.script is False). None when the command has no runner manifest;
+    UNPINNABLE when it cannot be pinned (an unreadable manifest counts as that).
+    """
+    plan = analyze(command, cwd)
+    if plan.unpinnable:
+        return UNPINNABLE
+    refs = [r for r in plan.refs if not r.script]
+    if not refs:
+        return None
+    hashed = _hash_refs(refs, cwd)
+    if hashed is None or UNREADABLE in hashed[0].values():
+        return UNPINNABLE
+    return hashed[0] or None
+
+
 def compute_pin(command: str, cwd: str) -> ScriptPin | None:
     """Pin the script(s) `command` runs; None if it runs none.
 
@@ -1297,24 +1335,12 @@ def compute_pin(command: str, cwd: str) -> ScriptPin | None:
     sorted (realpath, sha256) pairs, so a missing path that is created later changes it.
     """
     plan = analyze(command, cwd)
-    if plan.unpinnable:
+    if plan.unpinnable or not plan.refs:
+        return ScriptPin(UNPINNABLE, {}, ok=False) if plan.unpinnable else None
+    hashed = _hash_refs(plan.refs, cwd)
+    if hashed is None:
         return ScriptPin(UNPINNABLE, {}, ok=False)
-    if not plan.refs:
-        return None
-    paths: dict[str, str] = {}
-    budget = [MAX_TOTAL_BYTES]
-    ok = True
-    for ref in plan.refs:
-        candidates = _ref_paths(ref, cwd)
-        for path in candidates:
-            if path not in paths:
-                if len(paths) >= MAX_FILES:
-                    return ScriptPin(UNPINNABLE, {}, ok=False)
-                paths[path] = _file_sha256(path, budget)
-        if ref.required and all(paths[p] in _UNHASHED for p in candidates):
-            ok = False
-    if _OVER_BUDGET in paths.values():
-        return ScriptPin(UNPINNABLE, {}, ok=False)
+    paths, ok = hashed
     if not paths:
         return None
     only = next(iter(paths.values()))

@@ -10,7 +10,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -37,6 +37,59 @@ class PromotionRule:
     approved_tier: int
     approved_by: str | None = None
     cwd_prefix: str | None = None
+
+
+@dataclass(frozen=True)
+class RuleMatch:
+    """Outcome of a rule lookup: the tier of the honoured rows (None if none), and whether
+    a rule matched the command but was not honoured because the runner manifest differs
+    from the one it was approved for (issue #98)."""
+
+    tier: int | None
+    manifest_blocked: bool = False
+
+
+CurrentPins = Mapping[str, str] | Callable[[], Mapping[str, str] | None] | None
+
+
+def _pins_honoured(stored: str | None, current: CurrentPins) -> bool:
+    """Whether a rule's stored manifest_pins (JSON) cover the current runner manifests.
+
+    ``current`` None: the command has no runner manifest, nothing to bind. A callable is
+    resolved lazily (only once a candidate row exists). Otherwise the
+    rule needs a map holding every current manifest path with an identical value; a
+    legacy rule (NULL map) never covers a runner command.
+    """
+    if callable(current):
+        current = current()
+    if current is None:
+        return True
+    if stored is None:
+        return False
+    try:
+        pinned = json.loads(stored)
+    except ValueError:
+        return False
+    return isinstance(pinned, dict) and all(pinned.get(p) == h for p, h in current.items())
+
+
+def _merge_pins(old: str | None, new: str | None) -> str | None:
+    """Map of a replacing rule: the old map updated with the new entries (new hash wins).
+
+    A non-runner rule (new is None) keeps NULL.
+    """
+    if new is None:
+        return None
+    merged: dict[str, str] = {}
+    if old is not None:
+        try:
+            loaded = json.loads(old)
+        except ValueError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            merged.update(loaded)
+    merged.update(json.loads(new))
+    return json.dumps(merged, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -172,7 +225,8 @@ CREATE TABLE IF NOT EXISTS template_approvals (
     approved_tier INTEGER NOT NULL,
     approved_at TEXT NOT NULL,
     approved_via_prompt_id TEXT,
-    approved_by TEXT
+    approved_by TEXT,
+    manifest_pins TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_template_approvals_unique
@@ -188,7 +242,8 @@ CREATE TABLE IF NOT EXISTS verb_approvals (
     approved_tier INTEGER NOT NULL,
     approved_at TEXT NOT NULL,
     approved_via_prompt_id TEXT,
-    approved_by TEXT
+    approved_by TEXT,
+    manifest_pins TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_verb_approvals_unique
@@ -269,6 +324,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # issue #95: content pin of the script file(s) the command runs (NULL = none/unpinned)
     ("pending_prompts", "script_sha256", "TEXT"),
     ("pending_prompts", "script_paths", "TEXT"),
+    # issue #98: runner manifest hashes a reusable rule is bound to (JSON; NULL = none/legacy)
+    ("template_approvals", "manifest_pins", "TEXT"),
+    ("verb_approvals", "manifest_pins", "TEXT"),
 )
 
 JOB_KINDS = frozenset({"process", "monitor", "unit"})
@@ -756,7 +814,7 @@ class Persistence:
             now_dt = datetime.now(UTC)
             now = now_dt.isoformat()
             row = conn.execute(
-                "SELECT id, approve_decision, consumed_at, expires_at, created_at "
+                "SELECT id, approve_decision, consumed_at, expires_at, created_at, script_paths "
                 "FROM pending_prompts WHERE id = ?",
                 (prompt_id,),
             ).fetchone()
@@ -840,7 +898,13 @@ class Persistence:
                     (token, decision, now, new_expires_at, approver_agent_id, prompt_id),
                 )
             revoked = self._revoke_rules_for_prompt(conn, ctx)
-            rule_id = self._apply_rule(conn, rule, prompt_id, ctx) if rule is not None else None
+            # issue #98: the rule binds to the runner manifests the approver saw (the
+            # prompt's own pin: a promotable runner command only has manifest refs).
+            rule_id = (
+                self._apply_rule(conn, rule, prompt_id, ctx, row["script_paths"])
+                if rule is not None
+                else None
+            )
             self._record_decision(
                 conn, now, history, row["approve_decision"], "live", True, revoked
             )
@@ -987,6 +1051,7 @@ class Persistence:
         rule: PromotionRule,
         prompt_id: str,
         ctx: RevocationContext,
+        manifest_pins: str | None = None,
     ) -> int:
         if rule.kind == "verb":
             return self._insert_verb_approval(
@@ -998,6 +1063,7 @@ class Persistence:
                 approved_via_prompt_id=prompt_id,
                 approved_by=rule.approved_by,
                 audit=ctx,
+                manifest_pins=manifest_pins,
             )
         return self._insert_template_approval(
             conn,
@@ -1007,6 +1073,7 @@ class Persistence:
             approved_via_prompt_id=prompt_id,
             approved_by=rule.approved_by,
             audit=ctx,
+            manifest_pins=manifest_pins,
         )
 
     def consume_approve_token(self, *, token: str) -> dict | None:
@@ -1238,16 +1305,20 @@ class Persistence:
         approved_via_prompt_id: str | None,
         approved_by: str | None,
         audit: RevocationContext | None = None,
+        manifest_pins: str | None = None,
     ) -> int:
         """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT).
 
         With ``audit``, a rule displaced by the replace is recorded in
         rule_revocations (cause='replaced', issue #100) before it is deleted.
+        The replaced row's manifest_pins are merged into the new row (issue #98): the
+        new entries win, the rest are carried over, so the rule keeps covering the
+        runner manifests approved earlier.
         """
         scope_key = agent_id if agent_id is not None else ""
         old = conn.execute(
-            "SELECT id, template, agent_id, approved_via_prompt_id FROM template_approvals "
-            "WHERE template = ? AND COALESCE(agent_id, '') = ?",
+            "SELECT id, template, agent_id, approved_via_prompt_id, manifest_pins "
+            "FROM template_approvals WHERE template = ? AND COALESCE(agent_id, '') = ?",
             (template, scope_key),
         ).fetchone()
         if old is not None and audit is not None:
@@ -1273,10 +1344,18 @@ class Persistence:
             """
             INSERT INTO template_approvals
                 (template, agent_id, approved_tier, approved_at,
-                 approved_via_prompt_id, approved_by)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 approved_via_prompt_id, approved_by, manifest_pins)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (template, agent_id, approved_tier, _now_utc(), approved_via_prompt_id, approved_by),
+            (
+                template,
+                agent_id,
+                approved_tier,
+                _now_utc(),
+                approved_via_prompt_id,
+                approved_by,
+                _merge_pins(old["manifest_pins"] if old is not None else None, manifest_pins),
+            ),
         )
         row_id = cur.lastrowid
         if row_id is None:  # pragma: no cover - a successful INSERT always sets lastrowid
@@ -1311,33 +1390,50 @@ class Persistence:
                 inserted += 1
         return inserted
 
-    def get_template_approved_tier(self, template: str, agent_id: str) -> int | None:
+    def get_template_approved_tier(
+        self, template: str, agent_id: str, manifest_pins: Mapping[str, str] | None = None
+    ) -> int | None:
         """Get the most permissive approved tier for a template.
         Global approval (agent_id IS NULL) takes precedence over agent-specific.
-        Returns None if no approval exists.
+        Returns None if no (honoured) approval exists. See match_template_approval.
         """
+        return self.match_template_approval(template, agent_id, manifest_pins).tier
+
+    def match_template_approval(
+        self, template: str, agent_id: str, manifest_pins: CurrentPins = None
+    ) -> RuleMatch:
+        """Template lookup honouring runner manifest bindings (issue #98).
+
+        ``manifest_pins`` is the current runner manifest map of the command (None: the
+        command has no runner manifest). A row whose manifest_pins do not cover it is
+        skipped, so a global row that is not honoured falls through to the agent row.
+        """
+        blocked = False
         with self._conn() as conn:
-            # Global first
-            row = conn.execute(
-                """
-                SELECT approved_tier FROM template_approvals
-                WHERE template = ? AND agent_id IS NULL
-                ORDER BY approved_at DESC LIMIT 1
-                """,
-                (template,),
-            ).fetchone()
-            if row is not None:
-                return int(row[0])
-            # Then agent-specific
-            row = conn.execute(
-                """
-                SELECT approved_tier FROM template_approvals
-                WHERE template = ? AND agent_id = ?
-                ORDER BY approved_at DESC LIMIT 1
-                """,
-                (template, agent_id),
-            ).fetchone()
-            return int(row[0]) if row is not None else None
+            for scoped in (
+                conn.execute(
+                    """
+                    SELECT approved_tier, manifest_pins FROM template_approvals
+                    WHERE template = ? AND agent_id IS NULL
+                    ORDER BY approved_at DESC LIMIT 1
+                    """,
+                    (template,),
+                ).fetchone(),
+                conn.execute(
+                    """
+                    SELECT approved_tier, manifest_pins FROM template_approvals
+                    WHERE template = ? AND agent_id = ?
+                    ORDER BY approved_at DESC LIMIT 1
+                    """,
+                    (template, agent_id),
+                ).fetchone(),
+            ):
+                if scoped is None:
+                    continue
+                if _pins_honoured(scoped["manifest_pins"], manifest_pins):
+                    return RuleMatch(int(scoped["approved_tier"]))
+                blocked = True
+        return RuleMatch(None, blocked)
 
     def create_verb_approval(
         self,
@@ -1382,16 +1478,19 @@ class Persistence:
         approved_via_prompt_id: str | None,
         approved_by: str | None,
         audit: RevocationContext | None = None,
+        manifest_pins: str | None = None,
     ) -> int:
         """Replace-and-insert on an already-open transaction (no BEGIN/COMMIT).
 
         With ``audit``, a rule displaced by the replace is recorded in
         rule_revocations (cause='replaced', issue #100) before it is deleted.
+        The replaced row's manifest_pins are merged into the new row (issue #98): the
+        new entries win, the rest are carried over.
         """
         scope_key = agent_id if agent_id is not None else ""
         old = conn.execute(
-            "SELECT id, verb, cwd_prefix, agent_id, approved_via_prompt_id FROM verb_approvals "
-            "WHERE verb = ? AND cwd_prefix = ? AND COALESCE(agent_id, '') = ?",
+            "SELECT id, verb, cwd_prefix, agent_id, approved_via_prompt_id, manifest_pins "
+            "FROM verb_approvals WHERE verb = ? AND cwd_prefix = ? AND COALESCE(agent_id, '') = ?",
             (verb, cwd_prefix, scope_key),
         ).fetchone()
         if old is not None and audit is not None:
@@ -1417,8 +1516,8 @@ class Persistence:
             """
             INSERT INTO verb_approvals
                 (verb, cwd_prefix, agent_id, approved_tier, approved_at,
-                 approved_via_prompt_id, approved_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 approved_via_prompt_id, approved_by, manifest_pins)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 verb,
@@ -1428,6 +1527,7 @@ class Persistence:
                 _now_utc(),
                 approved_via_prompt_id,
                 approved_by,
+                _merge_pins(old["manifest_pins"] if old is not None else None, manifest_pins),
             ),
         )
         row_id = cur.lastrowid
@@ -1435,7 +1535,23 @@ class Persistence:
             raise RuntimeError("INSERT did not produce a rowid")
         return row_id
 
-    def get_verb_approved_tier(self, verb: str, cwd: str, agent_id: str) -> int | None:
+    def get_verb_approved_tier(
+        self,
+        verb: str,
+        cwd: str,
+        agent_id: str,
+        manifest_pins: Mapping[str, str] | None = None,
+    ) -> int | None:
+        """Tier of the honoured verb rules containing `cwd`; see match_verb_approval."""
+        return self.match_verb_approval(verb, cwd, agent_id, manifest_pins).tier
+
+    def match_verb_approval(
+        self,
+        verb: str,
+        cwd: str,
+        agent_id: str,
+        manifest_pins: CurrentPins = None,
+    ) -> RuleMatch:
         """Get the most restrictive approved tier among verb+cwd-prefix approvals
         whose cwd_prefix contains `cwd`.
 
@@ -1449,18 +1565,23 @@ class Persistence:
         Returns the MAX approved_tier among matching rows (the most
         conservative one wins when multiple cwd_prefix/agent scopes overlap),
         or None if no row's cwd_prefix contains cwd.
+
+        Issue #98: rows whose manifest_pins do not cover the command's current runner
+        manifests (``manifest_pins``; None = no runner manifest) are dropped before the
+        MAX, and flag the result as manifest_blocked.
         """
         resolved_cwd = Path(os.path.realpath(cwd))
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT cwd_prefix, approved_tier FROM verb_approvals
+                SELECT cwd_prefix, approved_tier, manifest_pins FROM verb_approvals
                 WHERE verb = ? AND (agent_id = ? OR agent_id IS NULL)
                 """,
                 (verb, agent_id),
             ).fetchall()
 
         best: int | None = None
+        blocked = False
         for row in rows:
             prefix = Path(os.path.realpath(row["cwd_prefix"]))
             try:
@@ -1469,10 +1590,13 @@ class Persistence:
                 within = False
             if not within:
                 continue
+            if not _pins_honoured(row["manifest_pins"], manifest_pins):
+                blocked = True
+                continue
             tier = int(row["approved_tier"])
             if best is None or tier > best:
                 best = tier
-        return best
+        return RuleMatch(best, blocked and best is None)
 
     def find_similar_approved_templates(
         self,

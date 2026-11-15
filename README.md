@@ -392,11 +392,16 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   what an approved script does.
 - **Residual TOCTOU.** The hash is taken just before dispatch and the shell opens the
   file afterwards; a swap in that window is not detected.
-- **Runner rules are not content-bound.** `make`, `pixi run`, `uv run`, `npm run|test`
-  and `yarn`/`pnpm` run-style commands stay promotable: their template/verb approvals are
-  honoured as before. Their makefile / manifest is pinned only for one-shot
-  (`approve_once`) approvals; a runner that also runs a script (`uv run x.py`,
-  `pixi run bash x.sh`) is non-promotable.
+- **Runner rules are bound to the manifest they were approved for.** `make`, `pixi run`,
+  `uv run`, `npm run|test` and `yarn`/`pnpm` run-style commands stay promotable, but a
+  template/verb rule records the hashes of the makefile / manifest the approver saw
+  (`manifest_pins`). The rule is honoured only while the current manifest(s) match;
+  after an edit, or in another project, the command prompts again, and approving that
+  prompt with `approve_template`/`approve_verb` adds the new hash to the rule (the
+  earlier ones stay covered). Rules created before this change carry no hashes and need
+  one re-approval. A runner that also runs a script (`uv run x.py`, `pixi run bash x.sh`)
+  is non-promotable. Residual: the manifest is hashed at classification time, not at
+  dispatch (same TOCTOU window as above).
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 
