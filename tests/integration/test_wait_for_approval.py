@@ -172,7 +172,7 @@ def test_unanswered_prompt_past_ttl_is_expired(client: TestClient) -> None:
     assert waited["approve_token"] is None
 
 
-def test_approved_but_expired_prompt_withholds_token(client: TestClient) -> None:
+def test_approving_expired_prompt_is_refused_and_withholds_token(client: TestClient) -> None:
     pid = srv.db.create_pending_prompt(
         agent_id=AGENT,
         cwd="/tmp",
@@ -183,7 +183,11 @@ def test_approved_but_expired_prompt_withholds_token(client: TestClient) -> None
         decision_path=[],
         ttl_seconds=-1,
     )
-    _decide(client, pid, "approve_template")  # does not extend the TTL
+    resp = client.post(  # issue #96: a closed prompt can no longer be approved
+        "/approve_pending",
+        json={"prompt_id": pid, "decision": "approve_template", "approver_agent_id": "primary"},
+    )
+    assert resp.status_code == 409
     waited = _wait(client, pid)
     assert waited["state"] == "expired"
     assert waited["approve_token"] is None

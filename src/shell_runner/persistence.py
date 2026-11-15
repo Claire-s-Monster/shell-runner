@@ -56,6 +56,29 @@ class PromptDecision:
     token: str | None
     rule_id: int | None = None
     revoked_rules: int = 0
+    # False when the prompt row was left untouched (missing, or closed + deny; issue #96)
+    prompt_updated: bool = True
+    prompt_state: str = "live"  # 'live' | 'consumed' | 'expired' | 'missing'
+
+
+@dataclass(frozen=True)
+class _DecisionHistory:
+    """Caller-supplied columns of a prompt_decisions row (issue #96)."""
+
+    prompt_id: str
+    approver_agent_id: str | None
+    reason: str | None
+    requested_decision: str
+    effective_decision: str
+
+
+class PromptClosedError(Exception):
+    """A non-deny decision was refused because the prompt is consumed or expired (issue #96)."""
+
+    def __init__(self, prompt_id: str, state: str) -> None:
+        super().__init__(f"prompt {prompt_id} is {state}")
+        self.prompt_id = prompt_id
+        self.state = state
 
 
 DEFAULT_DB_PATH = Path.home() / ".local/share/shell-runner/telemetry.sqlite3"
@@ -196,7 +219,32 @@ CREATE TABLE IF NOT EXISTS rule_revocations (
 
 CREATE INDEX IF NOT EXISTS idx_rule_revocations_revoked_at ON rule_revocations(revoked_at);
 CREATE INDEX IF NOT EXISTS idx_rule_revocations_prompt ON rule_revocations(prompt_id);
+
+-- issue #96: append-only history of every applied decision on a prompt.
+-- Never purged by retention (pending_prompts keeps only the latest decision).
+CREATE TABLE IF NOT EXISTS prompt_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt_id TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    approver_agent_id TEXT,
+    reason TEXT,
+    requested_decision TEXT NOT NULL,
+    effective_decision TEXT NOT NULL,
+    previous_decision TEXT,
+    prompt_state TEXT NOT NULL CHECK(prompt_state IN ('live','consumed','expired','missing')),
+    prompt_updated INTEGER NOT NULL,
+    revoked_rules INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_decisions_prompt ON prompt_decisions(prompt_id);
 """
+
+# Default pending-prompt TTL (seconds); also the basis for undoing approve_once's
+# extension when a prompt is re-decided (issue #96).
+DEFAULT_PROMPT_TTL_S = 300
+_VALID_DECISIONS = frozenset(
+    {"deny", "approve_once", "approve_template", "approve_template_global", "approve_verb"}
+)
 
 # approve_once durability TTL (issue #26 P2 Part B): an approve_once approval
 # must survive the subagent that generated the pending prompt so a token-less
@@ -604,7 +652,7 @@ class Persistence:
         command_tier: int,
         matched_rule_category: str | None,
         decision_path: list[str],
-        ttl_seconds: int = 300,
+        ttl_seconds: int = DEFAULT_PROMPT_TTL_S,
         detach: bool = False,
         script_sha256: str | None = None,
         script_paths: str | None = None,
@@ -661,8 +709,16 @@ class Persistence:
         approver_agent_id: str | None = None,
         rule: PromotionRule | None = None,
         reason: str | None = None,
+        requested_decision: str | None = None,
     ) -> PromptDecision:
         """Atomically record a decision and apply its rule side effects (issue #94).
+
+        Issue #96: a non-deny decision on a consumed or expired prompt raises
+        PromptClosedError before any write. A deny on a closed prompt only
+        revokes its rules and leaves the row untouched. Re-deciding a live prompt
+        away from approve_once drops approve_once's TTL extension. Every applied
+        decision appends a prompt_decisions row (``requested_decision`` is what
+        the caller asked for when ``decision`` is a downgrade of it).
 
         Everything happens in ONE write transaction (BEGIN IMMEDIATE ... COMMIT):
         - the decision update on the prompt row;
@@ -684,25 +740,30 @@ class Persistence:
         Raises ValueError if ``rule`` does not match ``decision``; approve_*
         with rule=None is allowed (guarded/detach downgrades).
         """
+        for value in (decision, requested_decision):
+            if value is not None and value not in _VALID_DECISIONS:
+                raise ValueError(f"unknown decision {value!r}")
         self._validate_rule_for_decision(decision, rule)
-        now_dt = datetime.now(UTC)
-        now = now_dt.isoformat()
-        is_approved = decision in (
-            "approve_once",
-            "approve_template",
-            "approve_template_global",
-            "approve_verb",
-        )
+        is_approved = decision != "deny"
         token = str(uuid.uuid4()) if is_approved else None
         ctx = RevocationContext(prompt_id, decision, approver_agent_id, reason)
+        history = _DecisionHistory(
+            prompt_id, approver_agent_id, reason, requested_decision or decision, decision
+        )
         with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            # One clock reading, taken after the write lock, for every check below.
+            now_dt = datetime.now(UTC)
+            now = now_dt.isoformat()
             row = conn.execute(
-                "SELECT id, expires_at FROM pending_prompts WHERE id = ?",
+                "SELECT id, approve_decision, consumed_at, expires_at, created_at "
+                "FROM pending_prompts WHERE id = ?",
                 (prompt_id,),
             ).fetchone()
             if row is None:
                 orphaned = self._revoke_rules_for_prompt(conn, ctx) if decision == "deny" else 0
+                if orphaned:
+                    self._record_decision(conn, now, history, None, "missing", False, orphaned)
                 conn.execute("COMMIT")
                 if orphaned:
                     logger.info(
@@ -710,7 +771,28 @@ class Persistence:
                         prompt_id,
                         orphaned,
                     )
-                return PromptDecision(token=None, revoked_rules=orphaned)
+                return PromptDecision(
+                    token=None, revoked_rules=orphaned, prompt_updated=False, prompt_state="missing"
+                )
+            if row["consumed_at"] is not None:
+                closed_state: str | None = "consumed"
+            elif row["expires_at"] < now:
+                closed_state = "expired"
+            else:
+                closed_state = None
+            if closed_state is not None:
+                if decision != "deny":
+                    raise PromptClosedError(prompt_id, closed_state)  # rolls back, no write
+                revoked = self._revoke_rules_for_prompt(conn, ctx)
+                prev = row["approve_decision"]
+                self._record_decision(conn, now, history, prev, closed_state, False, revoked)
+                conn.execute("COMMIT")
+                return PromptDecision(
+                    token=None,
+                    revoked_rules=revoked,
+                    prompt_updated=False,
+                    prompt_state=closed_state,
+                )
             if decision == "approve_once":
                 # Durability (issue #26 P2 Part B): extend the TTL well past the
                 # default pending-prompt window so a token-less re-submit
@@ -733,26 +815,70 @@ class Persistence:
                     (token, decision, now, new_expires_at, approver_agent_id, prompt_id),
                 )
             else:
-                # Allow approving even expired prompts (expiry only gates token consumption)
+                # Leaving approve_once: its durable extension must not survive, so
+                # fall back to the prompt's original expiry (created_at + default
+                # TTL) when that is earlier than the current one. Assumes the default
+                # TTL: production never passes ttl_seconds and the original expiry
+                # is not stored.
+                new_expires_at = row["expires_at"]
+                if row["approve_decision"] == "approve_once":
+                    original = (
+                        datetime.fromisoformat(row["created_at"])
+                        + timedelta(seconds=DEFAULT_PROMPT_TTL_S)
+                    ).isoformat()
+                    new_expires_at = min(new_expires_at, original)
                 conn.execute(
                     """
                     UPDATE pending_prompts SET
                         approve_token = ?,
                         approve_decision = ?,
                         approved_at = ?,
+                        expires_at = ?,
                         approver_agent_id = ?
                     WHERE id = ?
                     """,
-                    (token, decision, now, approver_agent_id, prompt_id),
+                    (token, decision, now, new_expires_at, approver_agent_id, prompt_id),
                 )
             revoked = self._revoke_rules_for_prompt(conn, ctx)
             rule_id = self._apply_rule(conn, rule, prompt_id, ctx) if rule is not None else None
+            self._record_decision(
+                conn, now, history, row["approve_decision"], "live", True, revoked
+            )
             conn.execute("COMMIT")
         if revoked and decision == "deny":
             logger.info(
                 "deny of prompt %s revoked %d reusable rule(s) (issue #94)", prompt_id, revoked
             )
         return PromptDecision(token=token, rule_id=rule_id, revoked_rules=revoked)
+
+    @staticmethod
+    def _record_decision(
+        conn: sqlite3.Connection,
+        decided_at: str,
+        h: _DecisionHistory,
+        previous_decision: str | None,
+        prompt_state: str,
+        prompt_updated: bool,
+        revoked_rules: int,
+    ) -> None:
+        """Append one prompt_decisions row on the caller's open write transaction."""
+        conn.execute(
+            "INSERT INTO prompt_decisions (prompt_id, decided_at, approver_agent_id, reason, "
+            "requested_decision, effective_decision, previous_decision, prompt_state, "
+            "prompt_updated, revoked_rules) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                h.prompt_id,
+                decided_at,
+                h.approver_agent_id,
+                h.reason,
+                h.requested_decision,
+                h.effective_decision,
+                previous_decision,
+                prompt_state,
+                int(prompt_updated),
+                revoked_rules,
+            ),
+        )
 
     @staticmethod
     def _validate_rule_for_decision(decision: str, rule: PromotionRule | None) -> None:
@@ -890,9 +1016,9 @@ class Persistence:
         SQLite level.  The first caller that wins the lock sets consumed_at;
         the second sees consumed_at IS NOT NULL and returns None.
         """
-        now = _now_utc()
         with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = _now_utc()  # sampled after the write lock, as in decide_prompt
             row = conn.execute(
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
@@ -949,9 +1075,9 @@ class Persistence:
         approve_template_global and approve_verb rows are never consumable
         here; their rules apply through the classifier instead.
         """
-        now = _now_utc()
         with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            now = _now_utc()  # sampled after the write lock, as in decide_prompt
             row = conn.execute(
                 """
                 SELECT id, raw_cmd, agent_id, cwd, normalized_template,
@@ -998,8 +1124,13 @@ class Persistence:
         with self._write_conn() as conn:
             cur = conn.execute(
                 "UPDATE pending_prompts SET consumed_at = NULL"
-                " WHERE id = ? AND consumed_at IS NOT NULL AND detach = 1",
-                (prompt_id,),
+                " WHERE id = ? AND consumed_at IS NOT NULL AND detach = 1"
+                # A deny recorded while the prompt was closed leaves approve_decision
+                # untouched, so the history is the only record of it. A live deny
+                # already nulls approve_token, so restoring after it is harmless.
+                " AND NOT EXISTS (SELECT 1 FROM prompt_decisions WHERE prompt_id = ?"
+                " AND effective_decision = 'deny' AND prompt_state <> 'live')",
+                (prompt_id, prompt_id),
             )
             return cur.rowcount > 0
 

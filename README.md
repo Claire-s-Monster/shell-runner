@@ -465,6 +465,23 @@ that originally created the rule; differs from `prompt_id` for `replaced`),
 `agent_id` / `agent_id_prefix` match the approver or the rule's agent. These
 rows are never purged by retention.
 
+**Re-deciding a prompt.** A prompt that is consumed or expired is closed:
+a non-deny decision on it returns HTTP 409 and changes nothing (an expired
+`approve_once` is not revived). A deny on a closed prompt still revokes its
+rules but leaves the prompt row as it was (`applied` is true only if the row
+was updated or rules were revoked; a deny of an unknown id is `applied=false`).
+Re-deciding a live prompt away from `approve_once` drops that approval's TTL
+extension. A reusable approval downgraded to one-shot is stored as
+`approve_once`. When `approve_template`, `approve_template_global` or
+`approve_verb` is downgraded (detach, path-guarded, or non-promotable command),
+the prompt likewise gets the `approve_once` expiry (`APPROVE_ONCE_DURABLE_TTL_S`,
+1h) and, like any `approve_once`, the identical command can be re-submitted
+without the token until it is consumed or expires. The requested decision is
+kept in `prompt_decisions.requested_decision`. Every applied decision appends a row to the `prompt_decisions`
+table (requested vs effective decision, previous decision, prompt state,
+whether the row was updated, rules revoked); it is never purged by retention
+and not yet exposed through `shell_audit`.
+
 ## Rules files
 
 User-configurable deny rules and protected-path rules, loaded from TOML files.
