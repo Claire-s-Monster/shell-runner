@@ -177,20 +177,15 @@ def test_consume_approve_token_after_expiry_returns_none(tmp_path: Path) -> None
         command_tier=4,
         matched_rule_category=None,
         decision_path=[],
-        ttl_seconds=0,  # immediately expired
     )
-    # Patch: set expires_at to past
+    # Approve while live (issue #96: an already-expired prompt can no longer be
+    # approved), then let it expire: an approved token still stops working.
+    # approve_template leaves expires_at untouched.
+    token = db.approve_prompt(prompt_id=pid, decision="approve_template")
+    assert token is not None
     past = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
     with db._conn() as conn:
         conn.execute("UPDATE pending_prompts SET expires_at = ? WHERE id = ?", (past, pid))
-
-    # NOTE: decision="approve_template" (not "approve_once") — approve_once
-    # deliberately extends expires_at for durability (issue #26 P2 Part B; see
-    # test_approve_once_extends_expiry_for_durability below), so it no longer
-    # exercises this "approving an already-expired prompt doesn't resurrect
-    # the token" invariant. approve_template still leaves expires_at untouched.
-    token = db.approve_prompt(prompt_id=pid, decision="approve_template")
-    assert token is not None
 
     result = db.consume_approve_token(token=token)
     assert result is None

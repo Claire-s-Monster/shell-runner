@@ -86,6 +86,7 @@ from .persistence import (
     CatalogWriter,
     Persistence,
     PromotionRule,
+    PromptClosedError,
     TelemetryWriter,
     parse_time_bound,
 )
@@ -1730,14 +1731,26 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
 
     # One transaction: decision + rule creation (approve) or rule revocation
     # (deny) -- issue #94. approver_agent_id is self-asserted (issue #29).
-    outcome = await asyncio.to_thread(
-        db.decide_prompt,
-        prompt_id=req.prompt_id,
-        decision=req.decision,
-        approver_agent_id=req.approver_agent_id,
-        rule=rule,
-        reason=req.reason,
-    )
+    # A downgrade stores the decision that was actually granted (issue #96).
+    effective_decision = "approve_once" if guarded_note is not None else req.decision
+    try:
+        outcome = await asyncio.to_thread(
+            db.decide_prompt,
+            prompt_id=req.prompt_id,
+            decision=effective_decision,
+            approver_agent_id=req.approver_agent_id,
+            rule=rule,
+            reason=req.reason,
+            requested_decision=req.decision,
+        )
+    except PromptClosedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"prompt {req.prompt_id} is {exc.state}: it can no longer be approved "
+                "(only deny is accepted); re-run the command to create a new prompt"
+            ),
+        ) from exc
     token = outcome.token
     if token is None and req.decision != "deny":
         raise HTTPException(status_code=404, detail=f"prompt {req.prompt_id} not found")
@@ -1752,7 +1765,7 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     detail = _prompt_detail(row) if row is not None else None
 
     return ApproveResponse(
-        applied=True,
+        applied=outcome.prompt_updated or outcome.revoked_rules > 0,
         approve_token=token,
         template_promoted=template_promoted,
         catalog_entry_id=catalog_entry_id,
