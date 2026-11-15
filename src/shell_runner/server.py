@@ -208,8 +208,24 @@ def _compute_duration_ms(job: dict) -> int | None:
         return None
 
 
+RUNNER_MANIFEST_NOT_APPROVED = "runner_manifest_not_approved"
+_MANIFEST_NOT_APPROVED_WHY = (
+    "; a reusable approval exists for this command but not for this runner manifest "
+    "(Makefile/pixi.toml/package.json ... is new or changed since it was approved): "
+    "review the manifest, then approve_template/approve_verb extends the rule to it"
+)
+
+
+class _UnpinnableManifestError(Exception):
+    """The runner's manifest cannot be pinned: no runner rule may be honoured."""
+
+
 def _apply_template_approval(
-    cls: ClassificationResult, agent_id: str, cwd: str, detach: bool = False
+    cls: ClassificationResult,
+    agent_id: str,
+    cwd: str,
+    detach: bool = False,
+    command: str = "",
 ) -> ClassificationResult:
     """Override classification tier via persisted approvals (template or verb+cwd).
 
@@ -237,6 +253,10 @@ def _apply_template_approval(
 
     The override only applies when the approved tier is strictly more
     permissive than the classified command_tier.
+
+    Issue #98: for a runner command (`command` given), a rule row is honoured only if
+    its manifest_pins cover the runner's current manifest hashes; otherwise the command
+    falls through to normal classification (decision_path gets a marker).
     """
     # 1. DENY always wins — never consult or apply any promotion.
     if cls.command_tier == Tier.DENY:
@@ -257,18 +277,41 @@ def _apply_template_approval(
     if detach:
         return cls
 
-    # 2. Exact-template promotion first.
-    approved_int = db.get_template_approved_tier(cls.template, agent_id)
-    promotion_label = "approved_template"
+    # 1e. A runner (make, pixi run, npm run, ...) is promoted only while its manifest
+    # still has the hashes the rule was approved for (issue #98). None: no runner manifest.
+    # The manifests are read lazily: only once a candidate rule row exists, and once.
+    memo: list[dict[str, str] | None] = []
 
-    # 3. Verb + cwd-prefix promotion only when exact-template misses.
-    if approved_int is None:
-        verb = cls.segments[0].segment.verb if cls.segments else ""
-        if verb:
-            approved_int = db.get_verb_approved_tier(verb, cwd, agent_id)
-            promotion_label = "approved_verb"
+    def manifest() -> dict[str, str] | None:
+        if not memo:
+            pins = script_pin.manifest_pins(command, cwd) if command else None
+            if isinstance(pins, str):  # UNPINNABLE: never honoured via a runner rule
+                raise _UnpinnableManifestError
+            memo.append(pins)
+        return memo[0]
 
+    try:
+        # 2. Exact-template promotion first.
+        match = db.match_template_approval(cls.template, agent_id, manifest)
+        promotion_label = "approved_template"
+        manifest_blocked = match.manifest_blocked
+
+        # 3. Verb + cwd-prefix promotion only when exact-template misses.
+        if match.tier is None:
+            verb = cls.segments[0].segment.verb if cls.segments else ""
+            if verb:
+                match = db.match_verb_approval(verb, cwd, agent_id, manifest)
+                promotion_label = "approved_verb"
+                manifest_blocked = manifest_blocked or match.manifest_blocked
+    except _UnpinnableManifestError:
+        return cls
+
+    approved_int = match.tier
     if approved_int is None:
+        if manifest_blocked:
+            return dataclasses.replace(
+                cls, decision_path=(*cls.decision_path, RUNNER_MANIFEST_NOT_APPROVED)
+            )
         return cls
 
     approved_tier = Tier(approved_int)
@@ -1160,7 +1203,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 
     # Path B: no token — classify first
     cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd, req.detach)
+    cls = _apply_template_approval(cls, req.agent_id, req.cwd, req.detach, req.command)
 
     # DENY
     if cls.tier == Tier.DENY:
@@ -1411,6 +1454,8 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         f" → {cls.tier.name}; requires approval via shell_approve_pending from a primary"
         " session (approver identity is self-reported, not a human check — see issue #29)"
     )
+    if RUNNER_MANIFEST_NOT_APPROVED in cls.decision_path:
+        why += _MANIFEST_NOT_APPROVED_WHY
     detach_rerun = ""
     if req.detach:
         why += (
@@ -1451,7 +1496,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
     cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd)
+    cls = _apply_template_approval(cls, req.agent_id, req.cwd, command=req.command)
     _preview_map: dict[Tier, str] = {
         Tier.DENY: "would_deny",
         Tier.AUTO_LOG: "would_execute",
