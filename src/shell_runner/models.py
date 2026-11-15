@@ -176,6 +176,9 @@ class AuditRequest(BaseModel):
     until: str | None = None
     decision: str | None = None
     flagged_only: bool = False
+    # issue #104: the reusable rule that promoted the call (rows/summary modes)
+    approval_rule_kind: Literal["template", "template_global", "verb"] | None = None
+    approval_rule_outcome: Literal["honoured", "manifest_not_approved"] | None = None
     mode: Literal["rows", "summary", "revocations"] = "rows"
     limit: int = 100
     # mode="revocations" only (issue #100); ignored with a note in other modes.
