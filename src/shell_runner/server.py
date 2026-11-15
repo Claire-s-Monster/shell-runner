@@ -1588,7 +1588,15 @@ def _prompt_detail(row: dict) -> PendingPromptDetail:
     )
 
 
-@app.post("/approve_pending", response_model=ApproveResponse)
+@app.post(
+    "/approve_pending",
+    response_model=ApproveResponse,
+    responses={
+        403: {"description": "Approver identity rejected (e.g. approving own command)"},
+        404: {"description": "Prompt not found"},
+        409: {"description": "Prompt already consumed or expired; only deny is accepted"},
+    },
+)
 async def approve_route(req: ApproveRequest) -> ApproveResponse:
     # Fetch the pending prompt (if any) before applying the decision, so the
     # approver-identity guard below can inspect the executing agent's id.

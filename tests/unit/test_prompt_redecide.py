@@ -134,13 +134,64 @@ def test_redecide_keeps_expiry_when_previous_was_not_approve_once(db: Persistenc
     assert _row(db, pid)["expires_at"] == before
 
 
+def test_restore_after_closed_deny_does_not_rearm_approval(db: Persistence, tmp_path: Path) -> None:
+    pid = db.create_pending_prompt(
+        agent_id="worker",
+        cwd=str(tmp_path),
+        raw_cmd=CMD_A,
+        normalized_template="kill -9 <n>",
+        command_tier=4,
+        matched_rule_category=None,
+        decision_path=[],
+        detach=True,
+    )
+    token = db.decide_prompt(
+        prompt_id=pid, decision="approve_once", approver_agent_id="primary"
+    ).token
+    assert token is not None
+    assert db.consume_approve_token(token=token) is not None
+    db.decide_prompt(prompt_id=pid, decision="deny", approver_agent_id="primary")
+
+    assert db.restore_approval(pid) is False
+    assert db.consume_approve_token(token=token) is None
+    assert _row(db, pid)["consumed_at"] is not None
+
+
+def test_restore_after_consume_still_works_without_deny(db: Persistence, tmp_path: Path) -> None:
+    pid = db.create_pending_prompt(
+        agent_id="worker",
+        cwd=str(tmp_path),
+        raw_cmd=CMD_A,
+        normalized_template="kill -9 <n>",
+        command_tier=4,
+        matched_rule_category=None,
+        decision_path=[],
+        detach=True,
+    )
+    token = db.decide_prompt(
+        prompt_id=pid, decision="approve_once", approver_agent_id="primary"
+    ).token
+    assert token is not None
+    assert db.consume_approve_token(token=token) is not None
+
+    assert db.restore_approval(pid) is True
+    assert db.consume_approve_token(token=token) is not None
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"decision": "maybe"}, {"decision": "deny", "requested_decision": "x"}]
+)
+def test_decide_prompt_rejects_unknown_decision(db: Persistence, kwargs: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="decision"):
+        db.decide_prompt(prompt_id="p", approver_agent_id="primary", **kwargs)
+
+
 def test_deny_unknown_id_is_not_applied(client: TestClient, db: Persistence) -> None:
     resp = _post(client, "no-such-prompt", "deny")
 
     assert resp.status_code == 200
     assert resp.json()["applied"] is False
-    last = _history(db)[-1]
-    assert (last["prompt_state"], last["prompt_updated"]) == ("missing", 0)
+    assert _history(db) == []
 
 
 def test_deny_unknown_id_with_orphan_rules_is_applied(
