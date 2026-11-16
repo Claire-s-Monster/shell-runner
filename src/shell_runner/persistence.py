@@ -309,6 +309,7 @@ CREATE TABLE IF NOT EXISTS prompt_decisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_prompt_decisions_prompt ON prompt_decisions(prompt_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_decisions_decided_at ON prompt_decisions(decided_at, id);
 """
 
 # Default pending-prompt TTL (seconds); also the basis for undoing approve_once's

@@ -51,6 +51,16 @@ def _decisions(db: Persistence, **kw: Any) -> dict[str, Any]:
     return db.audit_query(mode="decisions", **kw)
 
 
+def test_prompt_decisions_has_decided_at_id_index(db: Persistence) -> None:
+    with db._write_conn() as conn:
+        indexes = [row[1] for row in conn.execute("PRAGMA index_list(prompt_decisions)")]
+        cols_by_index = {
+            name: [row[2] for row in conn.execute(f"PRAGMA index_info({name})")] for name in indexes
+        }
+
+    assert ["decided_at", "id"] in cols_by_index.values()
+
+
 # --- shape, order, limit ---------------------------------------------------------
 
 
