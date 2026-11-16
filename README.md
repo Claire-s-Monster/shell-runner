@@ -402,6 +402,22 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   one re-approval. A runner that also runs a script (`uv run x.py`, `pixi run bash x.sh`)
   is non-promotable. Residual: the manifest is hashed at classification time, not at
   dispatch (same TOCTOU window as above).
+- **Env-var code loaders are non-durable (#98).** A command that sets `BASH_ENV`, `ENV`,
+  `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5OPT`,
+  `PERL5LIB`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `NODE_PATH`, `RUBYLIB`, `PYTHONUSERBASE`,
+  `GEM_PATH` or `LD_AUDIT`, or a `PATH` with a `.`, empty, relative, non-`$PATH` expanding
+  (a single-quoted or backslash-escaped `$PATH` is a literal and counts as unsafe),
+  `/tmp`, `/var/tmp`, `/dev/shm` or working-directory component, via an inline prefix,
+  `env`, an earlier `export` / `declare -x` in the same line (`declare`, `typeset`,
+  `local` and `readonly` of these names count even without `-x`), or a `make` operand
+  (`NAME=`, `+=`, `:=`, `::=`, `?=`, `!=`), is approvable with `approve_once` only.
+  `set -a` / `set -o allexport`, and `read`, `printf -v` or `mapfile` / `readarray`
+  writing one of these variables or `PATH`, are non-durable too. Such a command is never
+  matched by an existing template/verb rule, always prompts (its tier is raised to at
+  least `approve_once`, never lowered, `deny` untouched), and `approve_template`,
+  `approve_template_global` and `approve_verb` degrade to one-shot (the response names
+  the variable). The decision path carries a `non_durable:` note. It stays pinned
+  (not unpinnable).
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 
