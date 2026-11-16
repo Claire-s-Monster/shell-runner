@@ -1891,7 +1891,8 @@ async def get_pending_route(body: GetPendingRequest) -> GetPendingResponse:
 async def audit_route(body: AuditRequest) -> AuditResponse:
     """Read-only audit query over shell_calls (+ approver info from pending_prompts).
 
-    mode="revocations" lists the rules removed by deny/re-decision (rule_revocations).
+    mode="revocations" lists the rules removed by deny/re-decision (rule_revocations);
+    mode="decisions" lists the prompt_decisions history.
     """
     try:
         since = parse_time_bound(body.since) if body.since else None
@@ -1913,6 +1914,8 @@ async def audit_route(body: AuditRequest) -> AuditResponse:
         prompt_id=body.prompt_id,
         rule_kind=body.rule_kind,
         cause=body.cause,
+        approver_agent_id=body.approver_agent_id,
+        effective_decision=body.effective_decision,
     )
     return AuditResponse(**result)
 

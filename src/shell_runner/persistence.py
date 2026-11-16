@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 if TYPE_CHECKING:
     from .seeds import SeedApproval
@@ -309,14 +309,16 @@ CREATE TABLE IF NOT EXISTS prompt_decisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_prompt_decisions_prompt ON prompt_decisions(prompt_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_decisions_decided_at ON prompt_decisions(decided_at, id);
 """
 
 # Default pending-prompt TTL (seconds); also the basis for undoing approve_once's
 # extension when a prompt is re-decided (issue #96).
 DEFAULT_PROMPT_TTL_S = 300
-_VALID_DECISIONS = frozenset(
-    {"deny", "approve_once", "approve_template", "approve_template_global", "approve_verb"}
-)
+ApprovalDecision = Literal[
+    "deny", "approve_once", "approve_template", "approve_template_global", "approve_verb"
+]
+_VALID_DECISIONS = frozenset(get_args(ApprovalDecision))
 
 # approve_once durability TTL (issue #26 P2 Part B): an approve_once approval
 # must survive the subagent that generated the pending prompt so a token-less
@@ -2055,8 +2057,16 @@ class Persistence:
         cause: str | None = None,
         approval_rule_kind: str | None = None,
         approval_rule_outcome: str | None = None,
+        approver_agent_id: str | None = None,
+        effective_decision: str | None = None,
     ) -> dict[str, Any]:
         """Read-only audit view of shell_calls (parameterized SQL only).
+
+        mode="decisions" (issue #106) lists prompt_decisions, newest first
+        (decided_at, id); since/until/prompt_id/approver_agent_id/effective_decision
+        filter there, every other filter is ignored with a note. Summary mode also
+        reports the decision count. approver_agent_id/effective_decision are ignored
+        with a note in other modes.
 
         approval_rule_kind / approval_rule_outcome (issue #104) filter shell_calls on the
         reusable rule that promoted the call (exact match; not for mode="revocations").
@@ -2076,6 +2086,39 @@ class Persistence:
         """
         limit = max(1, min(limit, MAX_AUDIT_LIMIT))
         notes: list[str] = []
+        if mode != "decisions":
+            for name, value in (
+                ("effective_decision", effective_decision),
+                ("approver_agent_id", approver_agent_id),
+            ):
+                if value is not None:
+                    notes.append(f"{name} ignored: it applies only to mode='decisions'.")
+        if mode == "decisions":
+            for name, supplied in (
+                ("agent_id", agent_id is not None),
+                ("agent_id_prefix", bool(agent_id_prefix)),
+                ("decision", decision is not None),
+                ("flagged_only", flagged_only),
+                ("approval_rule_kind", approval_rule_kind is not None),
+                ("approval_rule_outcome", approval_rule_outcome is not None),
+                ("rule_kind", rule_kind is not None),
+                ("cause", cause is not None),
+            ):
+                if supplied:
+                    notes.append(f"{name} ignored: it does not apply to mode='decisions'.")
+            with self._conn() as conn:
+                result = self._audit_decisions(
+                    conn,
+                    since=since,
+                    until=until,
+                    prompt_id=prompt_id,
+                    approver_agent_id=approver_agent_id,
+                    effective_decision=effective_decision,
+                    limit=limit,
+                )
+            result["mode"] = mode
+            result["notes"] = notes
+            return result
         if mode == "revocations":
             for name, supplied in (
                 ("decision", decision is not None),
@@ -2100,11 +2143,11 @@ class Persistence:
             result["mode"] = mode
             result["notes"] = notes
             return result
-        for name, value in (
-            ("prompt_id", prompt_id),
-            ("rule_kind", rule_kind),
-            ("cause", cause),
-        ):
+        if prompt_id is not None:
+            notes.append(
+                "prompt_id ignored: it applies only to mode='revocations' and mode='decisions'."
+            )
+        for name, value in (("rule_kind", rule_kind), ("cause", cause)):
             if value is not None:
                 notes.append(f"{name} ignored: it applies only to mode='revocations'.")
         with self._conn() as conn:
@@ -2151,6 +2194,7 @@ class Persistence:
             if mode == "summary":
                 result = self._audit_summary(conn, where, params, limit)
                 result["revocations"] = self._count_revocations(conn, since, until)
+                result["decisions"] = self._count_decisions(conn, since, until)
             else:
                 optional = [c for c in OPTIONAL_AUDIT_COLUMNS if c in cols]
                 result = self._audit_rows(conn, where, params, limit, optional)
@@ -2166,6 +2210,41 @@ class Persistence:
             (since, until),
         ).fetchone()
         return int(row[0])
+
+    @staticmethod
+    def _count_decisions(conn: sqlite3.Connection, since: str | None, until: str | None) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM prompt_decisions "
+            "WHERE (?1 IS NULL OR decided_at >= ?1) AND (?2 IS NULL OR decided_at <= ?2)",
+            (since, until),
+        ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _audit_decisions(
+        conn: sqlite3.Connection,
+        *,
+        since: str | None,
+        until: str | None,
+        prompt_id: str | None,
+        approver_agent_id: str | None,
+        effective_decision: str | None,
+        limit: int,
+    ) -> dict[str, Any]:
+        fetched = conn.execute(
+            "SELECT id, prompt_id, decided_at, approver_agent_id, reason, requested_decision, "
+            "effective_decision, previous_decision, prompt_state, prompt_updated, revoked_rules "
+            "FROM prompt_decisions "
+            "WHERE (?1 IS NULL OR decided_at >= ?1) "
+            "AND (?2 IS NULL OR decided_at <= ?2) "
+            "AND (?3 IS NULL OR prompt_id = ?3) "
+            "AND (?4 IS NULL OR approver_agent_id = ?4) "
+            "AND (?5 IS NULL OR effective_decision = ?5) "
+            "ORDER BY decided_at DESC, id DESC LIMIT ?6",
+            (since, until, prompt_id, approver_agent_id, effective_decision, limit + 1),
+        ).fetchall()
+        rows = [dict(r) for r in fetched[:limit]]
+        return {"rows": rows, "count": len(rows), "truncated": len(fetched) > limit}
 
     @staticmethod
     def _audit_revocations(

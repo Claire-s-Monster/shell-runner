@@ -463,8 +463,10 @@ the tool after the server is updated.
 | `decision` | exact match, e.g. `executed`, `denied`, `prompt_required`; ignored with a note in `revocations` mode |
 | `flagged_only` | only flagged calls; needs a `flagged` column, otherwise ignored with a note in `notes`; ignored with a note in `revocations` mode |
 | `approval_rule_kind` / `approval_rule_outcome` | exact match on the rule columns below (`template`, `template_global`, `verb`; `honoured`, `manifest_not_approved`); `rows` and `summary` modes |
-| `mode` | `rows` (default), `summary` or `revocations` |
-| `prompt_id` / `rule_kind` / `cause` | `revocations` mode only; `rule_kind` is `template`, `template_global` or `verb`; `cause` is `deny`, `approve_once`, `approve_template`, `approve_template_global`, `approve_verb` or `replaced`; ignored with a note in other modes |
+| `mode` | `rows` (default), `summary`, `revocations` or `decisions` |
+| `prompt_id` | `revocations` and `decisions` modes; ignored with a note in other modes |
+| `rule_kind` / `cause` | `revocations` mode only; `rule_kind` is `template`, `template_global` or `verb`; `cause` is `deny`, `approve_once`, `approve_template`, `approve_template_global`, `approve_verb` or `replaced`; ignored with a note in other modes |
+| `approver_agent_id` / `effective_decision` | `decisions` mode only (exact match); `effective_decision` is one of the five decisions (`deny`, `approve_once`, `approve_template`, `approve_template_global`, `approve_verb`); ignored with a note in other modes |
 | `limit` | default 100, capped at 1000 (rows, agents in summary mode, or revocations) |
 
 `rows` returns `ts, agent_id, cwd, raw_cmd, command_tier, final_tier, decision,
@@ -478,8 +480,18 @@ and `approval_rule_outcome`: the reusable template/verb rule that promoted the c
 rules: `verb @ cwd_prefix`) because rule ids change when a rule is replaced; all four
 are null for calls no reusable rule touched.
 `summary` returns per `agent_id`: `total_calls`, `by_decision`, `denied_count`,
-`prompt_count`, `first_ts`, `last_ts`, plus a top-level `revocations` count for
-the `since`/`until` window.
+`prompt_count`, `first_ts`, `last_ts`, plus top-level `revocations` and
+`decisions` counts for the `since`/`until` window.
+
+**Decision audit.** `mode=decisions` exposes the append-only `prompt_decisions`
+history, newest first (`decided_at` desc, then `id` desc): `id`, `prompt_id`,
+`decided_at`, `approver_agent_id`, `reason`, `requested_decision`,
+`effective_decision`, `previous_decision`, `prompt_state` (`live`, `consumed`,
+`expired` or `missing`), `prompt_updated`, `revoked_rules`. It filters on
+`since` / `until`, `prompt_id`, `approver_agent_id` and `effective_decision`;
+every other filter is ignored with a note. A deny on a closed prompt shows up here
+even though the prompt row is untouched. Re-decisions refused with HTTP 409 are
+not recorded.
 
 **Revocation audit.** When a deny (or any later re-decision) removes the
 template/verb rules a prompt created, one `rule_revocations` row is written per

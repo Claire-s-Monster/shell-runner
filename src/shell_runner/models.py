@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from shell_runner.persistence import ApprovalDecision
+
 # Maximum subprocess timeout in seconds. Configurable via env to support
 # long-running commands (e.g. 30-min builds) while keeping a runaway-guard.
 DEFAULT_MAX_TIMEOUT_S = 3600  # 1 hour
@@ -179,10 +181,14 @@ class AuditRequest(BaseModel):
     # issue #104: the reusable rule that promoted the call (rows/summary modes)
     approval_rule_kind: Literal["template", "template_global", "verb"] | None = None
     approval_rule_outcome: Literal["honoured", "manifest_not_approved"] | None = None
-    mode: Literal["rows", "summary", "revocations"] = "rows"
+    mode: Literal["rows", "summary", "revocations", "decisions"] = "rows"
     limit: int = 100
-    # mode="revocations" only (issue #100); ignored with a note in other modes.
+    # prompt_id: modes "revocations" (issue #100) and "decisions" (issue #106);
+    # ignored with a note elsewhere.
     prompt_id: str | None = None
+    # mode="decisions" only (issue #106); ignored with a note in other modes.
+    approver_agent_id: str | None = None
+    effective_decision: ApprovalDecision | None = None
     rule_kind: Literal["template", "template_global", "verb"] | None = None
     cause: (
         Literal[
@@ -198,12 +204,13 @@ class AuditRequest(BaseModel):
 
 
 class AuditResponse(BaseModel):
-    mode: Literal["rows", "summary", "revocations"]
+    mode: Literal["rows", "summary", "revocations", "decisions"]
     count: int
     truncated: bool
     rows: list[dict] | None = None
     summary: list[dict] | None = None
     revocations: int | None = None  # summary mode: rule revocations in the window
+    decisions: int | None = None  # summary mode: prompt decisions in the window
     notes: list[str] = Field(default_factory=list)
 
 

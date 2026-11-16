@@ -198,7 +198,14 @@ TOOLS: dict[str, dict[str, Any]] = {
             "plus approver_agent_id/approve_decision when a decided prompt matches "
             "the same agent_id+raw_cmd+cwd within its lifetime. mode='summary' returns, per "
             "agent_id: total_calls, by_decision, denied_count, prompt_count, first_ts, last_ts, "
-            "plus a top-level `revocations` count for the window. mode='revocations' lists, "
+            "plus top-level `revocations` and `decisions` counts for the window. "
+            "mode='decisions' lists, newest first, up to `limit` applied prompt decisions "
+            "(default 100); `truncated` signals more rows, so raise `limit` or narrow with "
+            "since/until to see more (refused 409 re-decisions are not recorded): id, prompt_id, decided_at, "
+            "approver_agent_id, reason, requested_decision, effective_decision, "
+            "previous_decision, prompt_state (live|consumed|expired|missing), prompt_updated, "
+            "revoked_rules; there since/until/prompt_id/approver_agent_id/effective_decision "
+            "filter and all other filters are ignored with a note. mode='revocations' lists, "
             "newest first (commit order), the reusable rules (template, template_global, verb) "
             "removed when a prompt was denied, re-decided or its rule replaced by a newer one: "
             "ts, prompt_id, approver_agent_id, rule_kind, rule_id, rule_text, rule_agent_id, "
@@ -251,12 +258,28 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["rows", "summary", "revocations"],
+                    "enum": ["rows", "summary", "revocations", "decisions"],
                     "default": "rows",
                 },
                 "prompt_id": {
                     "type": ["string", "null"],
-                    "description": "mode=revocations only: exact prompt id",
+                    "description": "mode=revocations or decisions only: exact prompt id",
+                },
+                "approver_agent_id": {
+                    "type": ["string", "null"],
+                    "description": "mode=decisions only: exact approver agent_id",
+                },
+                "effective_decision": {
+                    "type": ["string", "null"],
+                    "enum": [
+                        "deny",
+                        "approve_once",
+                        "approve_template",
+                        "approve_template_global",
+                        "approve_verb",
+                        None,
+                    ],
+                    "description": "mode=decisions only: decision actually applied",
                 },
                 "rule_kind": {
                     "type": ["string", "null"],
