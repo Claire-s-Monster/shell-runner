@@ -204,14 +204,14 @@ class ClassificationResult:
     # issue #95: the command runs a script whose content cannot be bound (variable path,
     # unknown stdin producer, eval, ...): every approval is refused (fail closed)
     script_unpinnable: bool = False
-    # issue #98: the command loads code through environment variables (PYTHONPATH=..., BASH_ENV,
-    # a relative PATH, ...): approve_once only, never matched by or promoted to a reusable rule
-    non_durable_reason: str | None = None
     # the command left after folding a leading `cd DIR &&` (what `segments` describes)
     folded_command: str | None = None
     # issue #104: the template/verb rule that promoted the command (outcome 'honoured') or
     # that matched it but was blocked by a changed runner manifest ('manifest_not_approved')
     approval_rule: ApprovalRuleMatch | None = None
+    # issue #98: the command loads code through environment variables (PYTHONPATH=..., BASH_ENV,
+    # a relative PATH, ...): approve_once only, never matched by or promoted to a reusable rule
+    non_durable_reason: str | None = None
 
     @property
     def protected_path_json(self) -> str | None:
@@ -507,10 +507,35 @@ def classify(
             non_durable_reason=reason,
             decision_path=(*result.decision_path, f"non_durable: {reason}; approve_once only"),
         )
+        result = _require_approval(result)
     labels = path_guard.write_labels(command)
     if labels:
         result = replace(result, decision_path=(*result.decision_path, *labels))
     return result
+
+
+def _require_approval(result: ClassificationResult) -> ClassificationResult:
+    """Defence in depth (#98): a non-durable command never auto-runs.
+
+    Raises the tiers to at least APPROVE_ONCE; never lowers one, and DENY stays DENY.
+    """
+    floor = PERMISSIVENESS[Tier.APPROVE_ONCE]
+
+    def raised(tier: Tier) -> Tier:
+        return Tier.APPROVE_ONCE if PERMISSIVENESS[tier] > floor else tier
+
+    tier, command_tier = raised(result.tier), raised(result.command_tier)
+    if (tier, command_tier) == (result.tier, result.command_tier):
+        return result
+    return replace(
+        result,
+        tier=tier,
+        command_tier=command_tier,
+        decision_path=(
+            *result.decision_path,
+            f"non_durable: tier raised to {Tier.APPROVE_ONCE.name}",
+        ),
+    )
 
 
 def _apply_path_guard(

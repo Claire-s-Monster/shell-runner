@@ -404,10 +404,17 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   dispatch (same TOCTOU window as above).
 - **Env-var code loaders are non-durable (#98).** A command that sets `BASH_ENV`, `ENV`,
   `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5OPT`,
-  `PERL5LIB`, `LD_PRELOAD` or `LD_LIBRARY_PATH`, or a `PATH` with a `.`, empty, relative
-  or non-`$PATH` expanding component, via an inline prefix, `env`, or an earlier
-  `export` / `declare -x` in the same line, is approvable with `approve_once` only. It is
-  never matched by an existing template/verb rule, and `approve_template`,
+  `PERL5LIB`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `NODE_PATH`, `RUBYLIB`, `PYTHONUSERBASE`,
+  `GEM_PATH` or `LD_AUDIT`, or a `PATH` with a `.`, empty, relative, non-`$PATH` expanding
+  (a single-quoted or backslash-escaped `$PATH` is a literal and counts as unsafe),
+  `/tmp`, `/var/tmp`, `/dev/shm` or working-directory component, via an inline prefix,
+  `env`, an earlier `export` / `declare -x` in the same line (`declare`, `typeset`,
+  `local` and `readonly` of these names count even without `-x`), or a `make` operand
+  (`NAME=`, `+=`, `:=`, `::=`, `?=`, `!=`), is approvable with `approve_once` only.
+  `set -a` / `set -o allexport`, and `read`, `printf -v` or `mapfile` / `readarray`
+  writing one of these variables or `PATH`, are non-durable too. Such a command is never
+  matched by an existing template/verb rule, always prompts (its tier is raised to at
+  least `approve_once`, never lowered, `deny` untouched), and `approve_template`,
   `approve_template_global` and `approve_verb` degrade to one-shot (the response names
   the variable). The decision path carries a `non_durable:` note. It stays pinned
   (not unpinnable).

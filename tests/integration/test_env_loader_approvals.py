@@ -6,6 +6,7 @@ become, or be matched by, a reusable rule. Nothing real runs: _dispatch_approved
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -173,15 +174,42 @@ def test_reusable_decisions_create_no_rule(
     assert row["script_sha256"] != script_pin.UNPINNABLE
 
     resp = _approve_raw(client, prompt["id"], decision)
-    if resp.status_code == 200:  # degraded to one-shot, as for any non-promotable command
-        body = resp.json()
-        assert body["template_promoted"] is False
-        assert body["verb_promoted"] is False
-    else:
-        assert resp.status_code >= 400
+    # S11 (Sourcery comment #11): degraded to one-shot, never refused with a 4xx
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["template_promoted"] is False
+    assert body["verb_promoted"] is False
+    note = json.dumps(body)
+    assert "downgraded to a one-shot approval" in note, body
+    assert "non_durable" in note, body
     assert _count(db, "template_approvals") == 0
     assert _count(db, "verb_approvals") == 0
     assert calls == []
+    # the returned token runs the command exactly once
+    token = body["approve_token"]
+    body_req = {"command": command, "cwd": str(tmp_path), "agent_id": AGENT, "approve_token": token}
+    run = client.post("/execute", json=body_req)
+    assert run.status_code == 200, run.text
+    assert run.json()["decision"] == "executed"
+    assert len(calls) == 1
+    assert _count(db, "template_approvals") == 0
+    assert _count(db, "verb_approvals") == 0
+
+
+# S1 (Sourcery comment #1): a non-durable command prompts even when the catalog auto-runs it
+def test_s1_non_durable_auto_command_prompts(
+    client: TestClient, calls: list[Any], tmp_path: Path
+) -> None:
+    assert _execute(client, "env PYTHONPATH=. pwd", tmp_path)["decision"] == "prompt_required"
+    assert calls == []
+
+
+# S1 guard
+def test_s1_harmless_assignment_auto_command_runs(
+    client: TestClient, calls: list[Any], tmp_path: Path
+) -> None:
+    assert _execute(client, "pwd", tmp_path)["decision"] == "executed"
+    assert len(calls) == 1
 
 
 # --- 4. an existing rule does not cover the env-prefixed form -------------------

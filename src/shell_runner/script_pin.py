@@ -481,40 +481,208 @@ def _split_commands(tokens: list[str]) -> list[_Simple]:
 _LOADER_ENV_VARS = frozenset(
     {"BASH_ENV", "ENV", "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "NODE_OPTIONS", "RUBYOPT"}
     | {"PERL5OPT", "PERL5LIB", "LD_PRELOAD", "LD_LIBRARY_PATH"}
+    | {"NODE_PATH", "RUBYLIB", "PYTHONUSERBASE", "GEM_PATH", "LD_AUDIT"}
 )
 _SAFE_PATH_REFS = frozenset({"$PATH", "${PATH}"})
+_WORLD_WRITABLE_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
+_PATH_REASON = "PATH contains a relative, empty, expanding, world-writable or cwd component"
+_ALLEXPORT_REASON = "allexport exports every assigned variable (set -a / -o allexport)"
+# Marks a `$` that is a literal character (single-quoted or backslash-escaped), not an expansion.
+_LITERAL_DOLLAR = "\x00"
 
 
-def _unsafe_path_value(value: str) -> bool:
-    """Whether a PATH value has a '.', empty, relative or (non-$PATH) expanding component."""
+def _plain_abs(path: str) -> str:
+    """normpath without resolving symlinks, with a single leading slash."""
+    return "/" + posixpath.normpath(path).lstrip("/")
+
+
+def _is_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _unsafe_abs_dir(part: str, cwd: str) -> bool:
+    """Whether absolute PATH component `part` is (under) a world-writable dir or the cwd."""
+    roots = list(_WORLD_WRITABLE_DIRS)
+    if cwd.startswith("/") and _plain_abs(cwd) != "/":
+        roots.append(_plain_abs(cwd))
+    norm = _plain_abs(part)
+    return any(_is_under(norm, root) for root in roots)
+
+
+def _unsafe_path_value(value: str, cwd: str = "") -> bool:
+    """Whether a PATH value has an unsafe component.
+
+    Unsafe: '.', empty, relative, a `$` expansion other than a live `$PATH`/`${PATH}`, or a
+    directory that is (under) /tmp, /var/tmp, /dev/shm or the command's cwd.
+    """
     for part in value.split(":"):
         if part in _SAFE_PATH_REFS:
             continue
-        if not part or "$" in part or not part.startswith("/"):
+        if not part or "$" in part or not part.startswith("/") or _unsafe_abs_dir(part, cwd):
             return True
     return False
+
+
+_RAW_PIECE_RE = re.compile(
+    r"""'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)|([^\s;&|()<>'"\\]+)|([\s;&|()<>]+)""", re.S
+)
+_DQ_ESCAPE_RE = re.compile(r'\\([$`"\\\n])')
+
+
+def _cooked_words(text: str) -> list[str]:
+    """Words of the raw command text, unquoted like shlex but with literal `$` marked.
+
+    A `$` that is single-quoted or backslash-escaped becomes _LITERAL_DOLLAR, so only a
+    `$` that the shell really expands (unquoted or in double quotes) stays a `$`.
+    """
+    words: list[str] = []
+    cur: list[str] | None = None
+    for m in _RAW_PIECE_RE.finditer(text):
+        group = m.lastindex or 4
+        if group == 5:  # whitespace / operator: ends the word
+            if cur is not None:
+                words.append("".join(cur))
+            cur = None
+            continue
+        piece = m.group(group)
+        if group == 2:
+            piece = _DQ_ESCAPE_RE.sub(
+                lambda e: _LITERAL_DOLLAR if e[1] == "$" else ("" if e[1] == "\n" else e[1]), piece
+            )
+        elif group in (1, 3):
+            piece = piece.replace("$", _LITERAL_DOLLAR)
+        if cur is None:
+            cur = []
+        cur.append(piece)
+    if cur is not None:
+        words.append("".join(cur))
+    return words
 
 
 # `NAME=value` or the append form `NAME+=value` (write_targets._ASSIGN_RE only has the first)
 _ASSIGN_OR_APPEND_RE = re.compile(r"^[A-Za-z_]\w*\+?=")
 _DECLARATIONS = frozenset({"export", "declare", "typeset", "local", "readonly"})
 _DECLARES_EXPORTED = frozenset({"declare", "typeset", "local"})  # exported only with -x
+# make command-line variable operands: = := ::= ?= += !=  (`!=` runs the value in a shell)
+_MAKE_ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)(\+|::?|\?|!)?=(.*)$", re.S)
 
 
-def loader_env_reason(assignment: str) -> str | None:
+def loader_env_reason(assignment: str, cwd: str = "") -> str | None:
     """Why `NAME=value` / `NAME+=value` / bare `NAME` makes a command non-durable, else None.
 
     A bare name (no `=`) is only checked against the loader list: its value is inherited
     or set earlier, so it is unknown. For `PATH+=`, the existing value counts as $PATH.
+    `cwd` is the command's directory: a PATH component under it is unsafe.
     """
     name, eq, value = assignment.partition("=")
     append = name.endswith("+") and bool(eq)
     name = name.removesuffix("+") if append else name
     if name in _LOADER_ENV_VARS:
         return f"{name} loads code through the environment"
-    if name == "PATH" and eq and _unsafe_path_value(f"$PATH{value}" if append else value):
-        return "PATH contains a relative, empty or expanding component"
+    if name == "PATH" and eq and _unsafe_path_value(f"$PATH{value}" if append else value, cwd):
+        return _PATH_REASON
     return None
+
+
+def _make_assignments(args: list[str]) -> list[str]:
+    """make operands `NAME<op>value` as `NAME=value` / `NAME+=value`; `!=` becomes `$(...)`."""
+    out: list[str] = []
+    for arg in args:
+        m = _MAKE_ASSIGN_RE.match(arg)
+        if m:
+            name, op, value = m.groups()
+            if op == "!":
+                value = f"$({value})"  # shell output: not a known value
+            out.append(f"{name}{'+' if op == '+' else ''}={value}")
+    return out
+
+
+def _scan_builtin(args: list[str], value_flags: str) -> tuple[dict[str, str], list[str]]:
+    """(flag -> value, operands) of a builtin; `value_flags` take an attached or next-word value."""
+    values: dict[str, str] = {}
+    operands: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            operands += args[i:]
+            break
+        if not arg.startswith("-") or len(arg) == 1:
+            operands.append(arg)
+            continue
+        for pos, ch in enumerate(arg[1:]):
+            if ch in value_flags:
+                rest = arg[pos + 2 :]
+                if not rest and i < len(args):
+                    rest, i = args[i], i + 1
+                values[ch] = rest
+                break
+    return values, operands
+
+
+def _read_targets(args: list[str]) -> list[str]:
+    values, operands = _scan_builtin(args, "dinNptua")
+    return [*operands, *([values["a"]] if "a" in values else [])]
+
+
+def _mapfile_targets(args: list[str]) -> list[str]:
+    return _scan_builtin(args, "dnOsuCc")[1][:1]  # only the array name
+
+
+def _printf_targets(args: list[str]) -> list[str]:
+    value = _scan_builtin(args[:2], "v")[0].get("v")
+    return [value] if value else []
+
+
+_TARGET_BUILTINS = {
+    "read": _read_targets,
+    "mapfile": _mapfile_targets,
+    "readarray": _mapfile_targets,
+    "printf": _printf_targets,
+}
+
+
+def _sets_allexport(args: list[str]) -> bool:
+    """Whether `set ARGS` turns on allexport: an `a` in a `-` cluster, or `-o allexport`."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--" or not arg.startswith(("-", "+")) or len(arg) == 1:
+            break  # positional parameters start here
+        if arg.startswith("-") and "a" in arg[1:]:
+            return True
+        if arg.endswith("o"):
+            # `-o NAME` / `+o NAME` (also clustered, `-eo NAME`): the next word is an option name
+            if arg.startswith("-") and args[i + 1 : i + 2] == ["allexport"]:
+                return True
+            i += 1
+        i += 1
+    return False
+
+
+def _builtin_reasons(words: list[str]) -> list[str]:
+    """Why `set` / `read` / `printf -v` / `mapfile` make a command non-durable (may be empty).
+
+    `set -a` / `set -o allexport` exports everything assigned later; the others write input
+    into a variable, which is dangerous when it is a loader variable or PATH.
+    """
+    words = _unwrap_builtins(words)
+    if not words:
+        return []
+    head, args = words[0], words[1:]
+    if head == "set":
+        return [_ALLEXPORT_REASON] if _sets_allexport(args) else []
+    scan = _TARGET_BUILTINS.get(head)
+    reasons: list[str] = []
+    for target in scan(args) if scan else []:
+        name = target.partition("[")[0]
+        reason = loader_env_reason(name)
+        if reason is None and name == "PATH":
+            reason = f"PATH is overwritten by {head}"
+        if reason:
+            reasons.append(reason)
+    return reasons
 
 
 def _unwrap_builtins(words: list[str]) -> list[str]:
@@ -531,7 +699,8 @@ def _exported_assignments(words: list[str]) -> list[str]:
     """Operands of export/declare/typeset/local/readonly that can set a loader variable.
 
     NAME=val / NAME+=val operands count when the variable ends up exported (export, or
-    -x on declare/typeset/local). A bare NAME operand of a loader variable always counts:
+    -x on declare/typeset/local), and always for a loader variable or PATH, which are
+    normally exported already. A bare NAME operand of a loader variable always counts:
     its value was set earlier or is inherited, so it is unknown.
     """
     words = _unwrap_builtins(words)
@@ -541,10 +710,18 @@ def _exported_assignments(words: list[str]) -> list[str]:
     exported = words[0] == "export" or (
         words[0] in _DECLARES_EXPORTED and any("x" in f for f in flags if not f.startswith("--"))
     )
-    operands = [a for a in words[1:] if a not in flags]
-    return [
-        a for a in operands if (exported and _ASSIGN_OR_APPEND_RE.match(a)) or a in _LOADER_ENV_VARS
-    ]
+    found: list[str] = []
+    for operand in (a for a in words[1:] if a not in flags):
+        name = operand.partition("=")[0].removesuffix("+")
+        if operand == name:  # bare NAME
+            keep = name in _LOADER_ENV_VARS
+        else:
+            keep = bool(_ASSIGN_OR_APPEND_RE.match(operand)) and (
+                exported or name in _LOADER_ENV_VARS or name == "PATH"
+            )
+        if keep:
+            found.append(operand)
+    return found
 
 
 def _strip_reserved(words: list[str], assigns: list[str] | None = None) -> list[str]:
@@ -843,6 +1020,7 @@ class _Analyzer:
         self.bases: list[str] = []
         self.base_unknown = False
         self.text = ""  # raw text of the command string being analyzed
+        self.raw_words: list[str] = []  # its words, unquoted with literal `$` marked
         # (bases, base_unknown) to restore after a systemd-run unwrap
         self.wd_saved: tuple[list[str], bool] | None = None
 
@@ -856,10 +1034,25 @@ class _Analyzer:
             self.plan.non_durable.append(reason)
 
     def check_assigns(self, assigns: list[str]) -> None:
+        """Flag loader-variable / unsafe PATH assignments.
+
+        The shlex token has lost its quoting, so each assignment is checked against the
+        matching raw word(s) of the command text: a quoted or escaped `$PATH` is a literal.
+        """
         for assignment in assigns:
-            reason = loader_env_reason(assignment)
-            if reason:
-                self.non_durable(reason)
+            raw = [w for w in self.raw_words if w.replace(_LITERAL_DOLLAR, "$") == assignment]
+            name = assignment.partition("=")[0].removesuffix("+")
+            if not raw and name == "PATH" and "$" in assignment:
+                self.non_durable("PATH: unresolvable quoting")  # fail closed
+                continue
+            for form in raw or [assignment]:
+                reason = loader_env_reason(form, self.cwd)
+                if reason:
+                    self.non_durable(reason)
+
+    def check_builtin(self, words: list[str]) -> None:
+        for reason in _builtin_reasons(words):
+            self.non_durable(reason)
 
     def emit(self, ref: ScriptRef) -> None:
         if self.base_unknown and not ref.operand.startswith(("/", "~")):
@@ -888,16 +1081,18 @@ class _Analyzer:
                 self.unpin("command could not be parsed")
             return
         saved, self.text = self.text, text
+        saved_raw, self.raw_words = self.raw_words, _cooked_words(text)
         try:
             for cmd in _split_commands(tokens):
                 assigns: list[str] = []
                 words = _strip_reserved(cmd.words, assigns)
                 self.check_assigns(assigns)
                 self.check_assigns(_exported_assignments(words))
+                self.check_builtin(words)
                 if words:
                     self.command(words, cmd, depth)
         finally:
-            self.text = saved
+            self.text, self.raw_words = saved, saved_raw
 
     def probe(self, text: str, depth: int) -> bool:
         """Whether `text`, parsed as a command string, runs a script (or is unpinnable)."""
@@ -1163,7 +1358,7 @@ class _Analyzer:
 
     def make(self, args: list[str]) -> None:
         # make exports command-line variables (NAME=value operands) to its recipes
-        self.check_assigns([a for a in args if _ASSIGN_OR_APPEND_RE.match(a)])
+        self.check_assigns(_make_assignments(args))
         files, dirs = _make_options(args)
         directory = ""
         for d in dirs:
