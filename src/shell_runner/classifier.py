@@ -204,6 +204,9 @@ class ClassificationResult:
     # issue #95: the command runs a script whose content cannot be bound (variable path,
     # unknown stdin producer, eval, ...): every approval is refused (fail closed)
     script_unpinnable: bool = False
+    # issue #98: the command loads code through environment variables (PYTHONPATH=..., BASH_ENV,
+    # a relative PATH, ...): approve_once only, never matched by or promoted to a reusable rule
+    non_durable_reason: str | None = None
     # the command left after folding a leading `cd DIR &&` (what `segments` describes)
     folded_command: str | None = None
     # issue #104: the template/verb rule that promoted the command (outcome 'honoured') or
@@ -495,6 +498,14 @@ def classify(
             non_promotable=True,
             script_unpinnable=plan.unpinnable,
             decision_path=(*result.decision_path, note),
+        )
+    if plan.non_durable:
+        reason = "; ".join(plan.non_durable)
+        result = replace(
+            result,
+            non_promotable=True,
+            non_durable_reason=reason,
+            decision_path=(*result.decision_path, f"non_durable: {reason}; approve_once only"),
         )
     labels = path_guard.write_labels(command)
     if labels:

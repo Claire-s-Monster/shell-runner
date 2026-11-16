@@ -360,8 +360,13 @@ def _systemd_run(args: list[str]) -> tuple[str, list[str], str | None, bool]:
     return "cmd", args[i:], workdir, same_dir or scope
 
 
-def _skip_wrapper(w: _Wrapper, args: list[str]) -> tuple[str, list[str]]:
-    """(status, rest): cmd (rest = wrapped command), none, unpin, or body (rest = [code])."""
+def _skip_wrapper(
+    w: _Wrapper, args: list[str], assigns: list[str] | None = None
+) -> tuple[str, list[str]]:
+    """(status, rest): cmd (rest = wrapped command), none, unpin, or body (rest = [code]).
+
+    VAR=val operands the wrapper skips are appended to `assigns` when given.
+    """
     positional = w.positional
     seen: set[str] = set()
     i = 0
@@ -372,6 +377,8 @@ def _skip_wrapper(w: _Wrapper, args: list[str]) -> tuple[str, list[str]]:
             i += 1
             break
         if (w.assign and _ASSIGN_RE.match(a)) or a == "-" or re.fullmatch(r"-\d+", a):
+            if assigns is not None and _ASSIGN_RE.match(a):
+                assigns.append(a)
             i += 1
         elif a.startswith("--"):
             name, eq, _ = a.partition("=")
@@ -469,8 +476,82 @@ def _split_commands(tokens: list[str]) -> list[_Simple]:
     return out
 
 
-def _strip_reserved(words: list[str]) -> list[str]:
-    """Drop reserved words / grouping and leading VAR=val; [] when nothing runs."""
+# Issue #98: environment variables through which a process loads attacker-chosen code.
+# A command that sets one is non-durable: approve_once only, never a reusable rule.
+_LOADER_ENV_VARS = frozenset(
+    {"BASH_ENV", "ENV", "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "NODE_OPTIONS", "RUBYOPT"}
+    | {"PERL5OPT", "PERL5LIB", "LD_PRELOAD", "LD_LIBRARY_PATH"}
+)
+_SAFE_PATH_REFS = frozenset({"$PATH", "${PATH}"})
+
+
+def _unsafe_path_value(value: str) -> bool:
+    """Whether a PATH value has a '.', empty, relative or (non-$PATH) expanding component."""
+    for part in value.split(":"):
+        if part in _SAFE_PATH_REFS:
+            continue
+        if not part or "$" in part or not part.startswith("/"):
+            return True
+    return False
+
+
+# `NAME=value` or the append form `NAME+=value` (write_targets._ASSIGN_RE only has the first)
+_ASSIGN_OR_APPEND_RE = re.compile(r"^[A-Za-z_]\w*\+?=")
+_DECLARATIONS = frozenset({"export", "declare", "typeset", "local", "readonly"})
+_DECLARES_EXPORTED = frozenset({"declare", "typeset", "local"})  # exported only with -x
+
+
+def loader_env_reason(assignment: str) -> str | None:
+    """Why `NAME=value` / `NAME+=value` / bare `NAME` makes a command non-durable, else None.
+
+    A bare name (no `=`) is only checked against the loader list: its value is inherited
+    or set earlier, so it is unknown. For `PATH+=`, the existing value counts as $PATH.
+    """
+    name, eq, value = assignment.partition("=")
+    append = name.endswith("+") and bool(eq)
+    name = name.removesuffix("+") if append else name
+    if name in _LOADER_ENV_VARS:
+        return f"{name} loads code through the environment"
+    if name == "PATH" and eq and _unsafe_path_value(f"$PATH{value}" if append else value):
+        return "PATH contains a relative, empty or expanding component"
+    return None
+
+
+def _unwrap_builtins(words: list[str]) -> list[str]:
+    """Drop leading `builtin` / `command [-p]` so the wrapped builtin can be inspected."""
+    i = 0
+    while i < len(words) and words[i] in ("builtin", "command"):
+        i += 1
+        while i < len(words) and words[i] == "-p":
+            i += 1
+    return words[i:]
+
+
+def _exported_assignments(words: list[str]) -> list[str]:
+    """Operands of export/declare/typeset/local/readonly that can set a loader variable.
+
+    NAME=val / NAME+=val operands count when the variable ends up exported (export, or
+    -x on declare/typeset/local). A bare NAME operand of a loader variable always counts:
+    its value was set earlier or is inherited, so it is unknown.
+    """
+    words = _unwrap_builtins(words)
+    if not words or words[0] not in _DECLARATIONS:
+        return []
+    flags = [a for a in words[1:] if a.startswith("-") and not _ASSIGN_OR_APPEND_RE.match(a)]
+    exported = words[0] == "export" or (
+        words[0] in _DECLARES_EXPORTED and any("x" in f for f in flags if not f.startswith("--"))
+    )
+    operands = [a for a in words[1:] if a not in flags]
+    return [
+        a for a in operands if (exported and _ASSIGN_OR_APPEND_RE.match(a)) or a in _LOADER_ENV_VARS
+    ]
+
+
+def _strip_reserved(words: list[str], assigns: list[str] | None = None) -> list[str]:
+    """Drop reserved words / grouping and leading VAR=val; [] when nothing runs.
+
+    The dropped VAR=val words are appended to `assigns` when given.
+    """
     w = list(words)
     while w:
         head = w[0]
@@ -483,7 +564,9 @@ def _strip_reserved(words: list[str]) -> list[str]:
             return []
         elif head == "function":
             w = w[w.index("{") + 1 :] if "{" in w else []
-        elif _ASSIGN_RE.match(head):
+        elif _ASSIGN_OR_APPEND_RE.match(head):
+            if assigns is not None:
+                assigns.append(head)
             w.pop(0)
         else:
             break
@@ -517,6 +600,8 @@ class Plan:
     refs: list[ScriptRef] = field(default_factory=list)
     unpinnable: bool = False
     reasons: list[str] = field(default_factory=list)
+    # issue #98: code-loading environment variables; still pinned, but never reusable
+    non_durable: list[str] = field(default_factory=list)
 
     @property
     def blocks_reuse(self) -> bool:
@@ -766,6 +851,16 @@ class _Analyzer:
         self.plan.unpinnable = True
         self.plan.reasons.append(reason)
 
+    def non_durable(self, reason: str) -> None:
+        if reason not in self.plan.non_durable:
+            self.plan.non_durable.append(reason)
+
+    def check_assigns(self, assigns: list[str]) -> None:
+        for assignment in assigns:
+            reason = loader_env_reason(assignment)
+            if reason:
+                self.non_durable(reason)
+
     def emit(self, ref: ScriptRef) -> None:
         if self.base_unknown and not ref.operand.startswith(("/", "~")):
             self.unpin("script path depends on a cd/pushd target that is not statically known")
@@ -795,7 +890,10 @@ class _Analyzer:
         saved, self.text = self.text, text
         try:
             for cmd in _split_commands(tokens):
-                words = _strip_reserved(cmd.words)
+                assigns: list[str] = []
+                words = _strip_reserved(cmd.words, assigns)
+                self.check_assigns(assigns)
+                self.check_assigns(_exported_assignments(words))
                 if words:
                     self.command(words, cmd, depth)
         finally:
@@ -827,6 +925,13 @@ class _Analyzer:
             self.wd_saved = undo[0]
         return result
 
+    def _strip(self, words: list[str]) -> list[str]:
+        """_strip_reserved, checking the dropped VAR=val words for code loaders."""
+        assigns: list[str] = []
+        stripped = _strip_reserved(words, assigns)
+        self.check_assigns(assigns)
+        return stripped
+
     def _systemd_run(
         self, words: list[str], undo: list[tuple[list[str], bool]]
     ) -> list[str] | None:
@@ -854,14 +959,16 @@ class _Analyzer:
             name = _trusted_name(words[0])
             if name == "systemd-run":
                 inner = self._systemd_run(words, undo)
-                words = _strip_reserved(inner) if inner else []
+                words = self._strip(inner) if inner else []
                 if not words:
                     return None
                 continue
             spec = _WRAPPERS.get(name) if name else None
             if spec is None:
                 return words
-            status, rest = _skip_wrapper(spec, words[1:])
+            assigns: list[str] = []
+            status, rest = _skip_wrapper(spec, words[1:], assigns)
+            self.check_assigns(assigns)
             if status == "unpin":
                 self.unpin(f"cannot parse the options of {name}")
                 return None
@@ -870,7 +977,7 @@ class _Analyzer:
                 return None
             if status == "none":
                 return None
-            words = _strip_reserved(rest)
+            words = self._strip(rest)
             if not words:
                 return None
         self.unpin("wrapper chain too long")
@@ -1055,6 +1162,8 @@ class _Analyzer:
             self.add_file(f)
 
     def make(self, args: list[str]) -> None:
+        # make exports command-line variables (NAME=value operands) to its recipes
+        self.check_assigns([a for a in args if _ASSIGN_OR_APPEND_RE.match(a)])
         files, dirs = _make_options(args)
         directory = ""
         for d in dirs:

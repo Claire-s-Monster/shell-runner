@@ -1763,15 +1763,23 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             )
         elif (
             pending is not None
-            and classify(pending["raw_cmd"], pending["cwd"], pending["agent_id"]).non_promotable
+            and (
+                pending_cls := classify(pending["raw_cmd"], pending["cwd"], pending["agent_id"])
+            ).non_promotable
         ):
-            what = (
-                "running a script file is never promotable: its content is not pinned "
-                "by a reusable approval (issue #95); only a one-shot approval, bound to "
-                "the script's sha256, is possible"
-                if script_pin.runs_script(pending["raw_cmd"], pending["cwd"])
-                else "inline code (-c, source) is never promotable"
-            )
+            if pending_cls.non_durable_reason:
+                what = (
+                    f"non_durable: {pending_cls.non_durable_reason}; a command that loads code "
+                    "through environment variables is never promotable (issue #98)"
+                )
+            elif script_pin.runs_script(pending["raw_cmd"], pending["cwd"]):
+                what = (
+                    "running a script file is never promotable: its content is not pinned "
+                    "by a reusable approval (issue #95); only a one-shot approval, bound to "
+                    "the script's sha256, is possible"
+                )
+            else:
+                what = "inline code (-c, source) is never promotable"
             guarded_note = f"{req.decision} downgraded to a one-shot approval: {what}"
 
     if guarded_note is not None:

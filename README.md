@@ -402,6 +402,15 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   one re-approval. A runner that also runs a script (`uv run x.py`, `pixi run bash x.sh`)
   is non-promotable. Residual: the manifest is hashed at classification time, not at
   dispatch (same TOCTOU window as above).
+- **Env-var code loaders are non-durable (#98).** A command that sets `BASH_ENV`, `ENV`,
+  `PYTHONSTARTUP`, `PYTHONPATH`, `PYTHONHOME`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5OPT`,
+  `PERL5LIB`, `LD_PRELOAD` or `LD_LIBRARY_PATH`, or a `PATH` with a `.`, empty, relative
+  or non-`$PATH` expanding component, via an inline prefix, `env`, or an earlier
+  `export` / `declare -x` in the same line, is approvable with `approve_once` only. It is
+  never matched by an existing template/verb rule, and `approve_template`,
+  `approve_template_global` and `approve_verb` degrade to one-shot (the response names
+  the variable). The decision path carries a `non_durable:` note. It stays pinned
+  (not unpinnable).
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 
