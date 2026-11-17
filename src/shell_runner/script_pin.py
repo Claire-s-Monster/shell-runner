@@ -53,8 +53,9 @@ _UNRESOLVABLE_CHARS = "$`*?[{\n\0"
 _OVER_BUDGET = "over_budget"
 _MAKEFILES = ("GNUmakefile", "makefile", "Makefile")
 _SUSPECT_RE = re.compile(
-    r"\b(?:bash|sh|zsh|dash|ksh|mksh|ash|fish|python[\d.]*|node|perl|ruby|php|awk|gawk|mawk"
-    r"|sed|make|pixi|uv|npm|yarn|pnpm|find|eval|source|xargs)\b|^\s*\.\s"
+    r"\b(?:bash|sh|zsh|dash|ksh|mksh|ash|fish|python[\d.]*|pypy[\d.]*|node|perl|ruby|php|awk"
+    r"|gawk|mawk|nawk|sed|make|pixi|uv|npm|yarn|pnpm|find|eval|source|xargs|csh|tcsh|lua[\d.]*"
+    r"|luajit|Rscript|tclsh[\d.]*|wish|deno|bun|osascript|go)\b|^\s*\.\s"
 )
 
 
@@ -76,11 +77,39 @@ class _Interp:
     preload_flags: str = ""  # short flags whose value is a file loaded before the script
     long_preload_flags: frozenset[str] = frozenset()
     include_flags: str = ""  # short flags whose value is a module search directory
-    lang: str = ""  # inline code (-c/-e) is scanned for local imports: python | node | ruby
+    # inline code (-c/-e) is scanned for local loads: python | node | ruby | lua | r | php | deno
+    lang: str = ""
     chdir_flags: str = ""  # short flags whose value is the directory the script runs in
     pragma_flags: str = ""  # short flags whose attached value is `use` code (perl -M/-m)
     # options are parsed after the -e code (node, perl, ruby); python's -c ends option parsing
     options_after_code: bool = False
+    # short flags whose value is code, repeatable, with the operand still a script (lua -e)
+    code_flags: str = ""
+    code_then_script: bool = False  # an operand after code_flags is still a script (lua)
+    config_flags: str = ""  # short flags whose value is a config file (php -c)
+    define_flags: str = ""  # short flags whose value is NAME=VALUE (php -d)
+    opaque_inline: bool = False  # inline code is another language: unpinnable (csh -c)
+    unpin_options: bool = False  # option grammar not modelled: any leading option is unpinnable
+    cli: str = ""  # has subcommands handled by _Analyzer: bun | deno
+    implicit_files: tuple[str, ...] = ()  # cwd files the interpreter loads on its own
+    # (implicit file, long options that make the interpreter skip it)
+    implicit_off: tuple[tuple[str, frozenset[str]], ...] = ()
+    unsafe_flags: str = ""  # short flags whose value makes the command unpinnable (php -z)
+
+    def collects(self, ch: str) -> bool:
+        """Whether short flag `ch` carries a value that _option_values records."""
+        return any(
+            ch in group
+            for group in (
+                self.preload_flags,
+                self.include_flags,
+                self.chdir_flags,
+                self.code_flags,
+                self.config_flags,
+                self.define_flags,
+                self.unsafe_flags,
+            )
+        )
 
 
 _SHELL = _Interp(
@@ -128,8 +157,46 @@ _RUBY = _Interp(
     lang="ruby",
     options_after_code=True,
 )
-_PHP = _Interp(value="dczSt", inline="rBRE", noexec="lvimh", file_flags="fF")
+_PHP = _Interp(
+    value="dczSt",
+    inline="rBRE",
+    noexec="lvimh",
+    file_flags="fF",
+    config_flags="c",
+    define_flags="d",
+    unsafe_flags="z",
+    lang="php",
+)
 _FISH = _Interp(value="dDoC", inline="c", noexec="n")
+_CSH = _Interp(inline="c", noexec="n", stdin="st", opaque_inline=True)
+_LUA = _Interp(value="l", code_flags="e", code_then_script=True, preload_flags="l", lang="lua")
+_RSCRIPT = _Interp(
+    code_flags="e",
+    lang="r",
+    implicit_files=(".Rprofile", ".Renviron"),
+    implicit_off=(
+        (".Rprofile", frozenset({"--vanilla", "--no-init-file"})),
+        (".Renviron", frozenset({"--vanilla", "--no-environ"})),
+    ),
+)
+_BUN_LONG_VALUE = frozenset(
+    {"--preload", "--require", "--import", "--define", "--loader", "--port", "--shell"}
+    | {"--cwd", "--config", "--env-file", "--tsconfig-override", "--install", "--conditions"}
+)
+_BUN = _Interp(
+    value="rdlc",
+    inline="ep",
+    long_value=_BUN_LONG_VALUE,
+    long_inline=frozenset({"--eval", "--print"}),
+    preload_flags="r",
+    long_preload_flags=frozenset({"--preload", "--require", "--import"}),
+    lang="node",
+    options_after_code=True,
+    cli="bun",
+    implicit_files=("bunfig.toml",),
+)
+_DENO = _Interp(cli="deno", lang="deno")
+_OPAQUE = _Interp(unpin_options=True)  # tclsh, wish, osascript: file operand only
 _FAMILIES = {
     "node": _NODE,
     "nodejs": _NODE,
@@ -137,9 +204,19 @@ _FAMILIES = {
     "ruby": _RUBY,
     "php": _PHP,
     "fish": _FISH,
+    "csh": _CSH,
+    "tcsh": _CSH,
+    "lua": _LUA,
+    "luajit": _LUA,
+    "Rscript": _RSCRIPT,
+    "deno": _DENO,
+    "bun": _BUN,
+    "osascript": _OPAQUE,
 }
 _SHELL_RE = re.compile(r"^(?:bash|sh|zsh|dash|ksh|ksh93|mksh|ash|rbash)$")
-_PYTHON_RE = re.compile(r"^python[\d.]*$")
+_PYTHON_RE = re.compile(r"^(?:python|pypy)[\d.]*$")
+_VERSIONED_RE = re.compile(r"^(?:perl5|ruby\d|php\d|lua\d)(?:\.\d+)*$")
+_TCL_RE = re.compile(r"^(?:tclsh|wish)[\d.]*$")
 
 
 def _family(name: str) -> _Interp | None:
@@ -147,6 +224,10 @@ def _family(name: str) -> _Interp | None:
         return _SHELL
     if _PYTHON_RE.match(name):
         return _PYTHON
+    if _VERSIONED_RE.match(name):
+        return _FAMILIES[name.rstrip("0123456789.")]
+    if _TCL_RE.match(name):
+        return _OPAQUE
     return _FAMILIES.get(name)
 
 
@@ -156,7 +237,7 @@ def _scan_options(spec: _Interp, args: list[str]) -> tuple[str, str | None]:
     Returns (kind, operand): file | inline | module | stdin | stdin! (explicitly
     requested) | none (nothing runs); operand is the file / code / module name.
     """
-    inline = module = noexec = stdin = False
+    inline = module = noexec = stdin = code = False
     i = 0
     operand: str | None = None
     while i < len(args):
@@ -182,6 +263,10 @@ def _scan_options(spec: _Interp, args: list[str]) -> tuple[str, str | None]:
                 if ch in spec.file_flags:
                     val = rest or (args[i + 1] if i + 1 < len(args) else "")
                     return ("file", val) if val else ("none", None)
+                if ch in spec.code_flags:
+                    code = True  # the code is collected by _option_values; skip its value
+                    step = 1 if rest else 2
+                    break
                 if rest and not spec.shell and (ch in spec.inline or ch in spec.module):
                     # `-cCODE` / `-mmod`: the rest of the word is the operand
                     return ("inline" if ch in spec.inline else "module"), rest
@@ -203,10 +288,10 @@ def _scan_options(spec: _Interp, args: list[str]) -> tuple[str, str | None]:
             return "inline", operand
         if module:
             return "module", operand
-        if noexec:
+        if noexec or (code and not spec.code_then_script):
             return "none", None
         return ("stdin!", None) if stdin else ("file", operand)
-    if inline or module or noexec:
+    if inline or module or noexec or code:
         return "none", None
     return ("stdin!", None) if stdin else ("stdin", None)
 
@@ -218,9 +303,50 @@ class _Options:
     preload: list[str] = field(default_factory=list)
     include: list[str] = field(default_factory=list)
     chdir: list[str] = field(default_factory=list)
+    code: list[str] = field(default_factory=list)  # lua/Rscript -e code words
+    files: list[str] = field(default_factory=list)  # files named by ini settings (php -d)
+    configs: list[str] = field(default_factory=list)  # config files (php -c)
+    flags: list[str] = field(default_factory=list)  # long option names seen
+    ini_search: list[str] = field(default_factory=list)  # php -d include_path=
+    unsafe: list[str] = field(default_factory=list)  # reasons the options are unpinnable
 
 
 _LIB_PRAGMA_RE = re.compile(r"lib(?:=|\s)")
+_PHP_FILE_SETTINGS = frozenset({"auto_prepend_file", "auto_append_file"})
+_PHP_EXTENSION_SETTINGS = frozenset({"extension", "zend_extension"})
+
+
+def _php_define(value: str) -> tuple[str, str]:
+    """(name, value) of a php `-d NAME=VALUE`: whitespace and one pair of quotes removed."""
+    name, _, setting = value.partition("=")
+    setting = setting.strip()
+    if len(setting) >= 2 and setting[0] == setting[-1] and setting[0] in "'\"":
+        setting = setting[1:-1].strip()
+    return name.strip().lower(), setting
+
+
+def _record_value(spec: _Interp, ch: str, value: str, out: _Options) -> None:
+    """File `value` of short flag `ch` into the matching _Options list."""
+    if ch in spec.code_flags:
+        out.code.append(value)
+    elif ch in spec.preload_flags:
+        out.preload.append(value)
+    elif ch in spec.chdir_flags:
+        out.chdir.append(value)
+    elif ch in spec.include_flags:
+        out.include.append(value)
+    elif ch in spec.config_flags:
+        out.configs.append(value)
+    elif ch in spec.unsafe_flags:
+        out.unsafe.append(f"-{ch} {value} loads a code extension that cannot be pinned")
+    else:  # define_flags: only the ini settings that load a file or code matter
+        name, setting = _php_define(value)
+        if name in _PHP_FILE_SETTINGS and setting:
+            out.files.append(setting)
+        elif name == "include_path":
+            out.ini_search.append(setting)
+        elif name in _PHP_EXTENSION_SETTINGS:
+            out.unsafe.append(f"-d {name} loads a code extension that cannot be pinned")
 
 
 def _short_option_values(spec: _Interp, args: list[str], i: int, out: _Options) -> int:
@@ -228,15 +354,10 @@ def _short_option_values(spec: _Interp, args: list[str], i: int, out: _Options) 
     a = args[i]
     for pos, ch in enumerate(a[1:]):
         rest = a[pos + 2 :]
-        if ch in spec.preload_flags or ch in spec.include_flags or ch in spec.chdir_flags:
+        if spec.collects(ch):
             value = rest or (args[i + 1] if i + 1 < len(args) else "")
             if value:
-                if ch in spec.preload_flags:
-                    out.preload.append(value)
-                elif ch in spec.chdir_flags:
-                    out.chdir.append(value)
-                else:
-                    out.include.append(value)
+                _record_value(spec, ch, value, out)
             return 1 if rest else 2
         if ch in spec.pragma_flags and _LIB_PRAGMA_RE.match(rest):
             out.include.append(rest)  # perl -Mlib=DIR adds an include directory
@@ -262,6 +383,7 @@ def _option_values(spec: _Interp, args: list[str]) -> _Options:
             break
         if a.startswith("--"):
             name, eq, val = a.partition("=")
+            out.flags.append(name)
             if name in spec.long_preload_flags:
                 value = val if eq else (args[i + 1] if i + 1 < len(args) else "")
                 if value:
@@ -276,6 +398,7 @@ def _option_values(spec: _Interp, args: list[str]) -> _Options:
 
 
 _INCLUDE_REASON = "-I puts a caller-chosen directory on the module search path"
+_INI_SEARCH_REASON = "-d include_path puts a caller-chosen directory on the include search path"
 _UNKNOWN_BASE_IMPORT = "inline code imports a module, but the cd/pushd target is not known"
 
 
@@ -285,13 +408,22 @@ def _node_modules_reason(kind: str, value: str) -> str:
 
 _PATH_PREFIXES = ("./", "../", "/")
 # (suffixes tried after the path as given, index file tried inside a directory)
+_NODE_RESOLVE = ((".js", ".json", ".mjs", ".cjs"), ("index.js", "index.json"))
 _RESOLVE = {
-    "node": ((".js", ".json", ".mjs", ".cjs"), ("index.js", "index.json")),
+    "node": _NODE_RESOLVE,
+    "deno": _NODE_RESOLVE,
     "ruby": ((".rb",), ()),
+    "lua": ((".lua",), ("init.lua",)),
 }
 _OPTION_PATH_PREFIXES = (*_PATH_PREFIXES, "~/")
 _JS_BLOCK_OR_LINE_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
 _RUBY_KEYWORD_RE = re.compile(r"(?<![\w.:@$])(?:require_relative|require|load)\b")
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")  # http:, https:, npm:, jsr:, data:, file:, ...
+# string-literal argument of a lua / R / php load call: group 1 the name, group 2 an open paren
+_LUA_CALL_RE = re.compile(r"(?<![\w.:])(require|dofile|loadfile)\b\s*(\()?\s*")
+_R_CALL_RE = re.compile(r"(?<![\w.])((?:sys\.)?source)\s*(\()\s*(?:file\s*=\s*)?")
+_PHP_CALL_RE = re.compile(r"\b(require|include)(?:_once)?\b\s*(\()?\s*", re.I)
+_STR_LITERAL_RE = re.compile(r"""(['"])([^'"\\\n]*)\1""")
 _NODE_CALL_RE = re.compile(r"\b(?:require|import)\s*\(\s*")  # require( / import(
 _NODE_LITERAL_RE = re.compile(r"""(['"])([^'"\\\n]*)\1\s*[,)]""")  # the whole call argument
 _NODE_STATIC_RE = re.compile(r"""\b(?:from|import)\s*(['"])([^'"\\\n]*)\1""")
@@ -410,6 +542,11 @@ def _is_node_builtin(spec: str) -> bool:
     return spec.startswith("node:") or spec in _NODE_BUILTINS
 
 
+def _is_remote(spec: str) -> bool:
+    """A URL-style specifier (http:, npm:, jsr:, data:, ...) other than `node:` builtins."""
+    return _URL_RE.match(spec) is not None and not spec.startswith("node:")
+
+
 def _ruby_requires(code: str) -> list[str]:
     """Operands of `require_relative` / `load` / `require './x'` (could load a local file)."""
     return [
@@ -430,6 +567,60 @@ def _ruby_dynamic(code: str, *, expanded: bool) -> bool:
         if m is None or (m[2] == '"' and "#{" in m[3]) or (expanded and "$" in m[3]):
             return True
     return False
+
+
+def _call_closes(tail: str, paren: bool) -> bool:
+    """Whether the text after a literal call argument ends the call (no concatenation)."""
+    if paren:
+        return tail[:1] in (",", ")")
+    return not tail or tail[0] in ";)_" or tail[0].isalpha() or tail.startswith("?>")
+
+
+def _call_literals(code: str, call_re: re.Pattern[str]) -> tuple[list[tuple[str, str]], bool]:
+    """((call name, literal argument) per load call, whether one is not a plain literal)."""
+    found: list[tuple[str, str]] = []
+    dynamic = False
+    for m in call_re.finditer(code):
+        lit = _STR_LITERAL_RE.match(code, m.end())
+        if lit is None or "$" in lit[2] or not _call_closes(code[lit.end() :].lstrip(), bool(m[2])):
+            dynamic = True
+        else:
+            found.append((m[1].lower(), lit[2]))
+    return found, dynamic
+
+
+def _lua_module_path(name: str) -> str:
+    """File stem `require name` / `lua -l name` searches ('a.b' is a/b; `g=mod` is mod)."""
+    name = name.rpartition("=")[2]
+    return name if "/" in name else name.replace(".", "/")
+
+
+# inline code that changes where modules are searched, or loads a file indirectly: unpinnable
+_LUA_SEARCH_RE = re.compile(r"\bpackage\s*(?:\.\s*(?:c?path|searchers|loaders)\b|\[)")
+_R_INDIRECT_RE = re.compile(
+    r"\.libPaths\s*\(|(?<![\w.])parse\s*\((?![^)]*\btext\s*=)"
+    r"|\bdo\.call\s*\(\s*[\"']?(?:sys\.)?source\b"
+)
+_PHP_SEARCH_RE = re.compile(r"\bset_include_path\s*\(|\bini_set\s*\([^)]*include_path", re.I)
+
+
+def _lua_loads(code: str) -> tuple[list[str], bool]:
+    calls, dynamic = _call_literals(code, _LUA_CALL_RE)
+    paths = [_lua_module_path(v) if n == "require" else v for n, v in calls]
+    return paths, dynamic or _LUA_SEARCH_RE.search(code) is not None
+
+
+def _r_loads(code: str) -> tuple[list[str], bool]:
+    calls, dynamic = _call_literals(code, _R_CALL_RE)
+    return [v for _, v in calls], dynamic or _R_INDIRECT_RE.search(code) is not None
+
+
+def _php_loads(code: str) -> tuple[list[str], bool]:
+    calls, dynamic = _call_literals(code, _PHP_CALL_RE)
+    return [v for _, v in calls], dynamic or _PHP_SEARCH_RE.search(code) is not None
+
+
+_LOAD_SCANNERS = {"lua": _lua_loads, "r": _r_loads, "php": _php_loads}
 
 
 def _heredoc_bodies(text: str) -> list[str]:
@@ -468,19 +659,71 @@ def _dotenv_assignment(line: str) -> str | None:
     return f"{key.strip()}={value}"
 
 
+def _read_capped(path: str) -> bytes | None:
+    """The whole file `path` (b"" when it is not a readable regular file), None when it is
+    over the scan cap: a file is never scanned in part."""
+    if not os.path.isfile(path):
+        return b""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(_ENV_FILE_MAX + 1)
+    except OSError:
+        return b""
+    return None if len(data) > _ENV_FILE_MAX else data
+
+
+_AWK_INCLUDE_DEPTH = 16
+_AWK_LONG_VALUE = frozenset(
+    {"--file", "--include", "--source", "--field-separator", "--assign", "--exec"}
+)
+_AWK_DIRECTIVE_RE = re.compile(r"^[ \t]*@(include|load)\b[ \t]*(.*)$", re.M)
+_AWK_NAME_RE = re.compile(r"""(["'])([^"'\n]+)\1[ \t]*(?:#.*)?$""")
+
+
+def _awk_includes(text: str) -> tuple[list[str], bool]:
+    """(literal `@include` names in awk source, False if an @load or a non-literal @include)."""
+    names: list[str] = []
+    for m in _AWK_DIRECTIVE_RE.finditer(text):
+        lit = _AWK_NAME_RE.match(m[2])
+        if m[1] == "load" or lit is None:
+            return names, False
+        names.append(lit[2])
+    return names, True
+
+
+def _awk_scan(args: list[str]) -> tuple[bool, str | None]:
+    """(whether gawk -l / --load is given, the first operand) of an awk command's args."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return False, args[i + 1] if i + 1 < len(args) else None
+        if a.startswith("--"):
+            name, eq, _ = a.partition("=")
+            if name == "--load":
+                return True, None
+            i += 2 if name in _AWK_LONG_VALUE and not eq else 1
+        elif a.startswith("-") and a != "-":
+            step = 1
+            for pos, ch in enumerate(a[1:]):
+                if ch == "l":
+                    return True, None
+                if ch in "Fvfei":
+                    step = 1 if a[pos + 2 :] else 2
+                    break
+            i += step
+        else:
+            return False, a
+    return False, None
+
+
 def _env_file_reasons(path: str, cwd: str) -> list[str] | None:
     """Why each loader variable in the dotenv file `path` makes a command non-durable.
 
     None when the file is too large to scan completely (it is never scanned in part).
     """
-    if not os.path.isfile(path):
-        return []
-    try:
-        with open(path, "rb") as fh:
-            data = fh.read(_ENV_FILE_MAX + 1)
-    except OSError:
-        return []
-    if len(data) > _ENV_FILE_MAX:
+    data = _read_capped(path)
+    if data is None:
         return None
     reasons: list[str] = []
     for line in data.decode("utf-8", "replace").splitlines():
@@ -797,7 +1040,11 @@ _LOADER_ENV_VARS = frozenset(
     {"BASH_ENV", "ENV", "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "NODE_OPTIONS", "RUBYOPT"}
     | {"PERL5OPT", "PERL5LIB", "LD_PRELOAD", "LD_LIBRARY_PATH"}
     | {"NODE_PATH", "RUBYLIB", "PYTHONUSERBASE", "GEM_PATH", "LD_AUDIT"}
+    | {"R_PROFILE_USER", "R_PROFILE", "R_ENVIRON_USER", "R_ENVIRON", "PHPRC", "PHP_INI_SCAN_DIR"}
+    | {"AWKPATH", "AWKLIBPATH", "BUN_OPTIONS", "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE"}
+    | {"PERL5DB", "TCLLIBPATH", "TCL_LIBRARY"}
 )
+_LOADER_ENV_RE = re.compile(r"LUA_(?:INIT|PATH|CPATH)(?:_\d_\d)?")  # LUA_INIT_5_4, LUA_PATH_5_3
 _SAFE_PATH_REFS = frozenset({"$PATH", "${PATH}"})
 _WORLD_WRITABLE_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
 _PATH_REASON = "PATH contains a relative, empty, expanding, world-writable or cwd component"
@@ -1104,6 +1351,10 @@ _DECLARES_EXPORTED = frozenset({"declare", "typeset", "local"})  # exported only
 _MAKE_ASSIGN_RE = re.compile(r"^([A-Za-z_]\w*)(\+|::?|\?|!)?=(.*)$", re.S)
 
 
+def _is_loader_var(name: str) -> bool:
+    return name in _LOADER_ENV_VARS or _LOADER_ENV_RE.fullmatch(name) is not None
+
+
 def loader_env_reason(assignment: str, cwd: str = "") -> str | None:
     """Why `NAME=value` / `NAME+=value` / bare `NAME` makes a command non-durable, else None.
 
@@ -1114,7 +1365,7 @@ def loader_env_reason(assignment: str, cwd: str = "") -> str | None:
     name, eq, value = assignment.partition("=")
     append = name.endswith("+") and bool(eq)
     name = name.removesuffix("+") if append else name
-    if name in _LOADER_ENV_VARS:
+    if _is_loader_var(name):
         return f"{name} loads code through the environment"
     if name == "PATH" and eq and _unsafe_path_value(f"$PATH{value}" if append else value, cwd):
         return _PATH_REASON
@@ -1251,10 +1502,10 @@ def _exported_assignments(words: list[str]) -> list[str]:
     for operand in (a for a in words[1:] if a not in flags):
         name = operand.partition("=")[0].removesuffix("+")
         if operand == name:  # bare NAME
-            keep = name in _LOADER_ENV_VARS
+            keep = _is_loader_var(name)
         else:
             keep = bool(_ASSIGN_OR_APPEND_RE.match(operand)) and (
-                exported or name in _LOADER_ENV_VARS or name == "PATH"
+                exported or _is_loader_var(name) or name == "PATH"
             )
         if keep:
             found.append(operand)
@@ -1382,6 +1633,23 @@ def _pixi_unknown_global(args: list[str], flags: frozenset[str] = _PIXI_GLOBAL_F
     return False
 
 
+def _unknown_leading_flag(args: list[str], flags: frozenset[str], values: frozenset[str]) -> bool:
+    """Whether an option before the subcommand/script is outside the known boolean/value flags."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--" or not a.startswith("-") or a == "-":
+            return False
+        name, eq, _ = a.partition("=")
+        if name in values:
+            i += 1 if eq else 2
+        elif name in flags:
+            i += 1
+        else:
+            return True
+    return False
+
+
 _UV_VALUE = frozenset(
     {"--directory", "--project", "--with", "--with-editable", "--with-requirements", "--python"}
     | {"-p", "--package", "--env-file", "--index", "--default-index", "--index-url", "-i"}
@@ -1408,6 +1676,60 @@ _PM_RUN_BIN = frozenset({"run", "run-script", "rum", "urn"})
 _EXEC_VALUE = frozenset(
     {"-p", "--package", "-w", "--workspace", "--prefix", "--registry", "--cache", "--userconfig"}
 )
+_BUN_VALUE = _BUN_LONG_VALUE | {"-r", "-d", "-l", "-c", "-e", "-p", "--eval", "--print"}
+_BUN_UNPIN = frozenset({"--cwd", "--config", "-c", "--env-file", "--tsconfig-override"})
+_BUN_PASSIVE = _PM_NON_RUN | {"build", "pm", "repl", "upgrade", "completions", "help"}
+# bun/deno options accepted before the subcommand or script; any other one fails closed
+_BUN_FLAGS = frozenset(
+    {"--watch", "--hot", "--smol", "--bun", "-b", "--silent", "--no-install", "--prefer-offline"}
+    | {"--prefer-latest", "--no-addons", "--no-clear-screen", "--no-macros", "--if-present"}
+    | {"--no-summary", "--verbose", "--install", "-h", "--help", "-v", "--version", "--revision"}
+)
+_DENO_GLOBAL_FLAGS = frozenset({"-h", "--help", "-V", "--version", "-q", "--quiet", "--no-color"})
+_DENO_GLOBAL_VALUE = frozenset({"-L", "--log-level"})
+_BUN_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+# deno subcommands that do not run a script given on the command line
+_DENO_PASSIVE = frozenset(
+    {"fmt", "lint", "check", "info", "install", "uninstall", "upgrade"}
+    | {"compile", "cache", "doc", "init", "add", "remove", "outdated", "completions", "help"}
+    | {"types", "publish", "lsp", "clean", "coverage", "vendor", "create"}
+)
+# deno run/eval options; an unknown one could swallow the script operand, so it fails closed
+_DENO_FLAGS = frozenset(
+    {"-q", "--quiet", "--no-check", "--check", "--no-prompt", "-A", "--allow-all", "--no-remote"}
+    | {"--cached-only", "--no-npm", "--no-lock", "--reload", "-r", "--watch", "--unstable"}
+    | {"--no-clear-screen", "--no-config", "-p", "--print"}
+)
+_DENO_PREFIXES = ("--allow-", "--deny-", "--unstable-")
+_DENO_VALUE = frozenset(
+    {"--config", "-c", "--import-map", "--cert", "--location", "--seed", "--ext"}
+)
+_DENO_FILE_FLAGS = frozenset({"--config", "-c", "--import-map"})
+
+
+def _deno_options(args: list[str]) -> tuple[list[str], list[str], bool]:
+    """(files of --config/--import-map, operands, unknown option) of the args after run/eval."""
+    files: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return files, args[i + 1 :], False
+        if not a.startswith("-") or a == "-":
+            break
+        name, eq, val = a.partition("=")
+        if name in _DENO_VALUE:
+            value = val if eq else (args[i + 1] if i + 1 < len(args) else "")
+            if name in _DENO_FILE_FLAGS:
+                files.append(value)
+            i += 1 if eq else 2
+        elif name in _DENO_FLAGS or name.startswith(_DENO_PREFIXES):
+            i += 1
+        else:
+            return files, [], True
+    return files, args[i:], False
+
+
 # Heads that only read/transform data or manage packages: an interpreter name among their
 # arguments is data, not a command to run (rule 7: unknown heads fail closed otherwise).
 _DATA_HEADS = frozenset(
@@ -1483,8 +1805,14 @@ def _split_runner(
     return args[i], args[i + 1 :], got
 
 
-def _prog_files(args: list[str], value_flags: str, attached_flags: str = "") -> list[str]:
-    """Program files named by `-f FILE` / `--file=FILE` of awk / sed."""
+def _prog_files(
+    args: list[str],
+    value_flags: str,
+    attached_flags: str = "",
+    file_flag: str = "f",
+    long_file: str = "--file",
+) -> list[str]:
+    """Files named by `-f FILE` / `--file=FILE` of awk / sed (or gawk `-i` / `--include`)."""
     files: list[str] = []
     i = 0
     while i < len(args):
@@ -1493,7 +1821,7 @@ def _prog_files(args: list[str], value_flags: str, attached_flags: str = "") -> 
             break
         if a.startswith("--"):
             name, eq, val = a.partition("=")
-            if name == "--file":
+            if name == long_file:
                 files += [val] if eq else args[i + 1 : i + 2]
                 i += 1 if eq else 2
             else:
@@ -1505,7 +1833,7 @@ def _prog_files(args: list[str], value_flags: str, attached_flags: str = "") -> 
         step = 1
         for pos, ch in enumerate(a[1:]):
             rest = a[pos + 2 :]
-            if ch == "f":
+            if ch == file_flag:
                 files += [rest] if rest else args[i + 1 : i + 2]
                 step = 1 if rest else 2
                 break
@@ -1755,8 +2083,9 @@ class _Analyzer:
         if spec is not None:
             self.interpreter(spec, args, cmd, depth)
         elif base in ("awk", "gawk", "mawk", "nawk"):
-            for f in _prog_files(args, "Fve"):
-                self.add_file(f)
+            self.awk(args)
+        elif base == "go":
+            self.go(args)
         elif base == "sed":
             for f in _prog_files(args, "el", "i"):
                 self.add_file(f)
@@ -1772,6 +2101,73 @@ class _Analyzer:
             self.pm_inner("exec", args, depth)
         elif base not in _DATA_HEADS:
             self.unknown_head(base, args, depth)
+
+    def awk(self, args: list[str]) -> None:
+        loads, operand = _awk_scan(args)
+        if loads:
+            self.unpin("gawk -l/--load loads a compiled extension that cannot be pinned")
+        files = _prog_files(args, "Fvel")
+        for f in files:
+            self.add_file(f)
+        # gawk -i FILE / --include=FILE: found as given, then with `.awk` appended
+        includes = _prog_files(args, "Fvefl", file_flag="i", long_file="--include")
+        for f in includes:
+            if _literal(f):
+                self.pin_inline([f, f + ".awk"])
+            else:
+                self.add_file(f)  # unpinnable
+        texts = _prog_files(args, "Fvfil", file_flag="e", long_file="--source")
+        if not files and not texts and operand is not None:
+            texts = [operand]
+        seen: set[str] = set()
+        for f in [*files, *includes]:
+            if _literal(f):
+                self.awk_follow_file(f, seen, 0)
+        for text in texts:
+            self.awk_follow_text(text, seen, 0)
+
+    def awk_path(self, name: str) -> str | None:
+        """Realpath of the first existing file among `name`, `name.awk` (gawk's @include rule)."""
+        for cand in (name, name + ".awk"):
+            for path in _ref_paths(ScriptRef(cand, tuple(self.bases)), self.cwd):
+                if os.path.isfile(path):
+                    return path
+        return None
+
+    def awk_follow_file(self, name: str, seen: set[str], depth: int) -> None:
+        path = self.awk_path(name)
+        if path is None or path in seen:
+            return
+        seen.add(path)
+        data = _read_capped(path)
+        if data is None:
+            self.unpin(f"awk source {name} is too large to scan for @include")
+            return
+        self.awk_follow_text(data.decode("utf-8", "replace"), seen, depth)
+
+    def awk_follow_text(self, text: str, seen: set[str], depth: int) -> None:
+        """Pin the files `@include` pulls into awk source `text`, recursively (cycle-safe)."""
+        if depth >= _AWK_INCLUDE_DEPTH:
+            self.unpin("awk @include nesting is too deep to pin")
+            return
+        names, ok = _awk_includes(text)
+        if not ok:
+            self.unpin("awk source loads an extension or has a non-literal @include")
+            return
+        for name in names:
+            if not _literal(name):
+                self.add_file(name)  # unpinnable
+                continue
+            self.pin_inline([name, name + ".awk"])
+            if not self.base_unknown:
+                self.awk_follow_file(name, seen, depth + 1)
+
+    def go(self, args: list[str]) -> None:
+        sub, rest, _ = _split_runner(args, frozenset({"-C"}), frozenset())
+        if sub == "run" and rest:
+            self.unpin("go run compiles and runs code that cannot be pinned")
+        elif sub == "generate":
+            self.unpin("go generate runs commands named in source files")
 
     def unknown_head(self, base: str, args: list[str], depth: int) -> None:
         """Fail closed for an unlisted wrapper/launcher (strace, watch, ssh, trap, alias, ...).
@@ -1811,6 +2207,22 @@ class _Analyzer:
         # prepare() turns heredoc / here-string openers into sentinel words
         heredoc = any(a.startswith(SENTINEL_PREFIX) for a in args)
         args = [a for a in args if not a.startswith(SENTINEL_PREFIX)]
+        if spec.cli == "deno":
+            self.deno(spec, args, (heredoc, cmd), depth)
+            return
+        if spec.cli == "bun":
+            bun_args = self.bun_args(args, depth)
+            if bun_args is None:
+                return
+            args = bun_args
+        if (
+            spec.unpin_options
+            and args[:1]
+            and args[0].startswith("-")
+            and args[0] not in ("-", "--")
+        ):
+            self.unpin("interpreter options are not modelled; run a literal script file")
+            return
         opts = _option_values(spec, args)
         if not opts.chdir:
             self.run_interpreter(spec, args, opts, (heredoc, cmd), depth)
@@ -1837,12 +2249,12 @@ class _Analyzer:
         heredoc, cmd = source
         self.option_refs(spec, opts)
         kind, operand = _scan_options(spec, args)
+        for code in opts.code:
+            self.inline_code(spec, code, depth)
+        if kind != "none" or opts.code:
+            self.implicit_refs(spec, opts)
         if heredoc and kind in ("stdin", "stdin!"):
-            if self.text_expands():
-                self.unpin("heredoc/here-string feeding an interpreter expands $ or backticks")
-            elif spec.lang:
-                for body in self.heredoc_bodies():
-                    self.inline_imports(spec.lang, body)
+            self.heredoc_stdin(spec.lang)
             return
         if kind == "file" and operand is not None:
             self.add_file(operand)
@@ -1922,6 +2334,8 @@ class _Analyzer:
         expands, subst, code = self.inline_word(operand)
         if subst:
             self.unpin("inline code is assembled by a command substitution")
+        elif spec.opaque_inline:
+            self.unpin("inline code of this interpreter cannot be pinned")
         elif spec.lang and self.has_ansi_c():
             self.unpin("inline code uses $'...' quoting, whose escapes are decoded by the shell")
         elif spec.lang:
@@ -1933,7 +2347,7 @@ class _Analyzer:
 
     def resolve_candidates(self, operand: str, lang: str) -> list[str]:
         """Files node/ruby would try for `operand` (as given, suffixed, index), in order."""
-        suffixes, indexes = _RESOLVE[lang]
+        suffixes, indexes = _RESOLVE.get(lang, ((), ()))
         return [operand, *(operand + s for s in suffixes)] + [
             posixpath.join(operand, i) for i in indexes
         ]
@@ -1948,12 +2362,42 @@ class _Analyzer:
         for value in opts.preload:
             if not _literal(value):
                 self.add_file(value)  # unpinnable: not a literal path
+            elif spec.lang == "lua":  # lua -l NAME: a module found through ./?.lua
+                self.pin_inline_paths([_lua_module_path(value)], "lua")
             elif value.startswith(_OPTION_PATH_PREFIXES):
                 self.add_file(self.resolve_local(value, spec.lang) or value)
             elif spec.lang == "node" and not _is_node_builtin(value):
                 self.non_durable(_node_modules_reason("preload", value))
+        for value in opts.files:  # php -d auto_prepend_file= / auto_append_file=
+            self.add_file(value)
+        for value in opts.configs:  # php -c
+            self.config_ref(value)
         if opts.include:
             self.non_durable(_INCLUDE_REASON)
+        if opts.ini_search:
+            self.non_durable(_INI_SEARCH_REASON)
+        for reason in opts.unsafe:
+            self.unpin(reason)
+
+    def config_ref(self, value: str) -> None:
+        """A config file (or a directory holding php.ini): pinned, but not a script run."""
+        if not _literal(value):
+            self.unpin(f"config path {value!r} is not a literal path")
+        elif value.endswith(".ini"):
+            self.add_file(value, script=False)
+        else:
+            self._ref(value, "search", ("php.ini",))
+
+    def implicit_refs(self, spec: _Interp, opts: _Options) -> None:
+        """Pin cwd files the interpreter loads on its own (Rscript .Rprofile, bun bunfig.toml)."""
+        off = dict(spec.implicit_off)
+        for name in spec.implicit_files:
+            if any(flag in opts.flags for flag in off.get(name, ())):
+                continue
+            exists = self.local_file_exists(name)
+            self.emit(
+                ScriptRef(".", tuple(self.bases), "search", (name,), required=False, script=exists)
+            )
 
     def inline_imports(self, lang: str, code: str, *, expanded: bool = False) -> None:
         """Pin the local files inline code (-c / -e / heredoc) imports; fail closed if unsure.
@@ -1963,12 +2407,19 @@ class _Analyzer:
         """
         if lang == "python":
             self.inline_python(code, expanded=expanded)
-        elif lang == "node":
-            self.inline_node(code, expanded=expanded)
-        elif _ruby_dynamic(code, expanded=expanded):
-            self.unpin("inline ruby code requires a file that cannot be resolved statically")
+        elif lang in ("node", "deno"):
+            self.inline_node(code, expanded=expanded, remote_unpinnable=lang == "deno")
+        elif lang == "ruby":
+            if _ruby_dynamic(code, expanded=expanded):
+                self.unpin("inline ruby code requires a file that cannot be resolved statically")
+            else:
+                self.pin_inline_paths(_ruby_requires(code), "ruby")
         else:
-            self.pin_inline_paths(_ruby_requires(code), "ruby")
+            operands, dynamic = _LOAD_SCANNERS[lang](code)
+            if dynamic:
+                self.unpin(f"inline {lang} code loads a file that cannot be resolved statically")
+            else:
+                self.pin_inline_paths(operands, lang)
 
     def pin_inline(self, files: list[str]) -> None:
         """Pin every candidate file; an absent one is pinned as MISSING (created later: mismatch).
@@ -2002,10 +2453,13 @@ class _Analyzer:
         elif names:
             self.pin_inline(_python_import_files(names))
 
-    def inline_node(self, code: str, *, expanded: bool) -> None:
+    def inline_node(self, code: str, *, expanded: bool, remote_unpinnable: bool = False) -> None:
         specs, dynamic = _node_specifiers(code, expanded=expanded)
         if dynamic:
             self.unpin("inline node code requires a module that cannot be resolved statically")
+            return
+        if remote_unpinnable and any(_is_remote(s) for s in specs):
+            self.unpin("inline deno code imports a remote specifier")
             return
         local = [s for s in specs if s.startswith(_PATH_PREFIXES)]
         for spec in dict.fromkeys(specs):
@@ -2026,6 +2480,14 @@ class _Analyzer:
         if any(os.path.exists(p) for p in _ref_paths(ref, self.cwd)):
             ref = ScriptRef(name, tuple(self.bases), "module", required=False)
         self.plan.refs.append(ref)
+
+    def heredoc_stdin(self, lang: str) -> None:
+        """A heredoc/here-string script: its text is in the command unless $ or ` assembles it."""
+        if self.text_expands():
+            self.unpin("heredoc/here-string feeding an interpreter expands $ or backticks")
+        elif lang:
+            for body in self.heredoc_bodies():
+                self.inline_imports(lang, body)
 
     def stdin(self, cmd: _Simple, *, explicit: bool, depth: int) -> None:
         for op, target in cmd.redirs:
@@ -2245,6 +2707,84 @@ class _Analyzer:
             inner = [sub, *rest]
         if inner:
             self.command(inner, _Simple(list(inner)), depth)
+
+    def deno(
+        self, spec: _Interp, args: list[str], source: tuple[bool, _Simple], depth: int
+    ) -> None:
+        """`deno run FILE` / `deno eval CODE`; tasks, unknown options and URLs fail closed."""
+        heredoc, cmd = source
+        if _unknown_leading_flag(args, _DENO_GLOBAL_FLAGS, _DENO_GLOBAL_VALUE):
+            self.unpin("unrecognised deno option before the subcommand")
+            return
+        sub, rest, _ = _split_runner(args, _DENO_GLOBAL_VALUE, frozenset())
+        if sub is None or sub in _DENO_PASSIVE:
+            return
+        if sub not in ("run", "eval"):
+            self.unpin(f"deno {sub} runs code that cannot be pinned")
+            return
+        files, operands, unknown = _deno_options(rest)
+        if unknown:
+            self.unpin("unrecognised deno option before the script")
+            return
+        for f in files:
+            if _is_remote(f):
+                self.unpin("deno config or import map is a remote specifier")
+            else:
+                self.add_file(f, script=False)
+        operand = operands[0] if operands else None
+        if operand is None:
+            return
+        if sub == "run" and _URL_RE.match(operand):
+            self.unpin("deno runs a remote or URL specifier")
+        elif operand == "-":
+            if heredoc:
+                self.heredoc_stdin(spec.lang)
+            else:
+                self.stdin(cmd, explicit=True, depth=depth)
+        elif sub == "eval":
+            self.inline_code(spec, operand, depth)
+        else:
+            self.add_file(operand)
+
+    def bun_is_file(self, operand: str) -> bool:
+        return (
+            operand.startswith(_PATH_PREFIXES)
+            or operand.endswith(_BUN_EXTS)
+            or self.local_file_exists(operand)
+        )
+
+    def bun_args(self, args: list[str], depth: int) -> list[str] | None:
+        """bun args to interpret as a script run (`run` dropped); None when handled here.
+
+        `bun run NAME` / `bun NAME` with no such file is an npm-style script: the package.json
+        manifest is pinned like `npm run`. `bun x PKG` is `bunx`. Options that change the config
+        file or directory are unpinnable.
+        """
+        sub, rest, got = _split_runner(args, _BUN_VALUE, _BUN_UNPIN)
+        if got:
+            self.unpin("bun option changes the config file or working directory")
+            return None
+        if _unknown_leading_flag(args, _BUN_FLAGS, _BUN_VALUE):
+            self.unpin("unrecognised bun option before the subcommand or script")
+            return None
+        if sub is None:
+            return args
+        if sub == "test":
+            self.unpin("bun test runs discovered code that cannot be pinned")
+            return None
+        if sub in _BUN_PASSIVE:
+            return None
+        if sub == "x":
+            self.implicit_refs(_BUN, _Options())
+            self.pm_inner("exec", rest, depth)
+            return None
+        pos = len(args) - len(rest) - 1
+        target = _split_runner(rest, _BUN_VALUE, frozenset())[0] if sub == "run" else sub
+        if target is not None and not self.bun_is_file(target):
+            self.implicit_refs(_BUN, _Options())
+            self.node_pm("bun", args if sub == "run" else [*args[:pos], "run", *args[pos:]], depth)
+            return None
+        return [*args[:pos], *rest] if sub == "run" else args
 
 
 def analyze(command: str, cwd: str) -> Plan:
