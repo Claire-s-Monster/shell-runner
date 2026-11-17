@@ -437,11 +437,32 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   argument that is not one plain literal; and any `xargs` whose command is a runner (make, pixi, uv, npm, yarn, pnpm), an interpreter or a
   wrapper (`nice`, `env`, `timeout`, ...) around one. `xargs env VAR=... cmd` is still
   checked for loader variables. Not detected: `importlib` / `__import__`, namespace
-  packages, `.so` / `.pyc` modules, `package.json` `"main"` resolution, and interpreters
-  not yet recognised (#98 item 3). Also not covered (#116): here-strings, `echo ... |
-  python`, perl/php `-e` code, and `python -c "$CODE"` without a literal `import`.
-  Best-effort static analysis (`ast` for python,
-  patterns for node/ruby).
+  packages, `.so` / `.pyc` modules, `package.json` `"main"` resolution. Also not covered
+  (#116): here-strings, `echo ... | python`, perl/php `-e` code, and `python -c "$CODE"`
+  without a literal `import`. Best-effort static analysis (`ast` for python, patterns for
+  node/ruby).
+- **More interpreters (#98).** Pinned like the ones above, including `/path/to/` heads:
+  `pypy*`, versioned `perl5.x`/`ruby3.x`/`php8.x`/`lua5.x`, `gawk`/`mawk`/`nawk`, `csh`/`tcsh`
+  (script file only; any `-c` body is unpinnable), `tclsh`/`wish`/`osascript` (file operand;
+  any option is unpinnable), `lua`/`luajit` (`-e` literal `require`/`dofile`/`loadfile`,
+  `-l mod`), `Rscript` (`-e` literal `source`/`sys.source`; `./.Rprofile` unless `--vanilla`/
+  `--no-init-file`, `./.Renviron` unless `--vanilla`/`--no-environ`), `php` (`-r` literal
+  `require`/`include`, `-d auto_prepend_file=`/`auto_append_file=` with spaces/quotes
+  normalised, `-c`), `gawk -i`/`--include` and `@include "file"` (followed recursively in
+  `-f` files and `-e`/`--source` text, cycle-safe, depth 16, whole files only), `bun` (file,
+  `bun run FILE`, `-e`, `--preload`, `./bunfig.toml` on every path; `bun run NAME` pins
+  `package.json`), `deno run FILE` / `deno eval` / `deno run -` heredocs (`--config`,
+  `--import-map` pinned). Fail closed: `go run`, `go generate`, test runners (`deno test`/
+  `bench`, `bun test`), `deno task` and other deno subcommands that run code, remote deno
+  specifiers, any flag before a deno/bun subcommand or script outside a known-flag
+  allowlist, `gawk -l`/`@load`, `php -d extension=`/`zend_extension=`/`-z`, and search-path
+  changes in inline code (lua `package.path`/`cpath`, php `set_include_path`/`ini_set
+  include_path`, R `.libPaths`, `parse(file)`, `do.call(source)`). Non-durable: `LUA_*`,
+  `R_PROFILE*`, `R_ENVIRON*`, `R_LIBS*`, `PHPRC`, `PHP_INI_SCAN_DIR`, `php -d include_path`,
+  `AWKPATH`, `AWKLIBPATH`, `BUN_OPTIONS`, `PERL5DB`, `TCLLIBPATH`, `TCL_LIBRARY`. Not covered:
+  `go test` (pending a decision; currently not pinned), `npx`/`bunx <pkg>` package code,
+  `$HOME` startup files (`~/.cshrc`, `~/.Rprofile`), and dynamic loading the literal scans
+  cannot see.
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 
