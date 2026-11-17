@@ -428,13 +428,17 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   site-packages imports add nothing. `uv run --env-file F` pins F and scans all of it (over
   8 MiB: unpinnable); a loader variable or unsafe `PATH` inside is non-durable.
   Fail closed (unpinnable): an unknown `cd`/`pushd` target or non-literal `ruby -C` before
-  inline code that imports; unparseable or shell-expanded (`$`, backticks) python code with
-  an `import`; a node `require(`/`import(` argument that is not one plain literal; and any
-  `xargs` whose command is a runner (make, pixi, uv, npm, yarn, pnpm), an interpreter or a
+  inline code that imports; unparseable or shell-expanded python code with an `import`
+  (`$` / backticks count only where the shell expands them: not inside single quotes, after
+  a backslash in double quotes, or in the body of a quoted-delimiter heredoc); inline code
+  using `$'..'` quoting (escapes decoded by the shell); a node `require(`/`import(`
+  argument that is not one plain literal; and any `xargs` whose command is a runner (make, pixi, uv, npm, yarn, pnpm), an interpreter or a
   wrapper (`nice`, `env`, `timeout`, ...) around one. `xargs env VAR=... cmd` is still
   checked for loader variables. Not detected: `importlib` / `__import__`, namespace
   packages, `.so` / `.pyc` modules, `package.json` `"main"` resolution, and interpreters
-  not yet recognised (#98 item 3). Best-effort static analysis (`ast` for python,
+  not yet recognised (#98 item 3). Also not covered (#116): here-strings, `echo ... |
+  python`, perl/php `-e` code, and `python -c "$CODE"` without a literal `import`.
+  Best-effort static analysis (`ast` for python,
   patterns for node/ruby).
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).

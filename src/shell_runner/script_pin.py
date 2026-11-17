@@ -337,11 +337,11 @@ def _python_import_files(names: set[str]) -> list[str]:
     return list(dict.fromkeys(files))
 
 
-def _node_specifiers(code: str) -> tuple[list[str], bool]:
+def _node_specifiers(code: str, *, expanded: bool = True) -> tuple[list[str], bool]:
     """(string-literal module specifiers in `code`, whether one is not statically knowable).
 
     A `require(` / `import(` argument that is not a single plain string literal, or a literal
-    containing `$` (the shell may have expanded it), makes the code dynamic.
+    containing `$` when the shell expands the code word (`expanded`), makes the code dynamic.
     """
     specs: list[str] = []
     dynamic = False
@@ -352,7 +352,7 @@ def _node_specifiers(code: str) -> tuple[list[str], bool]:
         else:
             specs.append(lit[2])
     specs += [m[2] for m in _NODE_STATIC_RE.finditer(code)]
-    return specs, dynamic or any("$" in s for s in specs)
+    return specs, dynamic or (expanded and any("$" in s for s in specs))
 
 
 def _is_node_builtin(spec: str) -> bool:
@@ -808,6 +808,212 @@ def _cooked_words(text: str) -> list[str]:
     if cur is not None:
         words.append("".join(cur))
     return words
+
+
+@dataclass
+class _RawWord:
+    """One shell word of the raw command text, with what its quoting means."""
+
+    shlex: str = ""  # unquoted like shlex (the form the tokenizer hands to the analysis)
+    bash: str = ""  # unquoted like bash (`\$` in double quotes is `$`)
+    expands: bool = False  # an unquoted / double-quoted, unescaped `$` or backtick
+    subst: bool = False  # ... that is a command substitution (`$(` or backtick)
+    ansi: bool = False  # contains `$'...'` (escapes decoded by the shell)
+    quoted: bool = False  # any quoting or backslash (a quoted heredoc delimiter)
+
+
+@dataclass
+class _Heredoc:
+    delimiter: str
+    strip_tabs: bool
+    quoted: bool
+    body: str = ""
+
+
+@dataclass
+class _ShellScan:
+    words: list[_RawWord] = field(default_factory=list)
+    heredocs: list[_Heredoc] = field(default_factory=list)
+    ok: bool = True  # False: quoting could not be followed (callers scan naively)
+
+
+_WORD_END = frozenset(" \t\r\f\v;&|()<>")
+
+
+class _ShellScanner:
+    """Quote-aware scan of command text: words (single / double quotes, backslashes,
+    `$'..'`, `$".."`) and heredocs (a quoted delimiter makes the body literal)."""
+
+    def __init__(self, text: str) -> None:
+        self.t = text
+        self.i = 0
+        self.scan = _ShellScan()
+        self.cur: _RawWord | None = None
+        self.expect: bool | None = None  # after `<<` / `<<-`: the next word is the delimiter
+        self.strip = False
+        self.pending: list[_Heredoc] = []
+
+    def run(self) -> _ShellScan:
+        n = len(self.t)
+        while self.i < n and self.scan.ok:
+            c = self.t[self.i]
+            if c == "\n":
+                self.end_word()
+                self.i += 1
+                self.read_bodies()
+            elif c == "<":
+                self.redirect()
+            elif c in _WORD_END:
+                self.end_word()
+                self.i += 1
+            elif c == "#" and self.cur is None:
+                end = self.t.find("\n", self.i)
+                self.i = n if end < 0 else end
+            else:
+                self.word_char(c)
+        self.end_word()
+        return self.scan
+
+    def redirect(self) -> None:
+        self.end_word()
+        if self.t.startswith("<<<", self.i):
+            self.i += 3
+        elif self.t.startswith("<<", self.i):
+            if "((" in self.t[: self.i] or "$[" in self.t[: self.i]:
+                self.scan.ok = False  # `<<` may be an arithmetic shift: stay strict
+                return
+            self.strip = self.t.startswith("<<-", self.i)
+            self.i += 3 if self.strip else 2
+            self.expect = True
+        else:
+            self.i += 1
+
+    def end_word(self) -> None:
+        word, self.cur = self.cur, None
+        if word is None:
+            return
+        self.scan.words.append(word)
+        if self.expect:
+            self.expect = None
+            doc = _Heredoc(word.bash, self.strip, word.quoted)
+            self.scan.heredocs.append(doc)
+            self.pending.append(doc)
+
+    def read_bodies(self) -> None:
+        lines = self.t[self.i :].split("\n")
+        used = 0
+        for doc in self.pending:
+            body: list[str] = []
+            while used < len(lines):
+                line = lines[used]
+                used += 1
+                if (line.lstrip("\t") if doc.strip_tabs else line) == doc.delimiter:
+                    break
+                body.append(line)
+            doc.body = "\n".join(body)
+        self.pending = []
+        self.i = min(len(self.t), self.i + sum(len(x) + 1 for x in lines[:used]))
+
+    def word(self) -> _RawWord:
+        if self.cur is None:
+            self.cur = _RawWord()
+        return self.cur
+
+    def add(self, bash: str, shlex: str | None = None) -> None:
+        w = self.word()
+        w.bash += bash
+        w.shlex += bash if shlex is None else shlex
+
+    def mark(self, *, subst: bool) -> None:
+        w = self.word()
+        w.expands = True
+        w.subst = w.subst or subst
+
+    def word_char(self, c: str) -> None:
+        if c == "\\":
+            self.backslash()
+        elif c == "'":
+            self.single()
+        elif c == '"':
+            self.double()
+        elif c == "$":
+            self.dollar()
+        else:
+            if c == "`":
+                self.mark(subst=True)
+            self.add(c)
+            self.i += 1
+
+    def backslash(self) -> None:
+        nxt = self.t[self.i + 1 : self.i + 2]
+        self.i += 2
+        if nxt == "\n":  # line continuation
+            return
+        self.word().quoted = True
+        self.add(nxt or "\\")
+
+    def single(self) -> None:
+        end = self.t.find("'", self.i + 1)
+        if end < 0:
+            self.scan.ok = False
+            return
+        self.word().quoted = True
+        self.add(self.t[self.i + 1 : end])
+        self.i = end + 1
+
+    def double(self) -> None:
+        self.word().quoted = True
+        self.i += 1
+        n = len(self.t)
+        while self.i < n:
+            c = self.t[self.i]
+            if c == '"':
+                self.i += 1
+                return
+            if c == "\\" and self.i + 1 < n:
+                self.dq_escape(self.t[self.i + 1])
+                self.i += 2
+                continue
+            if c == "`" or (c == "$" and self.t[self.i + 1 : self.i + 2] in ("(", "{")):
+                self.scan.ok = False  # nested quoting inside the expansion: stay strict
+                return
+            if c == "$":
+                self.mark(subst=False)
+            self.add(c)
+            self.i += 1
+        self.scan.ok = False
+
+    def dq_escape(self, nxt: str) -> None:
+        if nxt in '$`"\\':
+            self.add(nxt, nxt if nxt in '"\\' else "\\" + nxt)
+        elif nxt == "\n":  # line continuation: joined, as in bash and shellprep
+            self.add("")
+        else:
+            self.add("\\" + nxt)
+
+    def dollar(self) -> None:
+        nxt = self.t[self.i + 1 : self.i + 2]
+        if nxt == "'":  # ANSI-C quoting: escapes decoded by the shell
+            end = self.i + 2
+            while end < len(self.t) and self.t[end] != "'":
+                end += 2 if self.t[end] == "\\" else 1
+            w = self.word()
+            w.ansi = w.quoted = True
+            if end >= len(self.t):
+                self.scan.ok = False
+            self.add(self.t[self.i + 2 : end])
+            self.i = end + 1
+        elif nxt == '"':  # locale translation: a double-quoted string
+            self.i += 1
+            self.double()
+        else:
+            self.mark(subst=nxt == "(")
+            self.add("$")
+            self.i += 1
+
+
+def _scan_shell(text: str) -> _ShellScan:
+    return _ShellScanner(text).run()
 
 
 # `NAME=value` or the append form `NAME+=value` (write_targets._ASSIGN_RE only has the first)
@@ -1274,6 +1480,7 @@ class _Analyzer:
         self.base_unknown = False
         self.text = ""  # raw text of the command string being analyzed
         self.raw_words: list[str] = []  # its words, unquoted with literal `$` marked
+        self.scan: _ShellScan | None = None  # its quote-aware scan (words, heredocs)
         # (bases, base_unknown) to restore after a systemd-run unwrap
         self.wd_saved: tuple[list[str], bool] | None = None
 
@@ -1335,6 +1542,7 @@ class _Analyzer:
             return
         saved, self.text = self.text, text
         saved_raw, self.raw_words = self.raw_words, _cooked_words(text)
+        saved_scan, self.scan = self.scan, _scan_shell(text)
         try:
             for cmd in _split_commands(tokens):
                 assigns: list[str] = []
@@ -1345,7 +1553,7 @@ class _Analyzer:
                 if words:
                     self.command(words, cmd, depth)
         finally:
-            self.text, self.raw_words = saved, saved_raw
+            self.text, self.raw_words, self.scan = saved, saved_raw, saved_scan
 
     def probe(self, text: str, depth: int) -> bool:
         """Whether `text`, parsed as a command string, runs a script (or is unpinnable)."""
@@ -1550,25 +1758,94 @@ class _Analyzer:
         self.option_refs(spec, opts)
         kind, operand = _scan_options(spec, args)
         if heredoc and kind in ("stdin", "stdin!"):
-            if "$" in self.text or "`" in self.text:
+            if self.text_expands():
                 self.unpin("heredoc/here-string feeding an interpreter expands $ or backticks")
             elif spec.lang:
-                for body in _heredoc_bodies(self.text):
+                for body in self.heredoc_bodies():
                     self.inline_imports(spec.lang, body)
             return
         if kind == "file" and operand is not None:
             self.add_file(operand)
         elif kind == "inline" and operand is not None:
-            if "$(" in operand or "`" in operand:
-                self.unpin("inline code is assembled by a command substitution")
-            elif spec.shell:
-                self.run(operand, depth + 1)
-            elif spec.lang:
-                self.inline_imports(spec.lang, operand)
+            self.inline_code(spec, operand, depth)
         elif kind == "module" and operand is not None:
             self.module(operand)
         elif kind in ("stdin", "stdin!"):
             self.stdin(cmd, explicit=kind == "stdin!", depth=depth)
+
+    def text_expands(self) -> bool:
+        """Whether the shell expands `$` / backticks anywhere the interpreter's input is built.
+
+        Single-quoted or escaped characters and the body of a quoted-delimiter heredoc are
+        literal. When the quoting cannot be followed, any `$` or backtick counts.
+        """
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return "$" in self.text or "`" in self.text
+        return any(w.expands for w in scan.words) or any(
+            not h.quoted and ("$" in h.body or "`" in h.body) for h in scan.heredocs
+        )
+
+    def heredoc_bodies(self) -> list[str]:
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return _heredoc_bodies(self.text)
+        return [h.body for h in scan.heredocs]
+
+    def inline_word(self, operand: str) -> tuple[bool, bool, str]:
+        """(shell expands in it, ... by command substitution, code) for inline code `operand`.
+
+        The words of the raw command text containing the operand say how it was quoted; if
+        none does (the tokenizer rewrote it), any `$` / backtick in the operand counts. The
+        code is the bash-unquoted form (`\\$1` in double quotes is `$1`) of an exact match.
+        """
+        cands = self.exact_words(operand)
+        if not cands:
+            return "$" in operand or "`" in operand, "$(" in operand or "`" in operand, operand
+        bashes = {w.bash for w in cands}
+        code = bashes.pop() if len(bashes) == 1 and not any(w.ansi for w in cands) else operand
+        return any(w.expands for w in cands), any(w.subst for w in cands), code
+
+    def exact_words(self, operand: str) -> list[_RawWord]:
+        """Raw words whose shlex-unquoted form is exactly `operand` (none: quoting unknown)."""
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return []
+        return [w for w in scan.words if w.shlex == operand]
+
+    def has_ansi_c(self) -> bool:
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return "$'" in self.text
+        return any(w.ansi for w in scan.words)
+
+    def shell_body(self, operand: str, depth: int) -> None:
+        """Recurse into a shell `-c` body as the inner shell receives it (bash-unquoted)."""
+        if "$(" in operand or "`" in operand:
+            self.unpin("inline code is assembled by a command substitution")
+            return
+        cands = self.exact_words(operand)
+        bashes = {w.bash for w in cands}
+        if len(bashes) == 1 and not any(w.ansi for w in cands):
+            body = bashes.pop()
+        elif "\\$" in operand or "\\`" in operand:
+            self.unpin("shell -c body has an escaped $ or backtick whose quoting is unknown")
+            return
+        else:
+            body = operand
+        self.run(body, depth + 1)
+
+    def inline_code(self, spec: _Interp, operand: str, depth: int) -> None:
+        if spec.shell:  # the nested command string is analyzed on its own
+            self.shell_body(operand, depth)
+            return
+        expands, subst, code = self.inline_word(operand)
+        if subst:
+            self.unpin("inline code is assembled by a command substitution")
+        elif spec.lang and self.has_ansi_c():
+            self.unpin("inline code uses $'...' quoting, whose escapes are decoded by the shell")
+        elif spec.lang:
+            self.inline_imports(spec.lang, code, expanded=expands)
 
     def local_file_exists(self, operand: str) -> bool:
         ref = ScriptRef(operand, tuple(self.bases))
@@ -1594,12 +1871,16 @@ class _Analyzer:
         if opts.include:
             self.non_durable(_INCLUDE_REASON)
 
-    def inline_imports(self, lang: str, code: str) -> None:
-        """Pin the local files inline code (-c / -e / heredoc) imports; fail closed if unsure."""
+    def inline_imports(self, lang: str, code: str, *, expanded: bool = False) -> None:
+        """Pin the local files inline code (-c / -e / heredoc) imports; fail closed if unsure.
+
+        `expanded`: the shell expands `$` / backticks in the code word (heredocs are checked
+        before this is reached).
+        """
         if lang == "python":
-            self.inline_python(code)
+            self.inline_python(code, expanded=expanded)
         elif lang == "node":
-            self.inline_node(code)
+            self.inline_node(code, expanded=expanded)
         else:
             self.pin_inline_paths(_ruby_requires(code), "ruby")
 
@@ -1614,9 +1895,8 @@ class _Analyzer:
             return
         self.pin_inline([f for o in dict.fromkeys(operands) if (f := self.resolve_local(o, lang))])
 
-    def inline_python(self, code: str) -> None:
+    def inline_python(self, code: str, *, expanded: bool) -> None:
         names = _python_imports(code)
-        expanded = "$" in code or "`" in code
         if (names is None or expanded) and _PY_IMPORT_RE.search(code):
             self.unpin("inline python code has an import that cannot be resolved statically")
         elif names and self.base_unknown:
@@ -1624,8 +1904,8 @@ class _Analyzer:
         elif names:
             self.pin_inline([f for f in _python_import_files(names) if self.local_file_exists(f)])
 
-    def inline_node(self, code: str) -> None:
-        specs, dynamic = _node_specifiers(code)
+    def inline_node(self, code: str, *, expanded: bool) -> None:
+        specs, dynamic = _node_specifiers(code, expanded=expanded)
         if dynamic:
             self.unpin("inline node code requires a module that cannot be resolved statically")
             return
@@ -1660,7 +1940,7 @@ class _Analyzer:
             if op.startswith("<<"):
                 # heredoc / here-string: the content is in the command text, unless
                 # a substitution or variable assembles it
-                if "$" in self.text or "`" in self.text:
+                if self.text_expands():
                     self.unpin("heredoc/here-string feeding an interpreter expands $ or backticks")
                 return
             if op == "<&":
