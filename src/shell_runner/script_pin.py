@@ -1826,18 +1826,131 @@ def _unknown_leading_flag(args: list[str], flags: frozenset[str], values: frozen
     return False
 
 
+def _leading_has(args: list[str], targets: frozenset[str], values: frozenset[str]) -> bool:
+    """Whether one of the `targets` options appears before the first operand (or `--`)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--" or not a.startswith("-") or a == "-":
+            return False
+        name, eq, val = a.partition("=")
+        if name in targets and not (eq and val == "false"):
+            return True
+        i += 1 if eq or name not in values else 2
+    return False
+
+
+def _scan_flag_values(
+    args: list[str], collect: frozenset[str], values: frozenset[str], *, whole: bool
+) -> list[tuple[str, str]]:
+    """(option, value) of the `collect` options (`--x=v` or `--x v`) up to `--`.
+
+    Without `whole` the scan also stops at the first operand (options before the script).
+    """
+    got: list[tuple[str, str]] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if not a.startswith("-") or a == "-":
+            if not whole:
+                break
+            i += 1
+            continue
+        name, eq, val = a.partition("=")
+        if name in collect:
+            got.append((name, val if eq else (args[i + 1] if i + 1 < len(args) else "")))
+        i += 1 if eq or (name not in collect and name not in values) else 2
+    return got
+
+
 _UV_VALUE = frozenset(
     {"--directory", "--project", "--with", "--with-editable", "--with-requirements", "--python"}
     | {"-p", "--package", "--env-file", "--index", "--default-index", "--index-url", "-i"}
     | {"--extra-index-url", "--group", "--extra", "--no-group", "--exclude-newer", "--script"}
     | {"--find-links", "-f", "--cache-dir", "--config-file", "--color", "--python-preference"}
     | {"--refresh-package", "--reinstall-package", "--upgrade-package", "-P"}
+    | {"--no-extra", "--only-group", "--index-strategy", "--keyring-provider", "--resolution"}
+    | {"--prerelease", "--link-mode", "--config-setting", "-C", "--no-build-package"}
+    | {"--no-binary-package", "--allow-insecure-host", "--fork-strategy", "--python-platform"}
+    | {"--constraints", "-c", "--overrides", "--build-constraints", "-b", "--torch-backend"}
+    | {"--no-install-package"}
 )
-_NPM_VALUE = frozenset({"--prefix", "-w", "--workspace", "--userconfig", "--registry", "--cache"})
+# uv options accepted before `run` / before the script; any other one fails closed
+_UV_GLOBAL_VALUE = frozenset(
+    {"--color", "--directory", "--project", "--config-file", "--cache-dir"}
+    | {"--allow-insecure-host", "--python-preference"}
+)
+_UV_GLOBAL_FLAGS = frozenset(
+    {"-q", "--quiet", "-qq", "-v", "--verbose", "-vv", "-vvv", "--native-tls", "--offline"}
+    | {"--no-progress", "--no-config", "-n", "--no-cache", "--preview", "--no-preview"}
+    | {"--no-python-downloads", "--managed-python", "--no-managed-python", "-h", "--help"}
+    | {"-V", "--version"}
+)
+_UV_RUN_FLAGS = _UV_GLOBAL_FLAGS | (
+    {"--frozen", "--locked", "--no-sync", "--isolated", "--all-extras", "--no-dev", "--dev"}
+    | {"--only-dev", "--all-groups", "--no-default-groups", "--all-packages", "--no-project"}
+    | {"--no-env-file", "-m", "--module", "-s", "--gui-script", "--exact", "--no-editable"}
+    | {"--active", "--no-active", "--no-index", "-U", "--upgrade", "--reinstall", "--refresh"}
+    | {"--no-build-isolation", "--no-build", "--no-binary", "--only-binary", "--compile-bytecode"}
+    | {"--no-install-project", "--no-install-workspace", "--no-sources", "--inexact"}
+    | {"--verify-hashes"}
+)
+# Not allowlisted, so refused: --script-shell, --shell-mode, --node-options, --userconfig,
+# --use-yarnrc, --config.* (they change the shell, node binary or config file that runs it)
+_NODE_PM_FLAGS = {
+    "npm": frozenset(
+        {"-s", "--silent", "--workspaces", "-ws", "--if-present", "--ignore-scripts"}
+        | {"--include-workspace-root", "-d", "-dd", "-ddd", "--verbose", "-q", "--quiet"}
+        | {"--color", "--no-color", "--foreground-scripts", "-h", "--help", "-v", "--version"}
+        | {"--json", "--offline", "--prefer-offline", "--prefer-online", "--no-audit"}
+        | {"--no-fund", "--production", "--no-progress", "--no-update-notifier", "--audit"}
+        | {"--fund", "--update-notifier", "--progress"}
+    ),
+    "yarn": frozenset(
+        {"-s", "--silent", "--verbose", "--offline", "--frozen-lockfile", "--immutable"}
+        | {"--json", "--non-interactive", "--no-progress", "--prefer-offline", "--production"}
+        | {"--ignore-engines", "--ignore-scripts", "--check-files", "-h", "--help", "-v"}
+        | {"--version", "--no-default-rc"}
+    ),
+    "pnpm": frozenset(
+        {"-r", "--recursive", "-w", "--workspace-root", "-s", "--silent", "--if-present"}
+        | {"--parallel", "--stream", "--aggregate-output", "--no-bail", "--sort", "--no-sort"}
+        | {"--reverse", "--report-summary", "--color", "--no-color", "-h", "--help", "-v"}
+        | {"--version", "--offline", "--prefer-offline", "--frozen-lockfile", "--fail-if-no-match"}
+        | {"--ignore-scripts", "--ignore-workspace", "--include-workspace-root"}
+    ),
+}
+_NODE_PM_VALUES = {
+    "npm": frozenset({"--prefix", "-w", "--workspace", "--registry", "--cache", "--loglevel"}),
+    "yarn": frozenset({"--cwd", "--registry", "--network-timeout", "--network-concurrency"}),
+    "pnpm": frozenset(
+        {"-C", "--dir", "-F", "--filter", "--filter-prod", "--reporter", "--loglevel"}
+        | {"--workspace-concurrency", "--resume-from", "--registry"}
+    ),
+}
+_NPM_VALUE = frozenset(_NODE_PM_VALUES["npm"])
+# flags npm parses AFTER the script name: the leading allowlist minus whatever selects
+# workspaces; --prefix/-w/--workspace are collected and pinned separately
+_NPM_ALL_WORKSPACES = frozenset({"--workspaces", "-ws", "--include-workspace-root"})
+_NPM_TRAILING_FLAGS = _NODE_PM_FLAGS["npm"] - _NPM_ALL_WORKSPACES
+_NPM_TRAILING_VALUE = frozenset({"--loglevel"})
+_NPM_SELECT = frozenset({"--prefix", "-w", "--workspace"})
+_PNPM_SELECT = frozenset({"-F", "--filter", "--filter-prod"})
+_PNPM_RECURSIVE = frozenset({"-r", "--recursive"})
+_UV_FILE_FLAGS = frozenset(
+    {"--with-requirements", "-c", "--constraints", "--overrides", "--config-file"}
+    | {"-b", "--build-constraints"}
+)
+_UV_ALWAYS_PATH = frozenset({"--find-links", "-f", "--with-editable"})
+_ARCHIVE_SUFFIXES = (".whl", ".tar.gz", ".zip")
+_UV_PATHISH_FLAGS = frozenset({"--python", "-p", "--with", "--with-editable", "--find-links", "-f"})
+_UV_MODULE = frozenset({"-m", "--module"})
 _NPM_RUN = frozenset(
     {"run", "run-script", "rum", "urn", "test", "t", "tst", "start", "stop", "restart"}
 )
-_PM_VALUE = frozenset({"--cwd", "--dir", "-C", "--prefix", "--filter", "-F", "--registry"})
+_PM_VALUE = _NODE_PM_VALUES["yarn"] | _NODE_PM_VALUES["pnpm"] | {"--prefix"}
 _PM_NON_RUN = frozenset(
     {"install", "i", "add", "remove", "rm", "init", "config", "cache", "info", "why", "list"}
     | {"ls", "upgrade", "up", "link", "unlink", "pack", "publish", "version", "versions"}
@@ -2922,9 +3035,11 @@ class _Analyzer:
                 self.bases, self.base_unknown = restore
         return unwrapped[0]
 
-    def manifest(self, values: list[str], names: tuple[str, ...]) -> None:
+    def manifest(
+        self, values: list[str], names: tuple[str, ...], upward: tuple[str, ...] | None = None
+    ) -> None:
         if not values:
-            self._ref(".", "upward", names)
+            self._ref(".", "upward", upward or names)
         for v in values:
             if not _literal(v):
                 self.unpin("manifest/project directory is not a literal path")
@@ -2955,8 +3070,15 @@ class _Analyzer:
 
     def uv(self, args: list[str], depth: int) -> None:
         collect = frozenset({"--directory", "--project", "--script", "--env-file"})
+        collect |= _UV_FILE_FLAGS | _UV_PATHISH_FLAGS
+        if _unknown_leading_flag(args, _UV_GLOBAL_FLAGS, _UV_GLOBAL_VALUE):
+            self.unpin("unrecognised uv option before the subcommand")
+            return
         sub, rest, got = _split_runner(args, _UV_VALUE, collect)
         if sub != "run":
+            return
+        if _unknown_leading_flag(rest, _UV_RUN_FLAGS, _UV_VALUE):
+            self.unpin("unrecognised uv run option before the script")
             return
         task, rest2, got2 = _split_runner(rest, _UV_VALUE, collect)
         got += got2
@@ -2966,18 +3088,58 @@ class _Analyzer:
         if directory is not None and _literal(directory):
             self.bases = _extend_bases(self.bases, directory)
         try:
-            self.manifest(dirs, ("pyproject.toml",))
+            # uv also reads a uv.toml next to the pyproject.toml it finds
+            self.manifest(dirs, ("pyproject.toml",), ("pyproject.toml", "uv.toml"))
+            extended, self.bases = self.bases, saved
+            for d in dirs:
+                if _literal(d) and not d.endswith((".toml", ".json")):
+                    self._ref(d, "search", ("uv.toml",))
+            self.bases = extended
             for k, v in got:
                 if k == "--script":
                     self.add_file(v)
                 elif k == "--env-file":
                     self.env_file(v)
-            if task is not None and task.endswith(".py"):
+                elif k in _UV_FILE_FLAGS or k in _UV_PATHISH_FLAGS:
+                    self.uv_path(k, v)
+            if task is not None and _leading_has(rest, _UV_MODULE, _UV_VALUE):
+                inner = ["python", "-m", task, *rest2]
+                self.command(inner, _Simple(list(inner)), depth)
+            elif task is not None and task.endswith(".py"):
                 self.add_file(task)
             elif task is not None:
                 self.command([task, *rest2], _Simple([task, *rest2]), depth)
         finally:
             self.bases = saved
+
+    def uv_path(self, flag: str, value: str) -> None:
+        """A uv option whose value may be a local file: pin a file, refuse a directory/missing."""
+        for part in value.split(",") if flag == "--with" else [value]:
+            self.uv_path_value(flag, part)
+
+    def uv_path_value(self, flag: str, value: str) -> None:
+        if (
+            flag not in _UV_FILE_FLAGS
+            and flag not in _UV_ALWAYS_PATH
+            and not ("/" in value or value.startswith((".", "~")))
+            and not (flag == "--with" and self.names_local_entry(value))
+        ):
+            return  # a version or package name
+        if not _literal(value):
+            self.unpin(f"uv {flag} value {value!r} is not a literal path")
+            return
+        paths = _ref_paths(ScriptRef(value, tuple(self.bases)), self.cwd)
+        if any(os.path.isfile(p) for p in paths):
+            self.add_file(value, script=False)
+        else:
+            self.unpin(f"uv {flag} {value} is not a regular file")
+
+    def names_local_entry(self, value: str) -> bool:
+        """Whether a bare `uv run --with` value is an archive name or exists on disk."""
+        if value.endswith(_ARCHIVE_SUFFIXES):
+            return True
+        refs = _ref_paths(ScriptRef(value, tuple(self.bases)), self.cwd)
+        return any(os.path.lexists(p) for p in refs)
 
     def env_file(self, path: str) -> None:
         """`uv run --env-file F`: pin F, and a loader variable inside it is non-durable (#98)."""
@@ -2995,14 +3157,97 @@ class _Analyzer:
     def node_pm(self, tool: str, args: list[str], depth: int) -> None:
         collect = frozenset({"--prefix", "--cwd", "--dir", "-C"})
         value = _NPM_VALUE if tool == "npm" else _PM_VALUE
+        checked = tool in _NODE_PM_FLAGS
+        if checked and _unknown_leading_flag(args, _NODE_PM_FLAGS[tool], _NODE_PM_VALUES[tool]):
+            self.unpin(f"unrecognised {tool} option before the subcommand or script")
+            return
         sub, rest, got = _split_runner(args, value, collect)
         if sub is None:
             return
+        if (
+            checked
+            and sub in _PM_RUN_BIN
+            and _unknown_leading_flag(rest, _NODE_PM_FLAGS[tool], _NODE_PM_VALUES[tool])
+        ):
+            self.unpin(f"unrecognised {tool} run option before the script")
+            return
+        members: list[str] = []
+        if tool == "yarn" and sub == "workspaces":
+            self.unpin("yarn workspaces runs commands in every workspace")
+            return
+        if tool == "yarn" and sub == "workspace":
+            if len(rest) < 2:
+                self.unpin("yarn workspace without a name and command")
+                return
+            members.append(rest[0])
+            sub, rest = rest[1], rest[2:]
         runs = sub in _NPM_RUN if tool == "npm" else sub not in _PM_NON_RUN
+        if runs and tool == "npm":
+            selected = self.npm_trailing(args, sub, rest)
+            if selected is None:
+                return
+            got = [(k, v) for k, v in selected if k == "--prefix"]
+            members = [v for _, v in selected]
+        elif runs and tool == "pnpm":
+            if not self.pnpm_select(args, rest, sub, members):
+                return
         if runs:
             self.manifest([v for _, v in got], ("package.json",))
+            for member in members:
+                self.workspace_member(member)
         if sub in _PM_EXEC or (tool != "npm" and runs) or sub in _PM_RUN_BIN:
             self.pm_inner(sub, rest, depth)
+
+    def npm_trailing(
+        self, args: list[str], sub: str, rest: list[str]
+    ) -> list[tuple[str, str]] | None:
+        """npm parses options after the script name too: (option, value) of --prefix/-w/
+        --workspace anywhere before `--`; None (unpinnable) for any other non-allowlisted one."""
+        for scan in (args, rest) if sub in _PM_RUN_BIN else (args,):
+            if _leading_has(scan, _NPM_ALL_WORKSPACES, _NODE_PM_VALUES["npm"]):
+                self.unpin("npm runs the script in every workspace")
+                return None
+        trailing = rest
+        if sub in _PM_RUN_BIN:
+            _, trailing, _ = _split_runner(rest, _NPM_VALUE, frozenset())
+        i = 0
+        while i < len(trailing):
+            a = trailing[i]
+            if a == "--":
+                break
+            name, eq, val = a.partition("=")
+            off = eq and val == "false" and name in _NODE_PM_FLAGS["npm"]
+            if not a.startswith("-") or a == "-" or name in _NPM_TRAILING_FLAGS or off:
+                i += 1
+            elif name in _NPM_SELECT or name in _NPM_TRAILING_VALUE:
+                i += 1 if eq else 2
+            else:
+                self.unpin(f"unrecognised npm option {name} after the script name")
+                return None
+        return _scan_flag_values(args, _NPM_SELECT, _NPM_VALUE, whole=True)
+
+    def pnpm_select(self, args: list[str], rest: list[str], sub: str, members: list[str]) -> bool:
+        """pnpm --filter/-F values go to `members`; --recursive is unpinnable (False)."""
+        value = _NODE_PM_VALUES["pnpm"]
+        scans = [args] + ([rest] if sub in _PM_RUN_BIN else [])
+        for scan in scans:
+            if _leading_has(scan, _PNPM_RECURSIVE, value):
+                self.unpin("pnpm --recursive runs the script in every workspace package")
+                return False
+            members.extend(v for _, v in _scan_flag_values(scan, _PNPM_SELECT, value, whole=False))
+        return True
+
+    def workspace_member(self, member: str) -> None:
+        """Pin <member>/package.json (npm -w/--prefix, pnpm --filter); refuse a missing one."""
+        path = posixpath.join(member, "package.json")
+        if not _literal(member):
+            self.unpin(f"workspace selector {member!r} is not a literal path")
+        elif any(
+            os.path.isfile(p) for p in _ref_paths(ScriptRef(path, tuple(self.bases)), self.cwd)
+        ):
+            self.add_file(path, script=False)
+        else:
+            self.unpin(f"workspace selector {member!r} does not name a package directory")
 
     def pm_inner(self, sub: str, rest: list[str], depth: int) -> None:
         """Recurse into the trailing command of `npm exec`, `pnpm dlx`, `npx`, `yarn run`, ..."""

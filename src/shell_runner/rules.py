@@ -481,7 +481,7 @@ def evaluate(command: str, cwd: str) -> RulesVerdict:
     matches: list[PathMatch] = []
     warnings: list[str] = []
     if protected:
-        for cp in analyze(command):
+        for cp in analyze(command, cwd=real_cwd):
             matches += _command_matches(cp, protected, real_cwd)
             warnings += [w for w in cp.warnings if w not in warnings]
     return RulesVerdict(deny=deny, matches=_dedupe(matches), warnings=tuple(warnings))

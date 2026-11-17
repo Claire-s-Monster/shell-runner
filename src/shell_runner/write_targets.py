@@ -11,6 +11,7 @@ Public API:
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -242,12 +243,35 @@ def _cd_directory(args: list[str]) -> str | None:
     return target
 
 
-def _track_cd(verb: str, args: list[str], bases: list[str], cp: CommandPaths) -> list[str]:
+def _track_cd(
+    verb: str, args: list[str], bases: list[str], cp: CommandPaths, cwd: str | None = None
+) -> list[str]:
     target = _cd_directory(args)
     if target is None:
         cp.warnings.append(f"{verb}: target directory not statically known; paths not tracked")
         return bases
-    return _extend_bases(bases, target)
+    out = _extend_bases(bases, target)
+    if cwd and any(a.startswith("-") and not a.startswith("--") and "P" in a for a in args):
+        out = _add_physical(out, bases, cwd)
+    return out
+
+
+def _add_physical(out: list[str], previous: list[str], root: str) -> list[str]:
+    """`cd -P`: also keep the symlink-resolved form (relative to `root`) of each new base."""
+    result = list(out)
+    for base in out:
+        if base in previous or base.startswith("~"):
+            continue
+        try:
+            real_root = os.path.realpath(root)
+            physical = os.path.realpath(os.path.join(real_root, base))
+            if not base.startswith("/"):
+                physical = os.path.relpath(physical, real_root)
+        except (ValueError, OSError):  # odd bytes in the path: keep the logical base only
+            continue
+        if physical not in result:
+            result.append(physical)
+    return result
 
 
 def _git_output_files(args: list[str]) -> list[str]:
@@ -339,8 +363,10 @@ def _verb_writes(verb: str, args: list[str]) -> list[str]:
     return []
 
 
-def analyze(command: str) -> list[CommandPaths]:
-    """Return one CommandPaths per simple command found in `command`."""
+def analyze(command: str, *, cwd: str | None = None) -> list[CommandPaths]:
+    """Return one CommandPaths per simple command found in `command`.
+
+    With `cwd`, `cd -P` also adds the symlink-resolved base (relative to `cwd`)."""
     tokens = _tokenize(command)
     if tokens is None:
         return [CommandPaths(unparseable=True, warnings=["command could not be tokenized"])]
@@ -355,7 +381,7 @@ def analyze(command: str) -> list[CommandPaths]:
             cp.verb = verb
             cp.words = list(args)
             if verb in ("cd", "pushd"):
-                cd_bases = _track_cd(verb, args, cd_bases, cp)
+                cd_bases = _track_cd(verb, args, cd_bases, cp, cwd)
             elif verb == "git":
                 for d in _git_c_dirs(args):
                     cp.bases = _extend_bases(cp.bases, d)
