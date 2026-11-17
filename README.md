@@ -418,6 +418,24 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   `approve_template_global` and `approve_verb` degrade to one-shot (the response names
   the variable). The decision path carries a `non_durable:` note. It stays pinned
   (not unpinnable).
+- **Preload files, include dirs, inline imports, `--env-file` (#98).** Detected: `node -r` /
+  `--require` / `--import` / `--loader` / `--experimental-loader` and `ruby -r` with a path
+  (`./x`, `../x`, `/x`) pin that file (also after `-e CODE` for node, ruby and perl; `ruby
+  -C DIR` resolves paths inside DIR). A bare `node -r pkg` or `require('pkg')` (not a Node
+  builtin) resolves through `node_modules` and is non-durable, as are `perl -I` / `-Mlib=`
+  and `ruby -I` (like `PERL5LIB` / `RUBYLIB`). Inline code (`python -c`, `node -e`, `ruby
+  -e` incl. `load`, python heredocs on stdin) pins the local files it imports; stdlib and
+  site-packages imports add nothing. `uv run --env-file F` pins F and scans all of it (over
+  8 MiB: unpinnable); a loader variable or unsafe `PATH` inside is non-durable.
+  Fail closed (unpinnable): an unknown `cd`/`pushd` target or non-literal `ruby -C` before
+  inline code that imports; unparseable or shell-expanded (`$`, backticks) python code with
+  an `import`; a node `require(`/`import(` argument that is not one plain literal; and any
+  `xargs` whose command is a runner (make, pixi, uv, npm, yarn, pnpm), an interpreter or a
+  wrapper (`nice`, `env`, `timeout`, ...) around one. `xargs env VAR=... cmd` is still
+  checked for loader variables. Not detected: `importlib` / `__import__`, namespace
+  packages, `.so` / `.pyc` modules, `package.json` `"main"` resolution, and interpreters
+  not yet recognised (#98 item 3). Best-effort static analysis (`ast` for python,
+  patterns for node/ruby).
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 

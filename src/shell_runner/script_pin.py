@@ -25,12 +25,14 @@ file afterwards; a swap in that window is not detected.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
 import posixpath
 import re
 import stat
+import warnings
 from dataclasses import dataclass, field
 
 from .executor import trusted_bin_dirs
@@ -70,6 +72,14 @@ class _Interp:
     long_value: frozenset[str] = frozenset()
     long_inline: frozenset[str] = frozenset()
     shell: bool = False
+    preload_flags: str = ""  # short flags whose value is a file loaded before the script
+    long_preload_flags: frozenset[str] = frozenset()
+    include_flags: str = ""  # short flags whose value is a module search directory
+    lang: str = ""  # inline code (-c/-e) is scanned for local imports: python | node | ruby
+    chdir_flags: str = ""  # short flags whose value is the directory the script runs in
+    pragma_flags: str = ""  # short flags whose attached value is `use` code (perl -M/-m)
+    # options are parsed after the -e code (node, perl, ruby); python's -c ends option parsing
+    options_after_code: bool = False
 
 
 _SHELL = _Interp(
@@ -81,7 +91,11 @@ _SHELL = _Interp(
     shell=True,
 )
 _PYTHON = _Interp(
-    value="WX", inline="c", module="m", long_value=frozenset({"--check-hash-based-pycs"})
+    value="WX",
+    inline="c",
+    module="m",
+    long_value=frozenset({"--check-hash-based-pycs"}),
+    lang="python",
 )
 _NODE = _Interp(
     value="r",
@@ -90,9 +104,29 @@ _NODE = _Interp(
         {"--require", "--import", "--loader", "--experimental-loader", "--input-type"}
     ),
     long_inline=frozenset({"--eval", "--print"}),
+    preload_flags="r",
+    long_preload_flags=frozenset({"--require", "--import", "--loader", "--experimental-loader"}),
+    lang="node",
+    options_after_code=True,
 )
-_PERL = _Interp(value="I", attached="MmixCFdDV", inline="eE")
-_RUBY = _Interp(value="rICE", attached="ixKTWF", inline="e")
+_PERL = _Interp(
+    value="I",
+    attached="MmixCFdDV",
+    inline="eE",
+    include_flags="I",
+    pragma_flags="Mm",
+    options_after_code=True,
+)
+_RUBY = _Interp(
+    value="rICEX",
+    attached="ixKTWF",
+    inline="e",
+    preload_flags="r",
+    include_flags="I",
+    chdir_flags="CX",
+    lang="ruby",
+    options_after_code=True,
+)
 _PHP = _Interp(value="dczSt", inline="rBRE", noexec="lvimh", file_flags="fF")
 _FISH = _Interp(value="dDoC", inline="c", noexec="n")
 _FAMILIES = {
@@ -174,6 +208,223 @@ def _scan_options(spec: _Interp, args: list[str]) -> tuple[str, str | None]:
     if inline or module or noexec:
         return "none", None
     return ("stdin!", None) if stdin else ("stdin", None)
+
+
+@dataclass
+class _Options:
+    """What the interpreter options name: preload files, include dirs, chdir targets."""
+
+    preload: list[str] = field(default_factory=list)
+    include: list[str] = field(default_factory=list)
+    chdir: list[str] = field(default_factory=list)
+
+
+_LIB_PRAGMA_RE = re.compile(r"lib(?:=|\s)")
+
+
+def _short_option_values(spec: _Interp, args: list[str], i: int, out: _Options) -> int:
+    """Collect the values of the flags of interest in the short cluster `args[i]`; words used."""
+    a = args[i]
+    for pos, ch in enumerate(a[1:]):
+        rest = a[pos + 2 :]
+        if ch in spec.preload_flags or ch in spec.include_flags or ch in spec.chdir_flags:
+            value = rest or (args[i + 1] if i + 1 < len(args) else "")
+            if value:
+                if ch in spec.preload_flags:
+                    out.preload.append(value)
+                elif ch in spec.chdir_flags:
+                    out.chdir.append(value)
+                else:
+                    out.include.append(value)
+            return 1 if rest else 2
+        if ch in spec.pragma_flags and _LIB_PRAGMA_RE.match(rest):
+            out.include.append(rest)  # perl -Mlib=DIR adds an include directory
+            return 1
+        if ch in spec.inline and spec.options_after_code:
+            if not rest:
+                return 2  # the code is the next word; options go on after it
+            if not any(c in spec.inline for c in rest):
+                return 1  # `-ecode`
+            continue  # `-pe CODE`: the later inline flag takes the code
+        if ch in spec.attached:
+            return 1
+        if ch in spec.value:
+            return 1 if rest else 2
+    return 1
+
+
+def _option_values(spec: _Interp, args: list[str]) -> _Options:
+    """Preload files, include dirs and chdir targets named by the options before the operand."""
+    out = _Options()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if not a.startswith("-") or a in ("-", "--"):
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in spec.long_preload_flags:
+                value = val if eq else (args[i + 1] if i + 1 < len(args) else "")
+                if value:
+                    out.preload.append(value)
+            takes_value = name in spec.long_value or (
+                name in spec.long_inline and spec.options_after_code
+            )
+            i += 2 if takes_value and not eq else 1
+        else:
+            i += _short_option_values(spec, args, i, out)
+    return out
+
+
+_INCLUDE_REASON = "-I puts a caller-chosen directory on the module search path"
+_UNKNOWN_BASE_IMPORT = "inline code imports a module, but the cd/pushd target is not known"
+
+
+def _node_modules_reason(kind: str, value: str) -> str:
+    return f"node {kind} {value!r} resolves through node_modules"
+
+
+_PATH_PREFIXES = ("./", "../", "/")
+# (suffixes tried after the path as given, index file tried inside a directory)
+_RESOLVE = {"node": ((".js", ".mjs", ".cjs"), "index.js"), "ruby": ((".rb",), "")}
+_NODE_CALL_RE = re.compile(r"\b(?:require|import)\s*\(\s*")  # require( / import(
+_NODE_LITERAL_RE = re.compile(r"""(['"])([^'"\\\n]*)\1\s*[,)]""")  # the whole call argument
+_NODE_STATIC_RE = re.compile(r"""\b(?:from|import)\s*(['"])([^'"\\\n]*)\1""")
+_RUBY_REQ_RE = re.compile(
+    r"""(?<![\w.:@$])(require_relative|require|load)\b\s*\(?\s*(['"])([^'"\n]+)\2"""
+)
+_PY_IMPORT_RE = re.compile(r"\bimport\b")
+_EXPORT_RE = re.compile(r"^export\s+")
+_ENV_FILE_MAX = 8 << 20
+_NODE_BUILTINS = frozenset(
+    {"assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants"}
+    | {"crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http"}
+    | {"http2", "https", "inspector", "module", "net", "os", "path", "perf_hooks", "process"}
+    | {"punycode", "querystring", "readline", "repl", "stream", "string_decoder", "sys"}
+    | {"timers", "tls", "trace_events", "tty", "url", "util", "v8", "vm", "wasi"}
+    | {"worker_threads", "zlib", "assert/strict", "dns/promises", "fs/promises"}
+    | {"inspector/promises", "path/posix", "path/win32", "readline/promises", "stream/consumers"}
+    | {"stream/promises", "stream/web", "timers/promises", "util/types"}
+)
+
+
+def _python_imports(code: str) -> set[str] | None:
+    """Dotted names a level-0 `import` in `code` could load (ast, no exec); None if unparseable."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{a.name}" for a in node.names if a.name != "*")
+    return names
+
+
+def _python_import_files(names: set[str]) -> list[str]:
+    """Relative files the imports `names` could load from the cwd."""
+    files: list[str] = []
+    for name in sorted(names):
+        parts = name.split(".")
+        for k in range(1, len(parts) + 1):
+            stem = "/".join(parts[:k])
+            files += [f"{stem}.py", f"{stem}/__init__.py"]
+    return list(dict.fromkeys(files))
+
+
+def _node_specifiers(code: str) -> tuple[list[str], bool]:
+    """(string-literal module specifiers in `code`, whether one is not statically knowable).
+
+    A `require(` / `import(` argument that is not a single plain string literal, or a literal
+    containing `$` (the shell may have expanded it), makes the code dynamic.
+    """
+    specs: list[str] = []
+    dynamic = False
+    for m in _NODE_CALL_RE.finditer(code):
+        lit = _NODE_LITERAL_RE.match(code, m.end())
+        if lit is None:
+            dynamic = True
+        else:
+            specs.append(lit[2])
+    specs += [m[2] for m in _NODE_STATIC_RE.finditer(code)]
+    return specs, dynamic or any("$" in s for s in specs)
+
+
+def _is_node_builtin(spec: str) -> bool:
+    return spec.startswith("node:") or spec in _NODE_BUILTINS
+
+
+def _ruby_requires(code: str) -> list[str]:
+    """Operands of `require_relative` / `load` / `require './x'` (could load a local file)."""
+    return [
+        m[3]
+        for m in _RUBY_REQ_RE.finditer(code)
+        if m[1] != "require" or m[3].startswith(_PATH_PREFIXES)
+    ]
+
+
+def _heredoc_bodies(text: str) -> list[str]:
+    """The bodies of the `<<WORD` heredocs in the command text (here-strings excluded)."""
+    lines = text.split("\n")
+    bodies: list[str] = []
+    i = 0
+    while i < len(lines):
+        openers = _HEREDOC_OPEN_RE.findall(lines[i])
+        i += 1
+        for quoted_s, quoted_d, bare in openers:
+            delim = quoted_s or quoted_d or bare
+            body: list[str] = []
+            while i < len(lines) and lines[i].strip() != delim:
+                body.append(lines[i])
+                i += 1
+            i += 1
+            bodies.append("\n".join(body))
+    return bodies
+
+
+_HEREDOC_OPEN_RE = re.compile(r"""<<(?!<)-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\?([\w.-]+))""")
+
+
+def _dotenv_assignment(line: str) -> str | None:
+    """`NAME=value` (quotes and a leading `export` removed) for a dotenv line, else None."""
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+    key, eq, value = _EXPORT_RE.sub("", s, count=1).partition("=")
+    if not eq:
+        return key.strip()
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return f"{key.strip()}={value}"
+
+
+def _env_file_reasons(path: str, cwd: str) -> list[str] | None:
+    """Why each loader variable in the dotenv file `path` makes a command non-durable.
+
+    None when the file is too large to scan completely (it is never scanned in part).
+    """
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(_ENV_FILE_MAX + 1)
+    except OSError:
+        return []
+    if len(data) > _ENV_FILE_MAX:
+        return None
+    reasons: list[str] = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        assignment = _dotenv_assignment(line)
+        reason = loader_env_reason(assignment, cwd) if assignment else None
+        if reason:
+            reasons.append(reason)
+    return reasons
 
 
 # --- wrapper commands ------------------------------------------------------------
@@ -806,8 +1057,10 @@ def _trusted_name(head: str) -> str | None:
 
 _XARGS_VALUE = frozenset(
     {"-n", "-I", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--replace", "--max-procs"}
-    | {"--max-lines", "--delimiter", "--arg-file", "--eof", "--max-chars"}
+    | {"--max-lines", "--delimiter", "--arg-file", "--eof", "--max-chars", "--process-slot-var"}
 )
+# xargs tails whose work is chosen by stdin (target/task names): never pinnable
+_XARGS_RUNNERS = frozenset({"make", "pixi", "uv", "npm", "yarn", "pnpm", "npx", "bunx", "pnpx"})
 _PIXI_VALUE = frozenset(
     {"--manifest-path", "-e", "--environment", "--color", "--pypi-keyring-provider", "--auth-file"}
     | {"--concurrent-solves", "--concurrent-downloads"}
@@ -1270,10 +1523,38 @@ class _Analyzer:
         # prepare() turns heredoc / here-string openers into sentinel words
         heredoc = any(a.startswith(SENTINEL_PREFIX) for a in args)
         args = [a for a in args if not a.startswith(SENTINEL_PREFIX)]
+        opts = _option_values(spec, args)
+        if not opts.chdir:
+            self.run_interpreter(spec, args, opts, (heredoc, cmd), depth)
+            return
+        saved = (list(self.bases), self.base_unknown)
+        for directory in opts.chdir:  # ruby -C DIR: everything below resolves inside DIR
+            if _literal(directory):
+                self.bases = _extend_bases(self.bases, directory)
+            else:
+                self.base_unknown = True
+        try:
+            self.run_interpreter(spec, args, opts, (heredoc, cmd), depth)
+        finally:
+            self.bases, self.base_unknown = saved
+
+    def run_interpreter(
+        self,
+        spec: _Interp,
+        args: list[str],
+        opts: _Options,
+        source: tuple[bool, _Simple],
+        depth: int,
+    ) -> None:
+        heredoc, cmd = source
+        self.option_refs(spec, opts)
         kind, operand = _scan_options(spec, args)
         if heredoc and kind in ("stdin", "stdin!"):
             if "$" in self.text or "`" in self.text:
                 self.unpin("heredoc/here-string feeding an interpreter expands $ or backticks")
+            elif spec.lang:
+                for body in _heredoc_bodies(self.text):
+                    self.inline_imports(spec.lang, body)
             return
         if kind == "file" and operand is not None:
             self.add_file(operand)
@@ -1282,10 +1563,77 @@ class _Analyzer:
                 self.unpin("inline code is assembled by a command substitution")
             elif spec.shell:
                 self.run(operand, depth + 1)
+            elif spec.lang:
+                self.inline_imports(spec.lang, operand)
         elif kind == "module" and operand is not None:
             self.module(operand)
         elif kind in ("stdin", "stdin!"):
             self.stdin(cmd, explicit=kind == "stdin!", depth=depth)
+
+    def local_file_exists(self, operand: str) -> bool:
+        ref = ScriptRef(operand, tuple(self.bases))
+        return any(os.path.isfile(p) for p in _ref_paths(ref, self.cwd))
+
+    def resolve_local(self, operand: str, lang: str) -> str | None:
+        """First existing file node/ruby would load for `operand` (as given, suffixed, index)."""
+        suffixes, index = _RESOLVE[lang]
+        cands = [operand, *(operand + s for s in suffixes)]
+        if index:
+            cands.append(posixpath.join(operand, index))
+        return next((c for c in cands if self.local_file_exists(c)), None)
+
+    def option_refs(self, spec: _Interp, opts: _Options) -> None:
+        """Preload files (node -r/--require/--import/--loader, ruby -r) and -I directories (#98)."""
+        for value in opts.preload:
+            if not _literal(value):
+                self.add_file(value)  # unpinnable: not a literal path
+            elif value.startswith(_PATH_PREFIXES):
+                self.add_file(self.resolve_local(value, spec.lang) or value)
+            elif spec.lang == "node":
+                self.non_durable(_node_modules_reason("preload", value))
+        if opts.include:
+            self.non_durable(_INCLUDE_REASON)
+
+    def inline_imports(self, lang: str, code: str) -> None:
+        """Pin the local files inline code (-c / -e / heredoc) imports; fail closed if unsure."""
+        if lang == "python":
+            self.inline_python(code)
+        elif lang == "node":
+            self.inline_node(code)
+        else:
+            self.pin_inline_paths(_ruby_requires(code), "ruby")
+
+    def pin_inline(self, files: list[str]) -> None:
+        for f in dict.fromkeys(files):
+            self.emit(ScriptRef(f, tuple(self.bases), required=False))
+
+    def pin_inline_paths(self, operands: list[str], lang: str) -> None:
+        """Pin what node/ruby would load for local `operands`; unknown cd target: unpinnable."""
+        if self.base_unknown and any(not o.startswith("/") for o in operands):
+            self.unpin(_UNKNOWN_BASE_IMPORT)
+            return
+        self.pin_inline([f for o in dict.fromkeys(operands) if (f := self.resolve_local(o, lang))])
+
+    def inline_python(self, code: str) -> None:
+        names = _python_imports(code)
+        expanded = "$" in code or "`" in code
+        if (names is None or expanded) and _PY_IMPORT_RE.search(code):
+            self.unpin("inline python code has an import that cannot be resolved statically")
+        elif names and self.base_unknown:
+            self.unpin(_UNKNOWN_BASE_IMPORT)
+        elif names:
+            self.pin_inline([f for f in _python_import_files(names) if self.local_file_exists(f)])
+
+    def inline_node(self, code: str) -> None:
+        specs, dynamic = _node_specifiers(code)
+        if dynamic:
+            self.unpin("inline node code requires a module that cannot be resolved statically")
+            return
+        local = [s for s in specs if s.startswith(_PATH_PREFIXES)]
+        for spec in dict.fromkeys(specs):
+            if not spec.startswith(_PATH_PREFIXES) and not _is_node_builtin(spec):
+                self.non_durable(_node_modules_reason("require", spec))
+        self.pin_inline_paths(local, "node")
 
     def module(self, name: str) -> None:
         if not re.fullmatch(r"[A-Za-z_][\w.]*", name):
@@ -1394,13 +1742,35 @@ class _Analyzer:
         inner = [sub, *rest]
         saved, self.plan = self.plan, Plan()
         try:
-            self.command(inner, _Simple(list(inner)), depth)
-            fed = bool(self.plan.refs or self.plan.unpinnable)
+            head = self.xargs_tail(inner, depth)
+            tail = self.plan
         finally:
             self.plan = saved
-        is_direct = "/" in sub and posixpath.dirname(sub) not in trusted_bin_dirs()
-        if fed or is_direct or _family(posixpath.basename(sub)) is not None:
-            self.unpin("xargs feeds arguments to a script or interpreter")
+        for reason in tail.non_durable:  # `xargs env VAR=... cmd` loader variables
+            self.non_durable(reason)
+        name = posixpath.basename(head)
+        is_direct = "/" in head and posixpath.dirname(head) not in trusted_bin_dirs()
+        if (
+            tail.unpinnable
+            or any(r.script for r in tail.refs)
+            or is_direct
+            or _family(name) is not None
+            or name in _XARGS_RUNNERS
+        ):
+            self.unpin("xargs feeds arguments to a script, interpreter or runner")
+
+    def xargs_tail(self, inner: list[str], depth: int) -> str:
+        """Analyze the command xargs runs; its head once wrappers (nice, env, ...) are stripped."""
+        unwrapped = self.unwrap(inner, depth)
+        if unwrapped is None:
+            return ""
+        restore = self.wd_saved
+        try:
+            self._command(unwrapped, _Simple(list(unwrapped)), depth)
+        finally:
+            if restore is not None:
+                self.bases, self.base_unknown = restore
+        return unwrapped[0]
 
     def manifest(self, values: list[str], names: tuple[str, ...]) -> None:
         if not values:
@@ -1434,7 +1804,7 @@ class _Analyzer:
             self.node_pm(tool, args, depth)
 
     def uv(self, args: list[str], depth: int) -> None:
-        collect = frozenset({"--directory", "--project", "--script"})
+        collect = frozenset({"--directory", "--project", "--script", "--env-file"})
         sub, rest, got = _split_runner(args, _UV_VALUE, collect)
         if sub != "run":
             return
@@ -1450,12 +1820,27 @@ class _Analyzer:
             for k, v in got:
                 if k == "--script":
                     self.add_file(v)
+                elif k == "--env-file":
+                    self.env_file(v)
             if task is not None and task.endswith(".py"):
                 self.add_file(task)
             elif task is not None:
                 self.command([task, *rest2], _Simple([task, *rest2]), depth)
         finally:
             self.bases = saved
+
+    def env_file(self, path: str) -> None:
+        """`uv run --env-file F`: pin F, and a loader variable inside it is non-durable (#98)."""
+        self.add_file(path, script=False)
+        if not _literal(path):
+            return
+        for real in _ref_paths(ScriptRef(path, tuple(self.bases)), self.cwd):
+            reasons = _env_file_reasons(real, self.cwd)
+            if reasons is None:
+                self.unpin(f"--env-file {path} is too large to scan for loader variables")
+                return
+            for reason in reasons:
+                self.non_durable(f"{reason} (--env-file {path})")
 
     def node_pm(self, tool: str, args: list[str], depth: int) -> None:
         collect = frozenset({"--prefix", "--cwd", "--dir", "-C"})
