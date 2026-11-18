@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 if TYPE_CHECKING:
     from .seeds import SeedApproval
 
+from .shellprep import template_has_sentinel
+
 logger = logging.getLogger(__name__)
 
 
@@ -858,8 +860,8 @@ class Persistence:
             now_dt = datetime.now(UTC)
             now = now_dt.isoformat()
             row = conn.execute(
-                "SELECT id, approve_decision, consumed_at, expires_at, created_at, script_paths "
-                "FROM pending_prompts WHERE id = ?",
+                "SELECT id, approve_decision, consumed_at, expires_at, created_at, script_paths, "
+                "normalized_template FROM pending_prompts WHERE id = ?",
                 (prompt_id,),
             ).fetchone()
             if row is None:
@@ -894,6 +896,11 @@ class Persistence:
                     revoked_rules=revoked,
                     prompt_updated=False,
                     prompt_state=closed_state,
+                )
+            if rule is not None and template_has_sentinel(row["normalized_template"]):
+                raise ValueError(  # rolls back, no write (issue #117)
+                    "refusing a reusable rule for a prompt whose template contains a raw "
+                    "masking sentinel"
                 )
             if decision == "approve_once":
                 # Durability (issue #26 P2 Part B): extend the TTL well past the
@@ -1326,6 +1333,11 @@ class Persistence:
         Delete+insert run in one transaction. Prompt-driven approvals should use
         decide_prompt so the decision and rule are atomic (issue #94).
         """
+        if template_has_sentinel(template):
+            raise ValueError(
+                "refusing a template approval whose template contains a raw masking sentinel "
+                "(issue #117)"
+            )
         with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row_id = self._insert_template_approval(
@@ -1359,6 +1371,8 @@ class Persistence:
         new entries win, the rest are carried over, so the rule keeps covering the
         runner manifests approved earlier.
         """
+        if template_has_sentinel(template):  # reached via decide_prompt too (issue #117)
+            raise ValueError("refusing a template approval containing a raw masking sentinel")
         scope_key = agent_id if agent_id is not None else ""
         old = conn.execute(
             "SELECT id, template, agent_id, approved_via_prompt_id, manifest_pins "
@@ -1452,6 +1466,8 @@ class Persistence:
         command has no runner manifest). A row whose manifest_pins do not cover it is
         skipped, so a global row that is not honoured falls through to the agent row.
         """
+        if template_has_sentinel(template):  # issue #117: a leaked sentinel is a wildcard
+            return RuleMatch(None)
         first_blocked: RuleMatch | None = None
         with self._conn() as conn:
             for kind, scoped in (

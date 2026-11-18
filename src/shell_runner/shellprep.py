@@ -28,6 +28,16 @@ from dataclasses import dataclass
 
 SENTINEL_PREFIX = "__TKSENTINEL_"
 
+
+def template_has_sentinel(template: str) -> bool:
+    """True if a raw masking sentinel leaked into a normalized template (issue #117).
+
+    Such a template stands for an unknown set of commands, so it is never stored as a
+    template approval and never matched against one.
+    """
+    return SENTINEL_PREFIX in template
+
+
 _MAX_DEPTH = 8  # nesting of extracted substitutions; deeper is unparseable (fail closed)
 _WORD_STOP = frozenset(" \t\n;&|()<>")
 _COMMENT_PREV = frozenset(" \t\n;&|()")

@@ -94,6 +94,7 @@ from .persistence import (
 )
 from .sandbox_config import SandboxState, sandbox_canary
 from .seeds import DEFAULT_SEED_APPROVALS
+from .shellprep import template_has_sentinel
 from .unit_runner import resolve_max_detached
 
 logger = logging.getLogger(__name__)
@@ -310,13 +311,19 @@ def _apply_template_approval(
         return memo[0]
 
     try:
-        # 2. Exact-template promotion first.
-        match = db.match_template_approval(cls.template, agent_id, manifest)
+        # 2. Exact-template promotion first. A template with a leaked masking sentinel
+        # would match a whole family of commands, so it never matches (issue #117).
+        sentinel = template_has_sentinel(cls.template)
+        if sentinel:
+            match = RuleMatch(None)
+        else:
+            match = db.match_template_approval(cls.template, agent_id, manifest)
         promotion_label = "approved_template"
         first_blocked = match if match.manifest_blocked else None
 
-        # 3. Verb + cwd-prefix promotion only when exact-template misses.
-        if match.tier is None:
+        # 3. Verb + cwd-prefix promotion only when exact-template misses, and never for
+        # a sentinel template: its masked part was never classified (issue #117).
+        if match.tier is None and not sentinel:
             verb = cls.segments[0].segment.verb if cls.segments else ""
             if verb:
                 match = db.match_verb_approval(verb, cwd, agent_id, manifest)
@@ -1781,6 +1788,12 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
             else:
                 what = "inline code (-c, source) is never promotable"
             guarded_note = f"{req.decision} downgraded to a one-shot approval: {what}"
+        elif pending is not None and template_has_sentinel(pending["normalized_template"]):
+            guarded_note = (
+                f"{req.decision} downgraded to a one-shot approval: the command's template "
+                "embeds a masked variable or substitution inside a larger word, so a reusable "
+                "template or verb approval would also match other commands (issue #117)"
+            )
 
     if guarded_note is not None:
         pass
