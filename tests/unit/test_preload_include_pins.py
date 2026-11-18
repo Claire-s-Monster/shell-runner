@@ -443,3 +443,32 @@ def test_python_heredoc_import_is_pinned(tmp_path: Path) -> None:
     # Spec: asserted PINNED even if the analyzer cannot see heredoc bodies today.
     _make(tmp_path, {"foo.py": "v=1\n"})
     _assert_pinned("python3 - <<'EOF'\nimport foo\nEOF", tmp_path, ("foo.py",))
+
+
+# --- J. ruby require regex: no polynomial backtracking (CodeQL py/polynomial-redos) ------
+
+
+def test_ruby_requires_long_whitespace_run_is_fast() -> None:
+    import time
+
+    code = "require" + " " * 30_000 + "x"
+    start = time.perf_counter()
+    assert script_pin._ruby_requires(code) == []
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("require './x'", ["./x"]),
+        ("require('./x')", ["./x"]),
+        ("require ( './x' )", ["./x"]),
+        ("require (  './x'", ["./x"]),
+        ('require_relative "x"', ["x"]),
+        ("load './x.rb'", ["./x.rb"]),
+        ("require 'json'", []),
+        ("foo.require './x'", []),
+    ],
+)
+def test_ruby_requires_forms(code: str, expected: list[str]) -> None:
+    assert script_pin._ruby_requires(code) == expected

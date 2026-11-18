@@ -291,7 +291,7 @@ _NODE_CALL_RE = re.compile(r"\b(?:require|import)\s*\(\s*")  # require( / import
 _NODE_LITERAL_RE = re.compile(r"""(['"])([^'"\\\n]*)\1\s*[,)]""")  # the whole call argument
 _NODE_STATIC_RE = re.compile(r"""\b(?:from|import)\s*(['"])([^'"\\\n]*)\1""")
 _RUBY_REQ_RE = re.compile(
-    r"""(?<![\w.:@$])(require_relative|require|load)\b\s*\(?\s*(['"])([^'"\n]+)\2"""
+    r"""(?<![\w.:@$])(require_relative|require|load)\b\s*(?:\(\s*)?(['"])([^'"\n]+)\2"""
 )
 _PY_IMPORT_RE = re.compile(r"\bimport\b")
 _EXPORT_RE = re.compile(r"^export\s+")
