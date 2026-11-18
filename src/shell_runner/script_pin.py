@@ -974,14 +974,22 @@ class _ShellScanner:
                 self.dq_escape(self.t[self.i + 1])
                 self.i += 2
                 continue
-            if c == "`" or (c == "$" and self.t[self.i + 1 : self.i + 2] in ("(", "{")):
+            after = self.after_dollar() if c == "$" else ""
+            if c == "`" or after in ("(", "{"):
                 self.scan.ok = False  # nested quoting inside the expansion: stay strict
                 return
-            if c == "$":
-                self.mark(subst=False)
+            if after and after in _DQ_EXPANDING_AFTER_DOLLAR:
+                self.mark(subst=False)  # any other `$` is literal inside double quotes
             self.add(c)
             self.i += 1
         self.scan.ok = False
+
+    def after_dollar(self) -> str:
+        """First char after the `$` at `self.i`, past any `\\<newline>` continuations ("" at end)."""
+        j = self.i + 1
+        while self.t[j : j + 2] == "\\\n":
+            j += 2
+        return self.t[j : j + 1]
 
     def dq_escape(self, nxt: str) -> None:
         if nxt in '$`"\\':
@@ -1010,6 +1018,14 @@ class _ShellScanner:
             self.mark(subst=nxt == "(")
             self.add("$")
             self.i += 1
+
+
+# Characters after which a `$` inside double quotes expands: name start, digits, special
+# parameters (`@ * # ? - $ ! 0`) and legacy arithmetic `$[`. `(` and `{` bail out earlier.
+# End of input is excluded separately: a bare trailing `$` is literal.
+_DQ_EXPANDING_AFTER_DOLLAR = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789@*#?-$!["
+)
 
 
 def _scan_shell(text: str) -> _ShellScan:

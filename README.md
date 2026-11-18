@@ -430,7 +430,9 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   Fail closed (unpinnable): an unknown `cd`/`pushd` target or non-literal `ruby -C` before
   inline code that imports; unparseable or shell-expanded python code with an `import`
   (`$` / backticks count only where the shell expands them: not inside single quotes, after
-  a backslash in double quotes, or in the body of a quoted-delimiter heredoc); inline code
+  a backslash in double quotes, in double quotes when the `$` is not followed (after any
+  backslash-newline continuations) by a name character, digit, `{`, `(`, `[` or one of
+  `@ * # ? - $ !` -- any other `$`, such as a regex `$` anchor, is literal -- or in the body of a quoted-delimiter heredoc); inline code
   using `$'..'` quoting (escapes decoded by the shell); a node `require(`/`import(`
   argument that is not one plain literal; and any `xargs` whose command is a runner (make, pixi, uv, npm, yarn, pnpm), an interpreter or a
   wrapper (`nice`, `env`, `timeout`, ...) around one. `xargs env VAR=... cmd` is still

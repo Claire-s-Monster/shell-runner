@@ -127,6 +127,96 @@ def test_security_review_round2(label: str, tmp_path: Path) -> None:
     assert plan.unpinnable is True, (label, R_UNPINNABLE[label])
 
 
+# --- D. literal `$` inside double quotes (bash expands only before name/digit/special) -----
+
+DQ_LITERAL_DOLLAR = {
+    "regex_end_anchor": '''python3 -c "import re; print(re.search(r'.*$', 'a'))"''',
+    "regex_alternation": '''python3 -c "import re; print(re.split(r'\\s*$|x', 'a'))"''',
+    "dollar_space": 'python3 -c "import os  # CRT$ merge"',
+    "dollar_quote": '''python3 -c "x = 'cost: $'; import json"''',
+    "dollar_after_escaped_backslash": (
+        '''python3 -c "import re; print(re.sub(r'\\\\$\\\\{', '', 'a'))"'''
+    ),
+    "dollar_in_print": '''python3 -c "import json; print('$')"''',
+}
+
+
+@pytest.mark.parametrize("label", list(DQ_LITERAL_DOLLAR))
+def test_usability_dq_literal_dollar(label: str, tmp_path: Path) -> None:
+    plan = _plan(DQ_LITERAL_DOLLAR[label], tmp_path)
+    assert plan.unpinnable is False, (label, _short_reasons(plan))
+
+
+def test_usability_dq_literal_dollar_local_import_pinned(tmp_path: Path) -> None:
+    (tmp_path / "localmod.py").write_text("")
+    plan = _plan('''python3 -c "import re, localmod; re.match(r'a$', 'a')"''', tmp_path)
+    assert plan.unpinnable is False, _short_reasons(plan)
+    assert any("localmod" in r.operand for r in plan.refs), plan.refs
+
+
+DQ_EXPANDING = {
+    "name": "$a",
+    "underscore": "$_x",
+    "digit": "$1",
+    "brace": "${x}",
+    "command_subst": "$(id)",
+    "arith": "$((1+1))",
+    "at": "$@",
+    "star": "$*",
+    "hash": "$#",
+    "question": "$?",
+    "dash": "$-",
+    "pid": "$$",
+    "bang": "$!",
+    "zero": "$0",
+    "backtick": "`id`",
+}
+
+
+@pytest.mark.parametrize("label", list(DQ_EXPANDING))
+def test_security_dq_expanding_dollar(label: str, tmp_path: Path) -> None:
+    (tmp_path / "localmod.py").write_text("")
+    command = f'python3 -c "import localmod; {DQ_EXPANDING[label]}"'
+    plan = _plan(command, tmp_path)
+    assert plan.unpinnable is True, (label, command)
+
+
+_BS_NL = "\\" + "\n"
+DQ_EXPANDING_ODD = {
+    "continuation_name": f"x='${_BS_NL}HOME'",
+    "two_continuations_name": f"x='${_BS_NL}{_BS_NL}HOME'",
+    "continuation_brace": f"x='${_BS_NL}{{HOME}}'",
+    "continuation_digit": f"x='${_BS_NL}1'",
+    "legacy_arith": "x='$[x]'",
+    "legacy_arith_expr": "x='$[1+1]'",
+}
+
+
+@pytest.mark.parametrize("label", list(DQ_EXPANDING_ODD))
+def test_security_dq_expanding_dollar_odd_forms(label: str, tmp_path: Path) -> None:
+    (tmp_path / "localmod.py").write_text("")
+    command = f'python3 -c "import localmod; {DQ_EXPANDING_ODD[label]}"'
+    plan = _plan(command, tmp_path)
+    assert plan.unpinnable is True, (label, command)
+
+
+def test_usability_dq_dollar_continuation_then_quote_is_literal(tmp_path: Path) -> None:
+    (tmp_path / "localmod.py").write_text("")
+    command = f"python3 -c \"import localmod; x='${_BS_NL}'\""
+    plan = _plan(command, tmp_path)
+    assert plan.unpinnable is False, _short_reasons(plan)
+    assert any("localmod" in r.operand for r in plan.refs), plan.refs
+
+
+def test_security_sq_dollar_joined_to_name_is_literal_but_dq_after_is_not(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "localmod.py").write_text("")
+    # `$` in single quotes is literal; the adjacent "$x" in double quotes expands.
+    command = """python3 -c "import localmod"'$'"$x\""""
+    assert _plan(command, tmp_path).unpinnable is True, command
+
+
 R_USABILITY = {
     "R1_bash_c_single_quoted": """bash -c 'python3 -c "import json; print(1)"'""",
     "R2_arith_shift_then_literal": "echo $((1<<2)); python3 -c 'import json'",
