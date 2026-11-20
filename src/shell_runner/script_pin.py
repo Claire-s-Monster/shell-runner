@@ -47,7 +47,8 @@ MAX_SCRIPT_BYTES = 64 << 20  # larger files are treated as unreadable (bounded h
 _MAX_DEPTH = 3  # nested `-c` bodies
 _MAX_WRAP = 12
 MAX_TOTAL_BYTES = 64 << 20  # total bytes hashed per command
-MAX_FILES = 32  # files hashed per command; over budget the command is unpinnable
+MAX_FILES = 32  # existing files hashed per command; over budget the command is unpinnable
+MAX_MISSING_FILES = 256  # absent candidates pinned as MISSING per command (bounds stat work)
 _UNRESOLVABLE_CHARS = "$`*?[{\n\0"
 _OVER_BUDGET = "over_budget"
 _MAKEFILES = ("GNUmakefile", "makefile", "Makefile")
@@ -2360,13 +2361,18 @@ def _hash_refs(refs: list[ScriptRef], cwd: str) -> tuple[dict[str, str], bool] |
     paths: dict[str, str] = {}
     budget = [MAX_TOTAL_BYTES]
     ok = True
+    existing = missing = 0
     for ref in refs:
         candidates = _ref_paths(ref, cwd)
         for path in candidates:
             if path not in paths:
-                if len(paths) >= MAX_FILES:
+                digest = paths[path] = _file_sha256(path, budget)
+                if digest == MISSING:
+                    missing += 1
+                else:
+                    existing += 1
+                if existing > MAX_FILES or missing > MAX_MISSING_FILES:
                     return None
-                paths[path] = _file_sha256(path, budget)
         if ref.required and all(paths[p] in _UNHASHED for p in candidates):
             ok = False
     if _OVER_BUDGET in paths.values():

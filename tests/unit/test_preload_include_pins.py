@@ -560,6 +560,54 @@ def test_node_builtin_preload_stays_durable(tmp_path: Path, mod: str) -> None:
     _assert_unchanged(f"node -r {mod} app.js", "node app.js", tmp_path)
 
 
+def _assert_reusable_pin(command: str, tmp_path: Path) -> script_pin.ScriptPin:
+    plan = _plan(command, tmp_path)
+    assert plan.unpinnable is False, command
+    assert plan.non_durable == [], command
+    pin = script_pin.compute_pin(command, str(tmp_path))
+    assert pin is not None
+    assert pin.sha256 != script_pin.UNPINNABLE, command
+    assert script_pin.pin_matches(command, str(tmp_path), pin.sha256)
+    return pin
+
+
+def test_many_absent_python_imports_stay_pinnable(tmp_path: Path) -> None:
+    mods = ", ".join(f"m{i}" for i in range(1, 18))
+    _assert_reusable_pin(f"python -c 'import {mods}'", tmp_path)
+
+
+def test_many_absent_python_imports_after_cd_stay_pinnable(tmp_path: Path) -> None:
+    (tmp_path / "sub").mkdir()
+    mods = ", ".join(f"m{i}" for i in range(1, 10))
+    _assert_reusable_pin(f"cd sub && python -c 'import {mods}'", tmp_path)
+
+
+def test_many_absent_node_requires_stay_pinnable_and_creation_invalidates(
+    tmp_path: Path,
+) -> None:
+    command = 'node -e "' + ";".join(f"require('./{c}')" for c in "abcde") + '"'
+    pin = _assert_reusable_pin(command, tmp_path)
+    _make(tmp_path, {"c.js": "evil = 1\n"})
+    assert not script_pin.pin_matches(command, str(tmp_path), pin.sha256)
+
+
+def test_over_file_cap_of_existing_files_is_unpinnable(tmp_path: Path) -> None:
+    n = script_pin.MAX_FILES + 1
+    _make(tmp_path, {f"m{i}.py": "x = 1\n" for i in range(n)})
+    mods = ", ".join(f"m{i}" for i in range(n))
+    pin = script_pin.compute_pin(f"python -c 'import {mods}'", str(tmp_path))
+    assert pin is not None
+    assert pin.unpinnable
+
+
+def test_over_missing_cap_is_unpinnable(tmp_path: Path) -> None:
+    n = script_pin.MAX_MISSING_FILES // 7 + 2  # node: 7 candidates per absent spec
+    command = 'node -e "' + ";".join(f"require('./a{i}')" for i in range(n)) + '"'
+    pin = script_pin.compute_pin(command, str(tmp_path))
+    assert pin is not None
+    assert pin.unpinnable
+
+
 def test_ruby_requires_long_whitespace_run_is_fast() -> None:
     import time
 
