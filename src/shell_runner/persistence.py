@@ -1424,13 +1424,20 @@ class Persistence:
         """Idempotently insert seed approvals as global (agent_id IS NULL) rows.
 
         Skips templates already present in template_approvals (regardless of
-        agent_id), so user-promoted approvals are never overwritten.
+        agent_id), so user-promoted approvals are never overwritten. A seed whose
+        template contains a leaked masking sentinel is skipped with a warning.
 
         Returns the count of newly-inserted rows.
         """
         inserted = 0
         with self._write_conn() as conn:
             for seed in seeds:
+                if template_has_sentinel(seed.template):  # issue #117: never store a wildcard
+                    logger.warning(
+                        "skipping seed approval with a raw masking sentinel in its template: %r",
+                        seed.template,
+                    )
+                    continue
                 existing = conn.execute(
                     "SELECT 1 FROM template_approvals WHERE template = ? LIMIT 1",
                     (seed.template,),
