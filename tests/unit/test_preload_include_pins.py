@@ -121,9 +121,6 @@ def test_include_dir_flag_is_non_durable(
 # --- 11-12. UNCHANGED --------------------------------------------------------------
 
 UNCHANGED = [
-    ("python -c 'import json'", "python -c 'pass'", {}),
-    ("python -c 'import os, sys; print(1)'", "python -c 'print(1)'", {}),
-    ("python3 -c 'from pathlib import Path'", "python3 -c 'pass'", {}),
     ("python -m pytest -q", "python -m pytest", {}),
     ("python -m json.tool", "python -m json.tool", {}),
     ("python -m pip --version", "python -m pip", {}),
@@ -409,7 +406,8 @@ def test_env_file_loader_var_after_large_padding_is_not_durable(tmp_path: Path) 
     assert len(text) > 1024 * 1024
     _make(tmp_path, {".env": text, "x.py": "print(1)\n"})
     plan = _plan("uv run --env-file .env python x.py", tmp_path)
-    assert plan.non_durable or plan.unpinnable
+    assert not plan.unpinnable
+    assert any("PYTHONPATH" in reason for reason in plan.non_durable), plan.non_durable
 
 
 # --- I. minor gaps -------------------------------------------------------------------
@@ -446,6 +444,120 @@ def test_python_heredoc_import_is_pinned(tmp_path: Path) -> None:
 
 
 # --- J. ruby require regex: no polynomial backtracking (CodeQL py/polynomial-redos) ------
+
+
+# =====================================================================================
+# PR #109 review fixes (#98)
+# =====================================================================================
+
+ABSENT_IMPORTS = [
+    ("python -c 'import json'", "json.py"),
+    ("python3 -c 'from foo import bar'", "foo/__init__.py"),
+    ("node -e \"require('./x')\"", "x.js"),
+    ("node -e \"import('./x')\"", "x.mjs"),
+    ("ruby -e \"require_relative 'x'\"", "x.rb"),
+    ("ruby -e \"load './x'\"", "x.rb"),
+]
+
+
+@pytest.mark.parametrize(("command", "created"), ABSENT_IMPORTS, ids=[c for c, _ in ABSENT_IMPORTS])
+def test_absent_import_is_pinned_missing_and_creating_it_invalidates(
+    tmp_path: Path, command: str, created: str
+) -> None:
+    pin = script_pin.compute_pin(command, str(tmp_path))
+    assert pin is not None
+    assert pin.ok is True
+    assert script_pin.pin_matches(command, str(tmp_path), pin.sha256)
+    _make(tmp_path, {created: "evil = 1\n"})
+    assert not script_pin.pin_matches(command, str(tmp_path), pin.sha256)
+
+
+def test_absent_import_does_not_make_command_non_promotable(tmp_path: Path) -> None:
+    plan = _plan("python -c 'import json'", tmp_path)
+    assert plan.unpinnable is False
+    assert plan.non_durable == []
+    assert plan.refs
+    assert all(ref.script is False and ref.required is False for ref in plan.refs)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "node -e 'require/*c*/(\"./x\")'",
+        "node -e 'require /* a */ /* b */ (\"./x\")'",
+        "node -e 'import/*c*/(\"./x\")'",
+        "node -e 'import/*c*/\"./x\"'",
+        "node -e 'require // c\n(\"./x\")'",
+        'node -e \'"/*"; require/*c*/("./x"); "*/"\'',
+        'node -e \'/"/; require/*c*/("./x")\'',
+    ],
+)
+def test_node_comment_between_require_and_argument_is_pinned(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, {"x.js": "1\n"})
+    _assert_pinned(command, tmp_path, ("x.js",))
+
+
+def test_node_comment_with_dynamic_argument_is_unpinnable(tmp_path: Path) -> None:
+    _assert_unpinnable("node -e 'require/*c*/(x)'", tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "files", "pinned"),
+    [
+        ("node -e \"require('./data')\"", {"data.json": "{}\n"}, ("data.json",)),
+        ("node -e \"require('./d')\"", {"d/index.json": "{}\n"}, ("d/index.json",)),
+    ],
+)
+def test_node_resolution_includes_json(
+    tmp_path: Path, command: str, files: dict[str, str], pinned: tuple[str, ...]
+) -> None:
+    _make(tmp_path, files)
+    _assert_pinned(command, tmp_path, pinned)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ruby -e 'require \"./#{x}\"'",
+        "ruby -e 'f = \"./x\"; require f'",
+        "ruby -e 'load f'",
+        "ruby -e 'require_relative(f)'",
+        'ruby -e "require \\"./$X\\""',
+    ],
+)
+def test_ruby_non_literal_require_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, {"x.rb": "1\n"})
+    _assert_unpinnable(command, tmp_path)
+
+
+def test_ruby_literal_require_is_not_dynamic(tmp_path: Path) -> None:
+    _make(tmp_path, {"x.rb": "1\n"})
+    assert _plan('ruby -e \'require "json"; require_relative "x"\'', tmp_path).unpinnable is False
+
+
+def test_attached_inline_code_does_not_hide_trailing_preload(tmp_path: Path) -> None:
+    _make(tmp_path, {"hook.rb": "h\n"})
+    _assert_pinned("ruby '-ex=1;r=2e' -r ./hook.rb", tmp_path, ("hook.rb",))
+
+
+def test_ruby_home_relative_preload_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    _make(home, {"hook.rb": "h\n"})
+    monkeypatch.setenv("HOME", str(home))
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    command = "ruby -r ~/hook.rb -e 1"
+    pin = script_pin.compute_pin(command, str(cwd))
+    assert pin is not None
+    assert pin.paths.get(str((home / "hook.rb").resolve())) == hashlib.sha256(b"h\n").hexdigest()
+
+
+@pytest.mark.parametrize("mod", ["fs", "node:fs", "path"])
+def test_node_builtin_preload_stays_durable(tmp_path: Path, mod: str) -> None:
+    _make(tmp_path, {"app.js": "a\n"})
+    _assert_unchanged(f"node -r {mod} app.js", "node app.js", tmp_path)
 
 
 def test_ruby_requires_long_whitespace_run_is_fast() -> None:

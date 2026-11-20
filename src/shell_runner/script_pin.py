@@ -241,11 +241,9 @@ def _short_option_values(spec: _Interp, args: list[str], i: int, out: _Options) 
             out.include.append(rest)  # perl -Mlib=DIR adds an include directory
             return 1
         if ch in spec.inline and spec.options_after_code:
-            if not rest:
-                return 2  # the code is the next word; options go on after it
-            if not any(c in spec.inline for c in rest):
-                return 1  # `-ecode`
-            continue  # `-pe CODE`: the later inline flag takes the code
+            # no attached text: the code is the next word; `-eCODE`: the rest of the cluster
+            # is code, never more options
+            return 1 if rest else 2
         if ch in spec.attached:
             return 1
         if ch in spec.value:
@@ -286,7 +284,13 @@ def _node_modules_reason(kind: str, value: str) -> str:
 
 _PATH_PREFIXES = ("./", "../", "/")
 # (suffixes tried after the path as given, index file tried inside a directory)
-_RESOLVE = {"node": ((".js", ".mjs", ".cjs"), "index.js"), "ruby": ((".rb",), "")}
+_RESOLVE = {
+    "node": ((".js", ".json", ".mjs", ".cjs"), ("index.js", "index.json")),
+    "ruby": ((".rb",), ()),
+}
+_OPTION_PATH_PREFIXES = (*_PATH_PREFIXES, "~/")
+_JS_BLOCK_OR_LINE_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_RUBY_KEYWORD_RE = re.compile(r"(?<![\w.:@$])(?:require_relative|require|load)\b")
 _NODE_CALL_RE = re.compile(r"\b(?:require|import)\s*\(\s*")  # require( / import(
 _NODE_LITERAL_RE = re.compile(r"""(['"])([^'"\\\n]*)\1\s*[,)]""")  # the whole call argument
 _NODE_STATIC_RE = re.compile(r"""\b(?:from|import)\s*(['"])([^'"\\\n]*)\1""")
@@ -345,14 +349,60 @@ def _node_specifiers(code: str, *, expanded: bool = True) -> tuple[list[str], bo
     """
     specs: list[str] = []
     dynamic = False
-    for m in _NODE_CALL_RE.finditer(code):
-        lit = _NODE_LITERAL_RE.match(code, m.end())
-        if lit is None:
-            dynamic = True
-        else:
-            specs.append(lit[2])
-    specs += [m[2] for m in _NODE_STATIC_RE.finditer(code)]
+    for view in _js_views(code):
+        for m in _NODE_CALL_RE.finditer(view):
+            lit = _NODE_LITERAL_RE.match(view, m.end())
+            if lit is None:
+                dynamic = True
+            else:
+                specs.append(lit[2])
+        specs += [m[2] for m in _NODE_STATIC_RE.finditer(view)]
     return specs, dynamic or (expanded and any("$" in s for s in specs))
+
+
+def _strip_js_comments_quoted(code: str) -> str:
+    """`code` with comments replaced by a space, honouring '...', "..." and `...` literals."""
+    out: list[str] = []
+    i, n = 0, len(code)
+    quote = ""
+    while i < n:
+        ch = code[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(code[i + 1])
+                i += 1
+            elif ch == quote or (ch == "\n" and quote != "`"):
+                quote = ""
+        elif ch in "'\"`":
+            quote = ch
+            out.append(ch)
+        elif code.startswith("//", i):
+            end = code.find("\n", i)
+            i = n if end < 0 else end - 1
+            out.append(" ")
+        elif code.startswith("/*", i):
+            end = code.find("*/", i + 2)
+            i = n if end < 0 else end + 1
+            out.append(" ")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _js_views(code: str) -> list[str]:
+    """Texts to scan for module specifiers: raw, and with comments removed.
+
+    A `/*` or quote inside a regex literal can fool any comment stripper, so the code is
+    scanned as written, comment-stripped string-aware, and comment-stripped string-blind;
+    a specifier found in any view counts (fail closed).
+    """
+    return [
+        code,
+        _strip_js_comments_quoted(code),
+        _JS_BLOCK_OR_LINE_COMMENT_RE.sub(" ", code),
+    ]
 
 
 def _is_node_builtin(spec: str) -> bool:
@@ -366,6 +416,19 @@ def _ruby_requires(code: str) -> list[str]:
         for m in _RUBY_REQ_RE.finditer(code)
         if m[1] != "require" or m[3].startswith(_PATH_PREFIXES)
     ]
+
+
+def _ruby_dynamic(code: str, *, expanded: bool) -> bool:
+    """Whether a require/load/require_relative in `code` has an operand not known statically.
+
+    Anything but a plain string literal (variable, interpolation, shell-expanded `$`) counts.
+    """
+    literal_at = {m.start(): m for m in _RUBY_REQ_RE.finditer(code)}
+    for kw in _RUBY_KEYWORD_RE.finditer(code):
+        m = literal_at.get(kw.start())
+        if m is None or (m[2] == '"' and "#{" in m[3]) or (expanded and "$" in m[3]):
+            return True
+    return False
 
 
 def _heredoc_bodies(text: str) -> list[str]:
@@ -1867,12 +1930,16 @@ class _Analyzer:
         ref = ScriptRef(operand, tuple(self.bases))
         return any(os.path.isfile(p) for p in _ref_paths(ref, self.cwd))
 
+    def resolve_candidates(self, operand: str, lang: str) -> list[str]:
+        """Files node/ruby would try for `operand` (as given, suffixed, index), in order."""
+        suffixes, indexes = _RESOLVE[lang]
+        return [operand, *(operand + s for s in suffixes)] + [
+            posixpath.join(operand, i) for i in indexes
+        ]
+
     def resolve_local(self, operand: str, lang: str) -> str | None:
         """First existing file node/ruby would load for `operand` (as given, suffixed, index)."""
-        suffixes, index = _RESOLVE[lang]
-        cands = [operand, *(operand + s for s in suffixes)]
-        if index:
-            cands.append(posixpath.join(operand, index))
+        cands = self.resolve_candidates(operand, lang)
         return next((c for c in cands if self.local_file_exists(c)), None)
 
     def option_refs(self, spec: _Interp, opts: _Options) -> None:
@@ -1880,9 +1947,9 @@ class _Analyzer:
         for value in opts.preload:
             if not _literal(value):
                 self.add_file(value)  # unpinnable: not a literal path
-            elif value.startswith(_PATH_PREFIXES):
+            elif value.startswith(_OPTION_PATH_PREFIXES):
                 self.add_file(self.resolve_local(value, spec.lang) or value)
-            elif spec.lang == "node":
+            elif spec.lang == "node" and not _is_node_builtin(value):
                 self.non_durable(_node_modules_reason("preload", value))
         if opts.include:
             self.non_durable(_INCLUDE_REASON)
@@ -1897,19 +1964,33 @@ class _Analyzer:
             self.inline_python(code, expanded=expanded)
         elif lang == "node":
             self.inline_node(code, expanded=expanded)
+        elif _ruby_dynamic(code, expanded=expanded):
+            self.unpin("inline ruby code requires a file that cannot be resolved statically")
         else:
             self.pin_inline_paths(_ruby_requires(code), "ruby")
 
     def pin_inline(self, files: list[str]) -> None:
+        """Pin every candidate file; an absent one is pinned as MISSING (created later: mismatch).
+
+        Only a candidate that exists counts as running a script (non-promotable).
+        """
         for f in dict.fromkeys(files):
-            self.emit(ScriptRef(f, tuple(self.bases), required=False))
+            self.emit(
+                ScriptRef(f, tuple(self.bases), required=False, script=self.local_file_exists(f))
+            )
 
     def pin_inline_paths(self, operands: list[str], lang: str) -> None:
         """Pin what node/ruby would load for local `operands`; unknown cd target: unpinnable."""
         if self.base_unknown and any(not o.startswith("/") for o in operands):
             self.unpin(_UNKNOWN_BASE_IMPORT)
             return
-        self.pin_inline([f for o in dict.fromkeys(operands) if (f := self.resolve_local(o, lang))])
+        files: list[str] = []
+        for o in dict.fromkeys(operands):
+            for cand in self.resolve_candidates(o, lang):
+                files.append(cand)
+                if self.local_file_exists(cand):
+                    break  # later candidates only matter if this one goes away
+        self.pin_inline(files)
 
     def inline_python(self, code: str, *, expanded: bool) -> None:
         names = _python_imports(code)
@@ -1918,7 +1999,7 @@ class _Analyzer:
         elif names and self.base_unknown:
             self.unpin(_UNKNOWN_BASE_IMPORT)
         elif names:
-            self.pin_inline([f for f in _python_import_files(names) if self.local_file_exists(f)])
+            self.pin_inline(_python_import_files(names))
 
     def inline_node(self, code: str, *, expanded: bool) -> None:
         specs, dynamic = _node_specifiers(code, expanded=expanded)
