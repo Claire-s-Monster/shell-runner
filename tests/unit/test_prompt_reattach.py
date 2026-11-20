@@ -7,6 +7,7 @@ import multiprocessing
 import sqlite3
 import threading
 import time
+import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -180,15 +181,53 @@ def test_concurrent_threads_create_one_row(tmp_path: Path) -> None:
     assert _count(path) == 1
 
 
+# Columns the raw INSERT below sets (same as create_pending_prompt's INSERT) and the
+# columns it leaves to NULL defaults. The guard test fails if the schema drifts from them.
+_INSERT_COLUMNS = (
+    "id",
+    "created_at",
+    "expires_at",
+    "agent_id",
+    "cwd",
+    "raw_cmd",
+    "normalized_template",
+    "command_tier",
+    "matched_rule_category",
+    "decision_path_json",
+    "detach",
+    "script_sha256",
+    "script_paths",
+)
+_DEFAULTED_COLUMNS = (
+    "approve_token",
+    "approve_decision",
+    "approved_at",
+    "consumed_at",
+    "approver_agent_id",
+)
+
+
+def test_raw_insert_columns_match_the_schema(tmp_path: Path) -> None:
+    path = tmp_path / "test.sqlite3"
+    Persistence(db_path=path)
+    with sqlite3.connect(path) as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_prompts)")}
+    assert cols == set(_INSERT_COLUMNS) | set(_DEFAULTED_COLUMNS)
+
+
 def _reattach_in_child(db_path: str, ready: Any, go: Any, entered: Any, results: Any) -> None:
     """Spawned child (top-level so spawn can pickle it). Its Persistence is built before
     the parent takes the write lock, so schema init never contends with it."""
-    db = Persistence(db_path=db_path)
-    ready.set()
-    go.wait(timeout=10)
-    entered.set()  # about to call create_or_reattach_prompt
-    row, reattached = db.create_or_reattach_prompt(**BASE)
-    results.put((row["id"], reattached))
+    try:
+        db = Persistence(db_path=db_path)
+        ready.set()
+        go.wait(timeout=10)
+        entered.set()  # about to call create_or_reattach_prompt
+        row, reattached = db.create_or_reattach_prompt(**BASE)
+        results.put((row["id"], reattached))
+    except BaseException as exc:
+        results.put(("error", repr(exc), traceback.format_exc()))
+        raise
 
 
 def test_lookup_waits_for_a_concurrent_writer_across_processes(tmp_path: Path) -> None:
@@ -215,14 +254,10 @@ def test_lookup_waits_for_a_concurrent_writer_across_processes(tmp_path: Path) -
             parent_id = str(uuid.uuid4())
             now = datetime.now(UTC)
             # same column set as create_pending_prompt's INSERT
+            placeholders = ", ".join("?" * len(_INSERT_COLUMNS))
             writer.execute(
-                """
-                INSERT INTO pending_prompts (
-                    id, created_at, expires_at, agent_id, cwd, raw_cmd,
-                    normalized_template, command_tier, matched_rule_category,
-                    decision_path_json, detach, script_sha256, script_paths
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                f"INSERT INTO pending_prompts ({', '.join(_INSERT_COLUMNS)}) "  # noqa: S608
+                f"VALUES ({placeholders})",
                 (
                     parent_id,
                     now.isoformat(),
@@ -242,11 +277,17 @@ def test_lookup_waits_for_a_concurrent_writer_across_processes(tmp_path: Path) -
             writer.execute("COMMIT")
         finally:
             writer.close()
-        child_id, reattached = results.get(timeout=10)
+        outcome = results.get(timeout=10)
     finally:
         child.join(timeout=10)
         if child.is_alive():
             child.terminate()
+            child.join(5)
+        results.close()
+        results.join_thread()
 
-    assert (child_id, reattached) == (parent_id, True)
+    if outcome[0] == "error":
+        pytest.fail(f"child failed: {outcome[1]}\n{outcome[2]}")
+    assert child.exitcode == 0
+    assert outcome == (parent_id, True)
     assert _count(path) == 1
