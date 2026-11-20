@@ -56,17 +56,23 @@ def test_identical_call_reattaches_and_keeps_expiry(db: Persistence) -> None:
     assert _count(db.db_path) == 1
 
 
-def test_non_script_calls_match_null_sha(db: Persistence) -> None:
-    first, _ = _open(db)
-    assert first["script_sha256"] is None
-    second, reattached = _open(db)
-    assert (second["id"], reattached) == (first["id"], True)
-
-
-def test_unpinnable_matches_only_itself(db: Persistence) -> None:
-    first, _ = _open(db, script_sha256=UNPINNABLE)
-    second, reattached = _open(db, script_sha256=UNPINNABLE)
-    assert (second["id"], reattached) == (first["id"], True)
+@pytest.mark.parametrize(
+    ("script_sha256", "script_paths"),
+    [
+        (None, None),
+        (UNPINNABLE, None),
+        (SHA_A, '{"/tmp/x.sh": "' + SHA_A + '"}'),
+    ],
+)
+def test_identical_pin_reattaches(
+    db: Persistence, script_sha256: str | None, script_paths: str | None
+) -> None:
+    pin = {"script_sha256": script_sha256, "script_paths": script_paths}
+    first, _ = _open(db, **pin)
+    second, reattached = _open(db, **pin)
+    assert reattached is True
+    assert second["id"] == first["id"]
+    assert _count(db.db_path) == 1
 
 
 @pytest.mark.parametrize(
@@ -110,6 +116,7 @@ def test_expired_prompt_is_not_reattached(db: Persistence) -> None:
     row, reattached = _open(db)
     assert reattached is False
     assert row["id"] != old
+    assert _count(db.db_path) == 2
 
 
 @pytest.mark.parametrize("decision", ["approve_once", "approve_template", "deny"])
