@@ -942,3 +942,28 @@ def test_hashing_budget_makes_the_command_unpinnable(
     monkeypatch.setattr(script_pin, "MAX_FILES", 32)
     monkeypatch.setattr(script_pin, "MAX_TOTAL_BYTES", 20)
     assert _pin(command, tmp_path).unpinnable
+
+
+def test_script_changed_reprompt_never_reattaches(
+    client: TestClient,
+    calls: list[Any],
+    script: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = _execute(client, SCRIPT_CMD, tmp_path)["prompt"]
+    _approve(client, prompt["id"])
+    script.write_text("echo rewritten\n")
+    reattach_calls: list[dict] = []
+    original = srv.db.create_or_reattach_prompt
+
+    def _spy(**kwargs: Any) -> tuple[dict, bool]:
+        reattach_calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(srv.db, "create_or_reattach_prompt", _spy)
+    reprompted = _execute(client, SCRIPT_CMD, tmp_path)  # consumes -> _reprompt_script_changed
+    assert reprompted["decision"] == "prompt_required"
+    assert "changed" in reprompted["prompt"]["why"]
+    assert reattach_calls == []
+    assert calls == []

@@ -26,6 +26,7 @@ WRITE_METHODS = frozenset(
         "finalize_call",
         "upsert_template",
         "create_pending_prompt",
+        "create_or_reattach_prompt",
         "approve_prompt",
         "consume_approve_token",
         "consume_approval_by_command",
