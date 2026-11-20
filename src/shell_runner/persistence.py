@@ -328,6 +328,22 @@ _VALID_DECISIONS = frozenset(get_args(ApprovalDecision))
 # longer than the default pending-prompt TTL (300s) used at prompt creation.
 APPROVE_ONCE_DURABLE_TTL_S = 3600
 
+# issue #119: an open prompt is re-attachable only if everything the approver decides on
+# matches. idx_pending_agent_cmd covers (agent_id, raw_cmd, cwd); the rest is filtered
+# here. Nullable columns use IS so NULL matches NULL (non-script commands store no pin)
+# and the UNPINNABLE sentinel matches only itself. script_paths is compared too: it is
+# the #98 manifest binding decide_prompt attaches to reusable rules.
+_REATTACH_SQL = """
+    SELECT id FROM pending_prompts
+    WHERE agent_id = ? AND raw_cmd = ? AND cwd = ? AND detach = ?
+      AND approve_decision IS NULL AND consumed_at IS NULL AND expires_at >= ?
+      AND script_sha256 IS ? AND script_paths IS ?
+      AND normalized_template = ? AND command_tier = ?
+      AND decision_path_json IS ? AND matched_rule_category IS ?
+    ORDER BY created_at DESC, rowid DESC
+    LIMIT 1
+"""
+
 
 BUSY_TIMEOUT_MS = 5000
 
@@ -818,6 +834,71 @@ class Persistence:
                 ),
             )
         return prompt_id
+
+    def create_or_reattach_prompt(
+        self,
+        *,
+        agent_id: str,
+        cwd: str,
+        raw_cmd: str,
+        normalized_template: str,
+        command_tier: int,
+        matched_rule_category: str | None,
+        decision_path: list[str],
+        detach: bool = False,
+        script_sha256: str | None = None,
+        script_paths: str | None = None,
+    ) -> tuple[dict, bool]:
+        """Reuse an identical open prompt, else insert one (issue #119).
+
+        Lookup and insert share one BEGIN IMMEDIATE transaction, so concurrent identical
+        calls (threads or processes) create a single row. Only undecided, unconsumed,
+        unexpired prompts that match on every field in _REATTACH_SQL qualify; re-attach
+        never touches expires_at. The insert reuses create_pending_prompt (the shared
+        write connection is reentrant, so it joins this transaction).
+        Returns (full row, reattached).
+        """
+        with self._write_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            now = _now_utc()  # sampled after the write lock, as in decide_prompt
+            found = conn.execute(
+                _REATTACH_SQL,
+                (
+                    agent_id,
+                    raw_cmd,
+                    cwd,
+                    int(detach),
+                    now,
+                    script_sha256,
+                    script_paths,
+                    normalized_template,
+                    command_tier,
+                    json.dumps(decision_path),
+                    matched_rule_category,
+                ),
+            ).fetchone()
+            reattached = found is not None
+            prompt_id = (
+                found["id"]
+                if found is not None
+                else self.create_pending_prompt(
+                    agent_id=agent_id,
+                    cwd=cwd,
+                    raw_cmd=raw_cmd,
+                    normalized_template=normalized_template,
+                    command_tier=command_tier,
+                    matched_rule_category=matched_rule_category,
+                    decision_path=decision_path,
+                    detach=detach,
+                    script_sha256=script_sha256,
+                    script_paths=script_paths,
+                )
+            )
+            row = conn.execute(
+                "SELECT * FROM pending_prompts WHERE id = ?", (prompt_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        return dict(row), reattached
 
     def approve_prompt(
         self, *, prompt_id: str, decision: str, approver_agent_id: str | None = None
