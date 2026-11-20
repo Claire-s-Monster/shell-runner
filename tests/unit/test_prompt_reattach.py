@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import multiprocessing
 import sqlite3
-from datetime import UTC, datetime
+import threading
+import time
+import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -145,3 +150,103 @@ def test_create_pending_prompt_still_always_inserts(db: Persistence) -> None:
     b = db.create_pending_prompt(**BASE)
     assert a != b
     assert _count(db.db_path) == 2
+
+
+def test_concurrent_threads_create_one_row(tmp_path: Path) -> None:
+    """In-process only: same-path instances share one RLock, so this guards the lock,
+    not BEGIN IMMEDIATE (see the cross-process test below)."""
+    path = tmp_path / "test.sqlite3"
+    Persistence(db_path=path)  # schema first, so the threads only race on the prompt
+    barrier = threading.Barrier(8)
+    results: list[tuple[str, bool]] = []
+    lock = threading.Lock()
+
+    def call() -> None:
+        own = Persistence(db_path=path)
+        barrier.wait()
+        row, reattached = own.create_or_reattach_prompt(**BASE)
+        with lock:
+            results.append((row["id"], reattached))
+
+    threads = [threading.Thread(target=call) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 8
+    assert len({pid for pid, _ in results}) == 1
+    assert sorted(r for _, r in results) == [False] + [True] * 7
+    assert _count(path) == 1
+
+
+def _reattach_in_child(db_path: str, ready: Any, go: Any, entered: Any, results: Any) -> None:
+    """Spawned child (top-level so spawn can pickle it). Its Persistence is built before
+    the parent takes the write lock, so schema init never contends with it."""
+    db = Persistence(db_path=db_path)
+    ready.set()
+    go.wait(timeout=10)
+    entered.set()  # about to call create_or_reattach_prompt
+    row, reattached = db.create_or_reattach_prompt(**BASE)
+    results.put((row["id"], reattached))
+
+
+def test_lookup_waits_for_a_concurrent_writer_across_processes(tmp_path: Path) -> None:
+    """Deterministic: the child must block on BEGIN IMMEDIATE while the parent holds the
+    write lock, then re-attach to the row the parent committed. A lookup outside the
+    transaction would not block (WAL readers never wait), miss the row and insert a second."""
+    path = tmp_path / "test.sqlite3"
+    Persistence(db_path=path)  # schema
+    ctx = multiprocessing.get_context("spawn")
+    ready, go, entered = ctx.Event(), ctx.Event(), ctx.Event()
+    results = ctx.Queue()
+    child = ctx.Process(target=_reattach_in_child, args=(str(path), ready, go, entered, results))
+    child.start()
+    try:
+        assert ready.wait(timeout=30), "child never initialised"
+        writer = sqlite3.connect(path, isolation_level=None, timeout=5)
+        try:
+            writer.execute("BEGIN IMMEDIATE")  # the parent now holds the write lock
+            go.set()
+            assert entered.wait(timeout=10), "child never reached create_or_reattach_prompt"
+            time.sleep(1.0)
+            assert child.is_alive()
+            assert results.empty(), "child finished while the parent held the write lock"
+            parent_id = str(uuid.uuid4())
+            now = datetime.now(UTC)
+            # same column set as create_pending_prompt's INSERT
+            writer.execute(
+                """
+                INSERT INTO pending_prompts (
+                    id, created_at, expires_at, agent_id, cwd, raw_cmd,
+                    normalized_template, command_tier, matched_rule_category,
+                    decision_path_json, detach, script_sha256, script_paths
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    parent_id,
+                    now.isoformat(),
+                    (now + timedelta(seconds=300)).isoformat(),
+                    BASE["agent_id"],
+                    BASE["cwd"],
+                    BASE["raw_cmd"],
+                    BASE["normalized_template"],
+                    BASE["command_tier"],
+                    BASE["matched_rule_category"],
+                    json.dumps(BASE["decision_path"]),
+                    0,
+                    None,
+                    None,
+                ),
+            )
+            writer.execute("COMMIT")
+        finally:
+            writer.close()
+        child_id, reattached = results.get(timeout=10)
+    finally:
+        child.join(timeout=10)
+        if child.is_alive():
+            child.terminate()
+
+    assert (child_id, reattached) == (parent_id, True)
+    assert _count(path) == 1
