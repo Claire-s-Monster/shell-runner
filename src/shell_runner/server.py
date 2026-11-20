@@ -1427,10 +1427,11 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             telemetry_id=telemetry_id,
         )
 
-    # T3/T4 — create pending prompt, return prompt_required
+    # T3/T4 — re-attach to an identical open prompt or create one (issue #119); the pin
+    # is computed before the transaction, compared inside it.
     pin = await asyncio.to_thread(script_pin.compute_pin, req.command, req.cwd)
-    prompt_id = await asyncio.to_thread(
-        db.create_pending_prompt,
+    prompt_row, reattached = await asyncio.to_thread(
+        db.create_or_reattach_prompt,
         agent_id=req.agent_id,
         cwd=req.cwd,
         raw_cmd=req.command,
@@ -1442,6 +1443,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         script_sha256=pin.storage_sha if pin else None,
         script_paths=pin.paths_json if pin else None,
     )
+    prompt_id = prompt_row["id"]
     duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
     if telemetry_writer is not None:

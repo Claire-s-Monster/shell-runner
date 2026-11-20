@@ -207,3 +207,13 @@ def test_job_id_and_prompt_id_are_mutually_exclusive(client: TestClient) -> None
     neither = client.post("/tools/shell_wait", json={}).json()
     assert both["state"] == neither["state"] == "error"
     assert "exactly one" in both["error"]
+
+
+# --- issue #119: re-attach ---------------------------------------------------
+
+
+def test_identical_calls_share_one_open_prompt(client: TestClient, tmp_path: Path) -> None:
+    first = _request_prompt(client, tmp_path)
+    second = _request_prompt(client, tmp_path)
+    assert second == first
+    assert [r["id"] for r in srv.db.list_pending_prompts()] == [first]
