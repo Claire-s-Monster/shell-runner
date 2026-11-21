@@ -484,6 +484,9 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   `parse(file)`, `do.call(source)`). Non-durable (approve-once only, never reusable): any
   option after `bun run` that changes the config/working directory (`--cwd`, `--config`,
   `--env-file`, `--tsconfig-override`) or is unknown (nothing is pinned for such a command),
+  any bun command run where a dotenv file exists in the working directory (`.env`,
+  `.env.local`, `.env.<name>`, `.env.<name>.local`; bun loads them on its own, their values
+  can set loader variables, and they are not parsed; with none present nothing changes),
   `luajit -j`/`-O`, `LUA_*`, `R_PROFILE*`, `R_ENVIRON*`,
   `R_LIBS*` (also when set in a pinned `./.Renviron`), `PHPRC`, `PHP_INI_SCAN_DIR`,
   `php -d include_path`, `AWKPATH`, `AWKLIBPATH`, `BUN_OPTIONS`, `PERL5DB`, `TCLLIBPATH`,
@@ -492,6 +495,10 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   keep their previous outcome), `npx`/`bunx <pkg>` package code, `$HOME` startup files (`~/.cshrc`,
   `~/.Rprofile`), and dynamic loading the literal scans cannot see; deep config modelling
   (`bunfig.toml`, `.Renviron`, php.ini contents beyond the checks above) is tracked in #127.
+  Deno config discovery is not modelled (#128): an upward-discovered `deno.json`/`deno.jsonc`
+  and the import map it names are not pinned (an import map can redirect a local import for
+  `deno run`/`deno eval`), and `deno lint` with `lint.plugins` in the config runs plugin code
+  that is not pinned; only an explicit `--config`/`--import-map` is.
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 
