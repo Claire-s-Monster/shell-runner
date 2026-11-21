@@ -96,7 +96,7 @@ class _Interp:
     # (implicit file, long options that make the interpreter skip it)
     implicit_off: tuple[tuple[str, frozenset[str]], ...] = ()
     unsafe_flags: str = ""  # short flags whose value makes the command unpinnable (php -z)
-    unpin_flags: str = ""  # short flags that make the command unpinnable (luajit -j, -O)
+    risky_flags: str = ""  # short flags that make the command non-durable (luajit -j, -O)
     # when set, any long option outside this set is unpinnable (php)
     long_allow: frozenset[str] | None = None
     opaque_heredoc: bool = False  # a heredoc/here-string script is another language: unpinnable
@@ -177,7 +177,9 @@ _PHP = _Interp(
 _FISH = _Interp(value="dDoC", inline="c", noexec="n")
 _CSH = _Interp(inline="c", noexec="n", stdin="st", opaque_inline=True, opaque_heredoc=True)
 _LUA = _Interp(value="l", code_flags="e", code_then_script=True, preload_flags="l", lang="lua")
-_LUAJIT = replace(_LUA, unpin_flags="jO")  # -j (jit/profiler/dump modules) and -O load code
+# -j (jit/profiler/dump modules) and -O load code: approve-once only. `-j cmd` takes the next
+# word, `-Oopt` its attached text
+_LUAJIT = replace(_LUA, value="lj", attached="O", risky_flags="jO")
 _RSCRIPT = _Interp(
     code_flags="e",
     lang="r",
@@ -318,6 +320,7 @@ class _Options:
     flags: list[str] = field(default_factory=list)  # long option names seen
     ini_search: list[str] = field(default_factory=list)  # php -d include_path=
     unsafe: list[str] = field(default_factory=list)  # reasons the options are unpinnable
+    risky: list[str] = field(default_factory=list)  # reasons the options are non-durable
 
 
 _LIB_PRAGMA_RE = re.compile(r"lib(?:=|\s)")
@@ -363,9 +366,9 @@ def _short_option_values(spec: _Interp, args: list[str], i: int, out: _Options) 
     a = args[i]
     for pos, ch in enumerate(a[1:]):
         rest = a[pos + 2 :]
-        if ch in spec.unpin_flags:
-            out.unsafe.append(f"-{ch} loads code that cannot be pinned")
-            return 1
+        if ch in spec.risky_flags:
+            out.risky.append(f"-{ch} loads code that cannot be pinned")
+            return 1 if rest or ch in spec.attached else 2
         if spec.collects(ch):
             value = rest or (args[i + 1] if i + 1 < len(args) else "")
             if value:
@@ -737,6 +740,48 @@ def _awk_includes(text: str) -> tuple[list[str], bool]:
             return names, False
         names.append(lit[2])
     return names, True
+
+
+def _awk_short_cluster(args: list[str], i: int, out: list[str]) -> int:
+    """Copy the short cluster `args[i]` to `out`, spelling its `W` option as `--opt`; words used."""
+    a = args[i]
+    for pos, ch in enumerate(a[1:]):
+        rest = a[pos + 2 :]
+        if ch == "W":
+            if pos:
+                out.append(a[: pos + 1])
+            opt = rest or (args[i + 1] if i + 1 < len(args) else "")
+            used = 1 if rest else 2
+            out.append(f"--{opt}" if opt else "--?")  # `--?` is unknown, so refused
+            if "--" + opt.partition("=")[0] in _AWK_LONG_VALUE and "=" not in opt:
+                out += args[i + used : i + used + 1]  # `-W file x`: the value is the next word
+                used += 1
+            return used
+        if ch in _AWK_SHORT_VALUE:
+            used = 1 if rest else 2
+            out += args[i : i + used]
+            return used
+    out.append(a)
+    return 1
+
+
+def _awk_normalize(args: list[str]) -> list[str]:
+    """Spell gawk/mawk `-W opt[=val]` as the equivalent `--opt[=val]` (same checks, same names)."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--", "-") or not a.startswith("-"):
+            out += args[i:]
+            break
+        if a.startswith("--"):
+            name, eq, _ = a.partition("=")
+            used = 2 if name in _AWK_LONG_VALUE and not eq else 1
+            out += args[i : i + used]
+        else:
+            used = _awk_short_cluster(args, i, out)
+        i += used
+    return out
 
 
 def _awk_scan(args: list[str]) -> tuple[bool, str | None]:
@@ -2177,6 +2222,7 @@ class _Analyzer:
             self.unknown_head(base, args, depth)
 
     def awk(self, args: list[str]) -> None:
+        args = _awk_normalize(args)
         unsafe, operand = _awk_scan(args)
         if unsafe:
             self.unpin("awk -l/--load or an unrecognised long option may load code or an extension")
@@ -2483,6 +2529,8 @@ class _Analyzer:
             self.non_durable(_INI_SEARCH_REASON)
         for reason in opts.unsafe:
             self.unpin(reason)
+        for reason in opts.risky:
+            self.non_durable(reason)
 
     def config_ref(self, value: str) -> None:
         """A config file (or a directory holding php.ini): pinned, but not a script run."""
@@ -2880,11 +2928,15 @@ class _Analyzer:
         )
 
     def bun_run_options_unsafe(self, rest: list[str]) -> bool:
-        """Unpin `bun run` options that change the config/cwd, or are unknown; True if unpinned."""
+        """Make `bun run` options that change the config/cwd, or are unknown, non-durable.
+
+        Nothing is pinned for such a command (the files it runs may not be the ones named); the
+        human approving once sees the raw command. True if the options were risky.
+        """
         if _split_runner(rest, _BUN_VALUE, _BUN_UNPIN)[2]:
-            self.unpin("bun option changes the config file or working directory")
+            self.non_durable("bun option after run changes the config file or working directory")
         elif _unknown_leading_flag(rest, _BUN_FLAGS, _BUN_VALUE):
-            self.unpin("unrecognised bun option after run")
+            self.non_durable("unrecognised bun option after run")
         else:
             return False
         return True

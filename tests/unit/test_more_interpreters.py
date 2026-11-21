@@ -60,6 +60,17 @@ def _assert_non_durable(command: str, tmp_path: Path, pinned: tuple[str, ...]) -
     assert cls.non_durable_reason is not None, command
 
 
+def _assert_approve_once_only(command: str, tmp_path: Path) -> None:
+    """Non-durable: not unpinnable (approve_once allowed), never covered by a reusable approval."""
+    plan = _plan(command, tmp_path)
+    assert plan.unpinnable is False, (command, plan.reasons)
+    assert plan.non_durable, command
+    cls = classify(command, str(tmp_path), AGENT)
+    assert cls.script_unpinnable is False, command
+    assert cls.non_promotable is True, command
+    assert cls.non_durable_reason is not None, command
+
+
 def _assert_unchanged(command: str, control: str, tmp_path: Path) -> None:
     plan = _plan(command, tmp_path)
     base = _plan(control, tmp_path)
@@ -704,20 +715,23 @@ def test_php_script_arguments_are_not_options(tmp_path: Path) -> None:
     _assert_pinned("php x.php --define=auto_prepend_file=./p.php", tmp_path, ("x.php",))
 
 
-# L4. luajit -j / -O load code
-LUAJIT_UNPINNABLE = [
+# L4. luajit -j / -O load code: approve-once only (non-durable), never unpinnable
+LUAJIT_NON_DURABLE = [
     "luajit -j off x.lua",
     "luajit -jdump x.lua",
     "luajit -O3 x.lua",
     "luajit -Ofoldl x.lua",
     "luajit -e 'print(1)' -j off x.lua",
+    "luajit -j dump -l ./m x.lua",
 ]
 
 
-@pytest.mark.parametrize("command", LUAJIT_UNPINNABLE)
-def test_luajit_jit_and_opt_flags_are_unpinnable(tmp_path: Path, command: str) -> None:
-    _make(tmp_path, ("x.lua",))
-    _assert_unpinnable(command, tmp_path)
+@pytest.mark.parametrize("command", LUAJIT_NON_DURABLE)
+def test_luajit_jit_and_opt_flags_are_non_durable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.lua", "m.lua"))
+    pinned = ("x.lua", "m.lua") if "-l" in command else ("x.lua",)
+    _assert_non_durable(command, tmp_path, pinned)
+    _assert_approve_once_only(command, tmp_path)
 
 
 def test_luajit_plain_script_stays_pinned(tmp_path: Path) -> None:
@@ -954,8 +968,8 @@ def test_bun_exec_is_unpinnable(tmp_path: Path, command: str) -> None:
     _assert_unpinnable(command, tmp_path)
 
 
-# L17. bun: options after `run` fail closed like the ones before it
-BUN_RUN_OPTIONS_UNPINNABLE = [
+# L17. bun: options after `run` that change config/cwd or are unknown: approve-once only
+BUN_RUN_OPTIONS_NON_DURABLE = [
     "bun run --cwd ./other x.ts",
     "bun run --config ./c.toml x.ts",
     "bun run --env-file ./e x.ts",
@@ -965,10 +979,20 @@ BUN_RUN_OPTIONS_UNPINNABLE = [
 ]
 
 
-@pytest.mark.parametrize("command", BUN_RUN_OPTIONS_UNPINNABLE)
-def test_bun_run_unknown_or_dir_changing_option_is_unpinnable(tmp_path: Path, command: str) -> None:
+@pytest.mark.parametrize("command", BUN_RUN_OPTIONS_NON_DURABLE)
+def test_bun_run_unknown_or_dir_changing_option_is_non_durable(
+    tmp_path: Path, command: str
+) -> None:
     _make(tmp_path, ("x.ts", "other/x.ts"))
-    _assert_unpinnable(command, tmp_path)
+    _assert_approve_once_only(command, tmp_path)
+    # nothing is pinned: --cwd may make the files it names the wrong ones
+    assert _plan(command, tmp_path).refs == []
+    assert _pin_paths(command, tmp_path) == {}
+
+
+def test_bun_option_before_subcommand_stays_unpinnable(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.ts",))
+    _assert_unpinnable("bun --cwd ./other run x.ts", tmp_path)
 
 
 def test_bun_run_known_flag_stays_pinned(tmp_path: Path) -> None:
@@ -1047,6 +1071,97 @@ def test_gawk_exec_file_is_pinned_and_followed(tmp_path: Path, command: str) -> 
 def test_gawk_exec_file_with_load_is_unpinnable(tmp_path: Path) -> None:
     _write(tmp_path, "x.awk", '@load "ext"\n')
     _assert_unpinnable("gawk -E x.awk", tmp_path)
+
+
+# L21. gawk -W opt[=val] is --opt[=val]: same checks, same abbreviation refusal
+GAWK_W_UNPINNABLE = [
+    "gawk -W load=./ext.so -f x.awk",
+    "gawk -Wload=./ext.so -f x.awk",
+    "gawk -W load ./ext.so -f x.awk",
+    "gawk -W loa=./ext.so -f x.awk",
+    "gawk -Wloa=./ext.so -f x.awk",
+    "gawk -W incl=lib.awk -f x.awk",
+    "gawk -W unknown -f x.awk",
+    "gawk -W",
+    "gawk -f x.awk -W load=./ext.so",
+    "gawk -W posix -W load=./ext.so -f x.awk",
+    "gawk -bW load=./ext.so -f x.awk",
+    "gawk -W exec=y.awk",  # y.awk loads an extension
+    "gawk -W source='@load \"ext\"'",
+    "gawk -W include=x -f x.awk",  # x.awk loads an extension
+]
+
+
+@pytest.mark.parametrize("command", GAWK_W_UNPINNABLE)
+def test_gawk_dash_w_bypass_forms_are_unpinnable(tmp_path: Path, command: str) -> None:
+    _write(tmp_path, "x.awk", '@load "ext"\n')
+    _write(tmp_path, "y.awk", '@load "ext"\n')
+    _make(tmp_path, ("lib.awk",))
+    _assert_unpinnable(command, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "pinned"),
+    [
+        ("gawk -W file=x.awk", ("x.awk", "lib.awk")),
+        ("gawk -Wfile=x.awk", ("x.awk", "lib.awk")),
+        ("gawk -W file x.awk", ("x.awk", "lib.awk")),
+        ("gawk -W exec=x.awk", ("x.awk", "lib.awk")),
+        ("gawk -W include=lib.awk -f z.awk", ("lib.awk", "z.awk")),
+        ("gawk -W source='@include \"lib.awk\"'", ("lib.awk",)),
+        ("gawk -W posix -f z.awk", ("z.awk",)),
+        ("gawk -Wposix -W lint -f z.awk", ("z.awk",)),
+    ],
+)
+def test_gawk_dash_w_acts_like_its_long_form(
+    tmp_path: Path, command: str, pinned: tuple[str, ...]
+) -> None:
+    _write(tmp_path, "x.awk", '@include "lib.awk"\n')
+    _make(tmp_path, ("lib.awk", "z.awk"))
+    _assert_pinned(command, tmp_path, pinned)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gawk -W version",
+        "gawk -W posix '{print}'",
+        "gawk -W posix '{print}' -W load=data.txt",  # after the program: a data file
+    ],
+)
+def test_gawk_harmless_dash_w_is_not_refused(tmp_path: Path, command: str) -> None:
+    plan = _plan(command, tmp_path)
+    assert plan.unpinnable is False, (command, plan.reasons)
+    assert plan.non_durable == []
+
+
+def test_gawk_dash_w_matches_long_form_refs(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.awk", "lib.awk"))
+    for short, long in [
+        ("gawk -W file=x.awk", "gawk --file=x.awk"),
+        ("gawk -W exec=x.awk", "gawk --exec=x.awk"),
+        ("gawk -W include=lib.awk -f x.awk", "gawk --include=lib.awk -f x.awk"),
+    ]:
+        assert _plan(short, tmp_path).refs == _plan(long, tmp_path).refs, short
+
+
+def test_gawk_include_value_is_not_taken_for_the_program_text(tmp_path: Path) -> None:
+    # `-i FILE` consumes FILE, so the inline program that follows is still scanned
+    _write(tmp_path, "inc.awk", "# inc\n")
+    _make(tmp_path, ("lib.awk",))
+    _assert_pinned("gawk -i lib.awk '@include \"inc.awk\"'", tmp_path, ("lib.awk", "inc.awk"))
+    _assert_pinned(
+        "gawk --include=lib.awk '@include \"inc.awk\"'", tmp_path, ("lib.awk", "inc.awk")
+    )
+
+
+def test_gawk_exec_value_is_consumed_even_if_it_looks_like_an_option(tmp_path: Path) -> None:
+    # `-E -l` names a program file called `-l` (getopt takes the next word as the value)
+    _make(tmp_path, ("-l",))
+    plan = _plan("gawk -E -l", tmp_path)
+    assert plan.unpinnable is False, plan.reasons
+    assert any(r.operand == "-l" for r in plan.refs)
+    _assert_unpinnable("gawk -E x.awk -l ./ext", tmp_path)
 
 
 def test_gawk_include_flag_value_is_not_a_program_file(tmp_path: Path) -> None:

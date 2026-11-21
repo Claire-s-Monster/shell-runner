@@ -463,12 +463,12 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   `deno eval` / `deno run -` heredocs (`--config`, `--import-map` pinned). Fail closed:
   `go run`, `go generate`, test runners (`deno test`/`bench`, `bun test`), `bun exec`, a
   `preload` key in the pinned `bunfig.toml`, `deno task` and other deno subcommands that run
-  code, remote deno specifiers, any flag before a deno/bun subcommand or script, and any
-  flag after `bun run`, outside a known-flag allowlist, `gawk -l`/`@load` and any gawk long
+  code, remote deno specifiers, any flag before a deno/bun subcommand or script,
+  `gawk -l`/`@load` and any gawk long
   option outside the exact known full spellings (abbreviations such as `--loa=` are
-  refused), `php -d extension=`/`zend_extension=`/`-z` and any php `--long` option other
+  refused; gawk/mawk `-W opt[=val]` is read as `--opt[=val]` and gets the same checks), `php -d extension=`/`zend_extension=`/`-z` and any php `--long` option other
   than `--version`/`--help`/`--info`/`--modules`/`--ini` (php keeps parsing options after
-  `-r CODE` / `-f FILE`, so trailing ones are checked too), `luajit -j`/`-O`, here-doc /
+  `-r CODE` / `-f FILE`, so trailing ones are checked too), here-doc /
   here-string scripts for `csh`/`tcsh`/`tclsh`/`wish`/`osascript`, `xargs` or a launcher
   (`watch`, `ssh`, ...) around `go` or an awk, inline lua/R/php code containing shell
   expansion, and R `source` / php `include`/`require`/`auto_prepend_file` operands that are
@@ -476,7 +476,10 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   that loads a native library (lua `package.loadlib`, R `dyn.load`/`library.dynam`, php
   `dl`), a lua `require` name containing `=`, and search-path changes in inline code (lua
   `package.path`/`cpath`, php `set_include_path`/`ini_set include_path`, R `.libPaths`,
-  `parse(file)`, `do.call(source)`). Non-durable: `LUA_*`, `R_PROFILE*`, `R_ENVIRON*`,
+  `parse(file)`, `do.call(source)`). Non-durable (approve-once only, never reusable): any
+  option after `bun run` that changes the config/working directory (`--cwd`, `--config`,
+  `--env-file`, `--tsconfig-override`) or is unknown (nothing is pinned for such a command),
+  `luajit -j`/`-O`, `LUA_*`, `R_PROFILE*`, `R_ENVIRON*`,
   `R_LIBS*` (also when set in a pinned `./.Renviron`), `PHPRC`, `PHP_INI_SCAN_DIR`,
   `php -d include_path`, `AWKPATH`, `AWKLIBPATH`, `BUN_OPTIONS`, `PERL5DB`, `TCLLIBPATH`,
   `TCL_LIBRARY`, `TK_LIBRARY`. Not covered: `go test` (pending a decision; currently not
