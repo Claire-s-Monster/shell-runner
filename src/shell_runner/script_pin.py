@@ -200,7 +200,7 @@ _BUN = _Interp(
     long_inline=frozenset({"--eval", "--print"}),
     preload_flags="r",
     long_preload_flags=frozenset({"--preload", "--require", "--import"}),
-    lang="node",
+    lang="bun",
     options_after_code=True,
     cli="bun",
     implicit_files=("bunfig.toml",),
@@ -417,6 +417,23 @@ def _option_values(spec: _Interp, args: list[str]) -> _Options:
 _INCLUDE_REASON = "-I puts a caller-chosen directory on the module search path"
 _INI_SEARCH_REASON = "-d include_path puts a caller-chosen directory on the include search path"
 _IMPLICIT_SCANS = {".Renviron": "env", "bunfig.toml": "bunfig"}
+_PHP_INI_NAMES = ("php-cli.ini", "php.ini")  # `-c DIR`: php-cli.ini wins over php.ini
+# an ini key that loads code (checked line by line, so no regex can backtrack on padding)
+_PHP_INI_KEY_RE = re.compile(
+    r"[ \t]*(?:auto_prepend_file|auto_append_file|zend_extension|extension)[ \t]*=([^\n]*)", re.I
+)
+
+
+def _php_ini_loads_code(text: str) -> bool:
+    """Whether php ini `text` sets auto_prepend_file/auto_append_file/an extension to a value."""
+    for line in text.splitlines():
+        m = _PHP_INI_KEY_RE.fullmatch(line)
+        value = m[1].strip() if m is not None else ""
+        if value and value[0] not in ";#" and value.strip("\"'") != "":
+            return True  # (anything but an empty value or a bare comment fails closed)
+    return False
+
+
 _BUNFIG_PRELOAD_RE = re.compile(r"\bpreload\b", re.I)
 _UNKNOWN_BASE_IMPORT = "inline code imports a module, but the cd/pushd target is not known"
 
@@ -428,12 +445,24 @@ def _node_modules_reason(kind: str, value: str) -> str:
 _PATH_PREFIXES = ("./", "../", "/")
 # (suffixes tried after the path as given, index file tried inside a directory)
 _NODE_RESOLVE = ((".js", ".json", ".mjs", ".cjs"), ("index.js", "index.json"))
+_BUN_RESOLVE = (
+    (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".json"),
+    tuple(f"index{s}" for s in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json")),
+)
 _RESOLVE = {
     "node": _NODE_RESOLVE,
     "deno": _NODE_RESOLVE,
+    "bun": _BUN_RESOLVE,
     "ruby": ((".rb",), ()),
     "lua": ((".lua",), ("init.lua",)),
+    "luamod": ((".lua",), ("init.lua",)),
 }
+# inline-import resolution kind per JS-family interpreter (deno keeps node's rules)
+_NODE_KIND = {"node": "node", "deno": "node", "bun": "bun"}
+# module-search resolution never tries the name as given (lua `require` / `-l`)
+_MODULE_ONLY = frozenset({"luamod"})
+# bun's own candidate order is not modelled: every existing candidate is pinned
+_PIN_ALL_CANDIDATES = frozenset({"bun"})
 _OPTION_PATH_PREFIXES = (*_PATH_PREFIXES, "~/")
 _JS_BLOCK_OR_LINE_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
 _RUBY_KEYWORD_RE = re.compile(r"(?<![\w.:@$])(?:require_relative|require|load)\b")
@@ -608,9 +637,13 @@ def _call_literals(code: str, call_re: re.Pattern[str]) -> tuple[list[tuple[str,
     return found, dynamic
 
 
+class _LuaModule(str):
+    """A lua module stem: searched as ./STEM.lua and ./STEM/init.lua, not as given."""
+
+
 def _lua_module_path(name: str) -> str:
     """File stem `require name` / `lua -l name` searches ('a.b' is a/b)."""
-    return name if "/" in name else name.replace(".", "/")
+    return _LuaModule(name if "/" in name else name.replace(".", "/"))
 
 
 # inline code that changes where modules are searched, or loads a file/library indirectly:
@@ -2310,6 +2343,8 @@ class _Analyzer:
         sub, rest, _ = _split_runner(args, frozenset({"-C"}), frozenset())
         if sub == "run" and rest:
             self.unpin("go run compiles and runs code that cannot be pinned")
+        elif sub == "test":
+            self.unpin("go test compiles and runs test code that cannot be pinned")
         elif sub == "generate":
             self.unpin("go generate runs commands named in source files")
 
@@ -2495,7 +2530,8 @@ class _Analyzer:
     def resolve_candidates(self, operand: str, lang: str) -> list[str]:
         """Files node/ruby would try for `operand` (as given, suffixed, index), in order."""
         suffixes, indexes = _RESOLVE.get(lang, ((), ()))
-        return [operand, *(operand + s for s in suffixes)] + [
+        head = [] if lang in _MODULE_ONLY else [operand]
+        return [*head, *(operand + s for s in suffixes)] + [
             posixpath.join(operand, i) for i in indexes
         ]
 
@@ -2513,8 +2549,17 @@ class _Analyzer:
                 # `-l g=mod` requires mod into the global g
                 self.pin_inline_paths([_lua_module_path(value.rpartition("=")[2])], "lua")
             elif value.startswith(_OPTION_PATH_PREFIXES):
-                self.add_file(self.resolve_local(value, spec.lang) or value)
-            elif spec.lang == "node" and not _is_node_builtin(value):
+                if spec.lang in _PIN_ALL_CANDIDATES:
+                    found = [
+                        c
+                        for c in self.resolve_candidates(value, spec.lang)
+                        if self.local_file_exists(c)
+                    ]
+                    for f in found or [value]:
+                        self.add_file(f)
+                else:
+                    self.add_file(self.resolve_local(value, spec.lang) or value)
+            elif spec.lang in ("node", "bun") and not _is_node_builtin(value):
                 self.non_durable(_node_modules_reason("preload", value))
         for value in opts.files:  # php -d auto_prepend_file= / auto_append_file=
             if _SCHEME_RE.match(value):
@@ -2536,10 +2581,31 @@ class _Analyzer:
         """A config file (or a directory holding php.ini): pinned, but not a script run."""
         if not _literal(value):
             self.unpin(f"config path {value!r} is not a literal path")
-        elif value.endswith(".ini"):
+            return
+        probe = ScriptRef(value, tuple(self.bases))
+        if any(os.path.isfile(p) for p in _ref_paths(probe, self.cwd)):
+            self.add_file(value, script=False)  # a file of any name
+        elif any(os.path.isdir(p) for p in _ref_paths(probe, self.cwd)):
+            self._ref(value, "search", _PHP_INI_NAMES)
+        else:  # absent: pinned as MISSING, as a file and as a directory
             self.add_file(value, script=False)
-        else:
-            self._ref(value, "search", ("php.ini",))
+            self._ref(value, "search", _PHP_INI_NAMES)
+        self.scan_php_ini(value)
+
+    def scan_php_ini(self, value: str) -> None:
+        """Refuse a php -c config that loads code (auto_prepend/append_file, extensions)."""
+        probe = ScriptRef(value, tuple(self.bases))
+        search = ScriptRef(value, tuple(self.bases), "search", _PHP_INI_NAMES)
+        for real in dict.fromkeys([*_ref_paths(probe, self.cwd), *_ref_paths(search, self.cwd)]):
+            if not os.path.isfile(real):
+                continue
+            data = _read_capped(real)
+            if data is None:
+                self.unpin(f"php config {value!r} is too large to scan for loader settings")
+                return
+            if _php_ini_loads_code(data.decode("utf-8", "replace")):
+                self.unpin(f"php config {value!r} loads code (auto_prepend_file, extension, ...)")
+                return
 
     def implicit_refs(self, spec: _Interp, opts: _Options) -> None:
         """Pin cwd files the interpreter loads on its own (Rscript .Rprofile, bun bunfig.toml)."""
@@ -2581,8 +2647,10 @@ class _Analyzer:
         """
         if lang == "python":
             self.inline_python(code, expanded=expanded)
-        elif lang in ("node", "deno"):
-            self.inline_node(code, expanded=expanded, remote_unpinnable=lang == "deno")
+        elif lang in ("node", "deno", "bun"):
+            self.inline_node(
+                code, expanded=expanded, remote_unpinnable=lang == "deno", lang=_NODE_KIND[lang]
+            )
         elif lang == "ruby":
             if _ruby_dynamic(code, expanded=expanded):
                 self.unpin("inline ruby code requires a file that cannot be resolved statically")
@@ -2611,10 +2679,11 @@ class _Analyzer:
             self.unpin(_UNKNOWN_BASE_IMPORT)
             return
         files: list[str] = []
-        for o in dict.fromkeys(operands):
-            for cand in self.resolve_candidates(o, lang):
+        for is_module, o in dict.fromkeys((isinstance(o, _LuaModule), str(o)) for o in operands):
+            kind = "luamod" if is_module else lang
+            for cand in self.resolve_candidates(o, kind):
                 files.append(cand)
-                if self.local_file_exists(cand):
+                if kind not in _PIN_ALL_CANDIDATES and self.local_file_exists(cand):
                     break  # later candidates only matter if this one goes away
         self.pin_inline(files)
 
@@ -2627,7 +2696,9 @@ class _Analyzer:
         elif names:
             self.pin_inline(_python_import_files(names))
 
-    def inline_node(self, code: str, *, expanded: bool, remote_unpinnable: bool = False) -> None:
+    def inline_node(
+        self, code: str, *, expanded: bool, remote_unpinnable: bool = False, lang: str = "node"
+    ) -> None:
         specs, dynamic = _node_specifiers(code, expanded=expanded)
         if dynamic:
             self.unpin("inline node code requires a module that cannot be resolved statically")
@@ -2639,7 +2710,7 @@ class _Analyzer:
         for spec in dict.fromkeys(specs):
             if not spec.startswith(_PATH_PREFIXES) and not _is_node_builtin(spec):
                 self.non_durable(_node_modules_reason("require", spec))
-        self.pin_inline_paths(local, "node")
+        self.pin_inline_paths(local, lang)
 
     def module(self, name: str) -> None:
         if not re.fullmatch(r"[A-Za-z_][\w.]*", name):
@@ -2977,6 +3048,9 @@ class _Analyzer:
             self.implicit_refs(_BUN, _Options())
             self.node_pm("bun", args if sub == "run" else [*args[:pos], "run", *args[pos:]], depth)
             return None
+        if sub == "run" and target is not None:
+            # a package script named like the file may take precedence over it
+            self.manifest([], ("package.json",))
         return [*args[:pos], *rest] if sub == "run" else args
 
 
