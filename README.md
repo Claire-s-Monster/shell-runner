@@ -444,11 +444,54 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   argument that is not one plain literal; and any `xargs` whose command is a runner (make, pixi, uv, npm, yarn, pnpm), an interpreter or a
   wrapper (`nice`, `env`, `timeout`, ...) around one. `xargs env VAR=... cmd` is still
   checked for loader variables. Not detected: `importlib` / `__import__`, namespace
-  packages, `.so` / `.pyc` modules, `package.json` `"main"` resolution, and interpreters
-  not yet recognised (#98 item 3). Also not covered (#116): here-strings, `echo ... |
-  python`, perl/php `-e` code, and `python -c "$CODE"` without a literal `import`.
-  Best-effort static analysis (`ast` for python,
-  patterns for node/ruby).
+  packages, `.so` / `.pyc` modules, `package.json` `"main"` resolution. Also not covered
+  (#116): here-strings, `echo ... | python`, perl/php `-e` code, and `python -c "$CODE"`
+  without a literal `import`. Best-effort static analysis (`ast` for python, patterns for
+  node/ruby).
+- **More interpreters (#98).** Pinned like the ones above, including `/path/to/` heads:
+  `pypy*`, versioned `perl5.x`/`ruby3.x`/`php8.x`/`lua5.x`, `gawk`/`mawk`/`nawk`, `csh`/`tcsh`
+  (script file only; any `-c` body is unpinnable), `tclsh`/`wish`/`osascript` (file operand;
+  any option is unpinnable), `lua`/`luajit` (`-e` literal `require`/`dofile`/`loadfile`,
+  `-l mod`; a module is searched as `mod.lua` and `mod/init.lua`, never as the bare name),
+  `Rscript` (`-e` literal `source`/`sys.source`; `./.Rprofile` unless `--vanilla`/
+  `--no-init-file`, `./.Renviron` unless `--vanilla`/`--no-environ`), `php` (`-r` literal
+  `require`/`include`, `-d auto_prepend_file=`/`auto_append_file=` with spaces/quotes
+  normalised, `-c FILE` of any name or `-c DIR` pinning `php-cli.ini` before `php.ini`; a
+  config that sets `auto_prepend_file`/`auto_append_file`/`extension`/`zend_extension` to a
+  value is unpinnable), `gawk -i`/`--include` and `@include "file"` (followed recursively in
+  `-f`/`-E`/`--exec` files and `-e`/`--source` text, cycle-safe, depth 16, whole files only;
+  one traversal budget per command across all awk calls: 32 files, 64 MiB, 256 include names,
+  over it the command is unpinnable), `bun` (file, `bun run FILE`, `-e`, `--preload`,
+  `./bunfig.toml` on every path; `bun run NAME` and `bun run FILE` pin `package.json`; local
+  imports and preloads pin every TypeScript/JavaScript/JSON candidate bun may resolve),
+  `deno run FILE` /
+  `deno eval` / `deno run -` heredocs (`--config`, `--import-map` pinned). Fail closed:
+  `go run`, `go test`, `go generate`, test runners (`deno test`/`bench`, `bun test`), `bun exec`, a
+  `preload` key in the pinned `bunfig.toml`, `deno task` and other deno subcommands that run
+  code, remote deno specifiers, any flag before a deno/bun subcommand or script,
+  `gawk -l`/`@load` and any gawk long
+  option outside the exact known full spellings (abbreviations such as `--loa=` are
+  refused; gawk/mawk `-W opt[=val]` is read as `--opt[=val]` and gets the same checks), `php -d extension=`/`zend_extension=`/`-z` and any php `--long` option other
+  than `--version`/`--help`/`--info`/`--modules`/`--ini` (php keeps parsing options after
+  `-r CODE` / `-f FILE`, so trailing ones are checked too), here-doc /
+  here-string scripts for `csh`/`tcsh`/`tclsh`/`wish`/`osascript`, `xargs` or a launcher
+  (`watch`, `ssh`, ...) around `go` or an awk, inline lua/R/php code containing shell
+  expansion, and R `source` / php `include`/`require`/`auto_prepend_file` operands that are
+  URLs or stream wrappers (`http:`, `phar:`, `data:`, `php:`, `file:`, ...), and inline code
+  that loads a native library (lua `package.loadlib`, R `dyn.load`/`library.dynam`, php
+  `dl`), a lua `require` name containing `=`, and search-path changes in inline code (lua
+  `package.path`/`cpath`, php `set_include_path`/`ini_set include_path`, R `.libPaths`,
+  `parse(file)`, `do.call(source)`). Non-durable (approve-once only, never reusable): any
+  option after `bun run` that changes the config/working directory (`--cwd`, `--config`,
+  `--env-file`, `--tsconfig-override`) or is unknown (nothing is pinned for such a command),
+  `luajit -j`/`-O`, `LUA_*`, `R_PROFILE*`, `R_ENVIRON*`,
+  `R_LIBS*` (also when set in a pinned `./.Renviron`), `PHPRC`, `PHP_INI_SCAN_DIR`,
+  `php -d include_path`, `AWKPATH`, `AWKLIBPATH`, `BUN_OPTIONS`, `PERL5DB`, `TCLLIBPATH`,
+  `TCL_LIBRARY`, `TK_LIBRARY`. Not covered: `go vet -vettool`, `go tool`,
+  `go build -toolexec` and `go test -exec` (the latter is refused as `go test`; the others
+  keep their previous outcome), `npx`/`bunx <pkg>` package code, `$HOME` startup files (`~/.cshrc`,
+  `~/.Rprofile`), and dynamic loading the literal scans cannot see; deep config modelling
+  (`bunfig.toml`, `.Renviron`, php.ini contents beyond the checks above) is tracked in #127.
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 
