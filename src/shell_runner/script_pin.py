@@ -25,12 +25,14 @@ file afterwards; a swap in that window is not detected.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
 import posixpath
 import re
 import stat
+import warnings
 from dataclasses import dataclass, field
 
 from .executor import trusted_bin_dirs
@@ -45,7 +47,8 @@ MAX_SCRIPT_BYTES = 64 << 20  # larger files are treated as unreadable (bounded h
 _MAX_DEPTH = 3  # nested `-c` bodies
 _MAX_WRAP = 12
 MAX_TOTAL_BYTES = 64 << 20  # total bytes hashed per command
-MAX_FILES = 32  # files hashed per command; over budget the command is unpinnable
+MAX_FILES = 32  # existing files hashed per command; over budget the command is unpinnable
+MAX_MISSING_FILES = 256  # absent candidates pinned as MISSING per command (bounds stat work)
 _UNRESOLVABLE_CHARS = "$`*?[{\n\0"
 _OVER_BUDGET = "over_budget"
 _MAKEFILES = ("GNUmakefile", "makefile", "Makefile")
@@ -70,6 +73,14 @@ class _Interp:
     long_value: frozenset[str] = frozenset()
     long_inline: frozenset[str] = frozenset()
     shell: bool = False
+    preload_flags: str = ""  # short flags whose value is a file loaded before the script
+    long_preload_flags: frozenset[str] = frozenset()
+    include_flags: str = ""  # short flags whose value is a module search directory
+    lang: str = ""  # inline code (-c/-e) is scanned for local imports: python | node | ruby
+    chdir_flags: str = ""  # short flags whose value is the directory the script runs in
+    pragma_flags: str = ""  # short flags whose attached value is `use` code (perl -M/-m)
+    # options are parsed after the -e code (node, perl, ruby); python's -c ends option parsing
+    options_after_code: bool = False
 
 
 _SHELL = _Interp(
@@ -81,7 +92,11 @@ _SHELL = _Interp(
     shell=True,
 )
 _PYTHON = _Interp(
-    value="WX", inline="c", module="m", long_value=frozenset({"--check-hash-based-pycs"})
+    value="WX",
+    inline="c",
+    module="m",
+    long_value=frozenset({"--check-hash-based-pycs"}),
+    lang="python",
 )
 _NODE = _Interp(
     value="r",
@@ -90,9 +105,29 @@ _NODE = _Interp(
         {"--require", "--import", "--loader", "--experimental-loader", "--input-type"}
     ),
     long_inline=frozenset({"--eval", "--print"}),
+    preload_flags="r",
+    long_preload_flags=frozenset({"--require", "--import", "--loader", "--experimental-loader"}),
+    lang="node",
+    options_after_code=True,
 )
-_PERL = _Interp(value="I", attached="MmixCFdDV", inline="eE")
-_RUBY = _Interp(value="rICE", attached="ixKTWF", inline="e")
+_PERL = _Interp(
+    value="I",
+    attached="MmixCFdDV",
+    inline="eE",
+    include_flags="I",
+    pragma_flags="Mm",
+    options_after_code=True,
+)
+_RUBY = _Interp(
+    value="rICEX",
+    attached="ixKTWF",
+    inline="e",
+    preload_flags="r",
+    include_flags="I",
+    chdir_flags="CX",
+    lang="ruby",
+    options_after_code=True,
+)
 _PHP = _Interp(value="dczSt", inline="rBRE", noexec="lvimh", file_flags="fF")
 _FISH = _Interp(value="dDoC", inline="c", noexec="n")
 _FAMILIES = {
@@ -174,6 +209,286 @@ def _scan_options(spec: _Interp, args: list[str]) -> tuple[str, str | None]:
     if inline or module or noexec:
         return "none", None
     return ("stdin!", None) if stdin else ("stdin", None)
+
+
+@dataclass
+class _Options:
+    """What the interpreter options name: preload files, include dirs, chdir targets."""
+
+    preload: list[str] = field(default_factory=list)
+    include: list[str] = field(default_factory=list)
+    chdir: list[str] = field(default_factory=list)
+
+
+_LIB_PRAGMA_RE = re.compile(r"lib(?:=|\s)")
+
+
+def _short_option_values(spec: _Interp, args: list[str], i: int, out: _Options) -> int:
+    """Collect the values of the flags of interest in the short cluster `args[i]`; words used."""
+    a = args[i]
+    for pos, ch in enumerate(a[1:]):
+        rest = a[pos + 2 :]
+        if ch in spec.preload_flags or ch in spec.include_flags or ch in spec.chdir_flags:
+            value = rest or (args[i + 1] if i + 1 < len(args) else "")
+            if value:
+                if ch in spec.preload_flags:
+                    out.preload.append(value)
+                elif ch in spec.chdir_flags:
+                    out.chdir.append(value)
+                else:
+                    out.include.append(value)
+            return 1 if rest else 2
+        if ch in spec.pragma_flags and _LIB_PRAGMA_RE.match(rest):
+            out.include.append(rest)  # perl -Mlib=DIR adds an include directory
+            return 1
+        if ch in spec.inline and spec.options_after_code:
+            # no attached text: the code is the next word; `-eCODE`: the rest of the cluster
+            # is code, never more options
+            return 1 if rest else 2
+        if ch in spec.attached:
+            return 1
+        if ch in spec.value:
+            return 1 if rest else 2
+    return 1
+
+
+def _option_values(spec: _Interp, args: list[str]) -> _Options:
+    """Preload files, include dirs and chdir targets named by the options before the operand."""
+    out = _Options()
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if not a.startswith("-") or a in ("-", "--"):
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in spec.long_preload_flags:
+                value = val if eq else (args[i + 1] if i + 1 < len(args) else "")
+                if value:
+                    out.preload.append(value)
+            takes_value = name in spec.long_value or (
+                name in spec.long_inline and spec.options_after_code
+            )
+            i += 2 if takes_value and not eq else 1
+        else:
+            i += _short_option_values(spec, args, i, out)
+    return out
+
+
+_INCLUDE_REASON = "-I puts a caller-chosen directory on the module search path"
+_UNKNOWN_BASE_IMPORT = "inline code imports a module, but the cd/pushd target is not known"
+
+
+def _node_modules_reason(kind: str, value: str) -> str:
+    return f"node {kind} {value!r} resolves through node_modules"
+
+
+_PATH_PREFIXES = ("./", "../", "/")
+# (suffixes tried after the path as given, index file tried inside a directory)
+_RESOLVE = {
+    "node": ((".js", ".json", ".mjs", ".cjs"), ("index.js", "index.json")),
+    "ruby": ((".rb",), ()),
+}
+_OPTION_PATH_PREFIXES = (*_PATH_PREFIXES, "~/")
+_JS_BLOCK_OR_LINE_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+_RUBY_KEYWORD_RE = re.compile(r"(?<![\w.:@$])(?:require_relative|require|load)\b")
+_NODE_CALL_RE = re.compile(r"\b(?:require|import)\s*\(\s*")  # require( / import(
+_NODE_LITERAL_RE = re.compile(r"""(['"])([^'"\\\n]*)\1\s*[,)]""")  # the whole call argument
+_NODE_STATIC_RE = re.compile(r"""\b(?:from|import)\s*(['"])([^'"\\\n]*)\1""")
+_RUBY_REQ_RE = re.compile(
+    r"""(?<![\w.:@$])(require_relative|require|load)\b\s*(?:\(\s*)?(['"])([^'"\n]+)\2"""
+)
+_PY_IMPORT_RE = re.compile(r"\bimport\b")
+_EXPORT_RE = re.compile(r"^export\s+")
+_ENV_FILE_MAX = 8 << 20
+_NODE_BUILTINS = frozenset(
+    {"assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants"}
+    | {"crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "http"}
+    | {"http2", "https", "inspector", "module", "net", "os", "path", "perf_hooks", "process"}
+    | {"punycode", "querystring", "readline", "repl", "stream", "string_decoder", "sys"}
+    | {"timers", "tls", "trace_events", "tty", "url", "util", "v8", "vm", "wasi"}
+    | {"worker_threads", "zlib", "assert/strict", "dns/promises", "fs/promises"}
+    | {"inspector/promises", "path/posix", "path/win32", "readline/promises", "stream/consumers"}
+    | {"stream/promises", "stream/web", "timers/promises", "util/types"}
+)
+
+
+def _python_imports(code: str) -> set[str] | None:
+    """Dotted names a level-0 `import` in `code` could load (ast, no exec); None if unparseable."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{a.name}" for a in node.names if a.name != "*")
+    return names
+
+
+def _python_import_files(names: set[str]) -> list[str]:
+    """Relative files the imports `names` could load from the cwd."""
+    files: list[str] = []
+    for name in sorted(names):
+        parts = name.split(".")
+        for k in range(1, len(parts) + 1):
+            stem = "/".join(parts[:k])
+            files += [f"{stem}.py", f"{stem}/__init__.py"]
+    return list(dict.fromkeys(files))
+
+
+def _node_specifiers(code: str, *, expanded: bool = True) -> tuple[list[str], bool]:
+    """(string-literal module specifiers in `code`, whether one is not statically knowable).
+
+    A `require(` / `import(` argument that is not a single plain string literal, or a literal
+    containing `$` when the shell expands the code word (`expanded`), makes the code dynamic.
+    """
+    specs: list[str] = []
+    dynamic = False
+    for view in _js_views(code):
+        for m in _NODE_CALL_RE.finditer(view):
+            lit = _NODE_LITERAL_RE.match(view, m.end())
+            if lit is None:
+                dynamic = True
+            else:
+                specs.append(lit[2])
+        specs += [m[2] for m in _NODE_STATIC_RE.finditer(view)]
+    return specs, dynamic or (expanded and any("$" in s for s in specs))
+
+
+def _strip_js_comments_quoted(code: str) -> str:
+    """`code` with comments replaced by a space, honouring '...', "..." and `...` literals."""
+    out: list[str] = []
+    i, n = 0, len(code)
+    quote = ""
+    while i < n:
+        ch = code[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(code[i + 1])
+                i += 1
+            elif ch == quote or (ch == "\n" and quote != "`"):
+                quote = ""
+        elif ch in "'\"`":
+            quote = ch
+            out.append(ch)
+        elif code.startswith("//", i):
+            end = code.find("\n", i)
+            i = n if end < 0 else end - 1
+            out.append(" ")
+        elif code.startswith("/*", i):
+            end = code.find("*/", i + 2)
+            i = n if end < 0 else end + 1
+            out.append(" ")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _js_views(code: str) -> list[str]:
+    """Texts to scan for module specifiers: raw, and with comments removed.
+
+    A `/*` or quote inside a regex literal can fool any comment stripper, so the code is
+    scanned as written, comment-stripped string-aware, and comment-stripped string-blind;
+    a specifier found in any view counts (fail closed).
+    """
+    return [
+        code,
+        _strip_js_comments_quoted(code),
+        _JS_BLOCK_OR_LINE_COMMENT_RE.sub(" ", code),
+    ]
+
+
+def _is_node_builtin(spec: str) -> bool:
+    return spec.startswith("node:") or spec in _NODE_BUILTINS
+
+
+def _ruby_requires(code: str) -> list[str]:
+    """Operands of `require_relative` / `load` / `require './x'` (could load a local file)."""
+    return [
+        m[3]
+        for m in _RUBY_REQ_RE.finditer(code)
+        if m[1] != "require" or m[3].startswith(_PATH_PREFIXES)
+    ]
+
+
+def _ruby_dynamic(code: str, *, expanded: bool) -> bool:
+    """Whether a require/load/require_relative in `code` has an operand not known statically.
+
+    Anything but a plain string literal (variable, interpolation, shell-expanded `$`) counts.
+    """
+    literal_at = {m.start(): m for m in _RUBY_REQ_RE.finditer(code)}
+    for kw in _RUBY_KEYWORD_RE.finditer(code):
+        m = literal_at.get(kw.start())
+        if m is None or (m[2] == '"' and "#{" in m[3]) or (expanded and "$" in m[3]):
+            return True
+    return False
+
+
+def _heredoc_bodies(text: str) -> list[str]:
+    """The bodies of the `<<WORD` heredocs in the command text (here-strings excluded)."""
+    lines = text.split("\n")
+    bodies: list[str] = []
+    i = 0
+    while i < len(lines):
+        openers = _HEREDOC_OPEN_RE.findall(lines[i])
+        i += 1
+        for quoted_s, quoted_d, bare in openers:
+            delim = quoted_s or quoted_d or bare
+            body: list[str] = []
+            while i < len(lines) and lines[i].strip() != delim:
+                body.append(lines[i])
+                i += 1
+            i += 1
+            bodies.append("\n".join(body))
+    return bodies
+
+
+_HEREDOC_OPEN_RE = re.compile(r"""<<(?!<)-?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\?([\w.-]+))""")
+
+
+def _dotenv_assignment(line: str) -> str | None:
+    """`NAME=value` (quotes and a leading `export` removed) for a dotenv line, else None."""
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+    key, eq, value = _EXPORT_RE.sub("", s, count=1).partition("=")
+    if not eq:
+        return key.strip()
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return f"{key.strip()}={value}"
+
+
+def _env_file_reasons(path: str, cwd: str) -> list[str] | None:
+    """Why each loader variable in the dotenv file `path` makes a command non-durable.
+
+    None when the file is too large to scan completely (it is never scanned in part).
+    """
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(_ENV_FILE_MAX + 1)
+    except OSError:
+        return []
+    if len(data) > _ENV_FILE_MAX:
+        return None
+    reasons: list[str] = []
+    for line in data.decode("utf-8", "replace").splitlines():
+        assignment = _dotenv_assignment(line)
+        reason = loader_env_reason(assignment, cwd) if assignment else None
+        if reason:
+            reasons.append(reason)
+    return reasons
 
 
 # --- wrapper commands ------------------------------------------------------------
@@ -559,6 +874,228 @@ def _cooked_words(text: str) -> list[str]:
     return words
 
 
+@dataclass
+class _RawWord:
+    """One shell word of the raw command text, with what its quoting means."""
+
+    shlex: str = ""  # unquoted like shlex (the form the tokenizer hands to the analysis)
+    bash: str = ""  # unquoted like bash (`\$` in double quotes is `$`)
+    expands: bool = False  # an unquoted / double-quoted, unescaped `$` or backtick
+    subst: bool = False  # ... that is a command substitution (`$(` or backtick)
+    ansi: bool = False  # contains `$'...'` (escapes decoded by the shell)
+    quoted: bool = False  # any quoting or backslash (a quoted heredoc delimiter)
+
+
+@dataclass
+class _Heredoc:
+    delimiter: str
+    strip_tabs: bool
+    quoted: bool
+    body: str = ""
+
+
+@dataclass
+class _ShellScan:
+    words: list[_RawWord] = field(default_factory=list)
+    heredocs: list[_Heredoc] = field(default_factory=list)
+    ok: bool = True  # False: quoting could not be followed (callers scan naively)
+
+
+_WORD_END = frozenset(" \t\r\f\v;&|()<>")
+
+
+class _ShellScanner:
+    """Quote-aware scan of command text: words (single / double quotes, backslashes,
+    `$'..'`, `$".."`) and heredocs (a quoted delimiter makes the body literal)."""
+
+    def __init__(self, text: str) -> None:
+        self.t = text
+        self.i = 0
+        self.scan = _ShellScan()
+        self.cur: _RawWord | None = None
+        self.expect: bool | None = None  # after `<<` / `<<-`: the next word is the delimiter
+        self.strip = False
+        self.pending: list[_Heredoc] = []
+
+    def run(self) -> _ShellScan:
+        n = len(self.t)
+        while self.i < n and self.scan.ok:
+            c = self.t[self.i]
+            if c == "\n":
+                self.end_word()
+                self.i += 1
+                self.read_bodies()
+            elif c == "<":
+                self.redirect()
+            elif c in _WORD_END:
+                self.end_word()
+                self.i += 1
+            elif c == "#" and self.cur is None:
+                end = self.t.find("\n", self.i)
+                self.i = n if end < 0 else end
+            else:
+                self.word_char(c)
+        self.end_word()
+        return self.scan
+
+    def redirect(self) -> None:
+        self.end_word()
+        if self.t.startswith("<<<", self.i):
+            self.i += 3
+        elif self.t.startswith("<<", self.i):
+            if "((" in self.t[: self.i] or "$[" in self.t[: self.i]:
+                self.scan.ok = False  # `<<` may be an arithmetic shift: stay strict
+                return
+            self.strip = self.t.startswith("<<-", self.i)
+            self.i += 3 if self.strip else 2
+            self.expect = True
+        else:
+            self.i += 1
+
+    def end_word(self) -> None:
+        word, self.cur = self.cur, None
+        if word is None:
+            return
+        self.scan.words.append(word)
+        if self.expect:
+            self.expect = None
+            doc = _Heredoc(word.bash, self.strip, word.quoted)
+            self.scan.heredocs.append(doc)
+            self.pending.append(doc)
+
+    def read_bodies(self) -> None:
+        lines = self.t[self.i :].split("\n")
+        used = 0
+        for doc in self.pending:
+            body: list[str] = []
+            while used < len(lines):
+                line = lines[used]
+                used += 1
+                if (line.lstrip("\t") if doc.strip_tabs else line) == doc.delimiter:
+                    break
+                body.append(line)
+            doc.body = "\n".join(body)
+        self.pending = []
+        self.i = min(len(self.t), self.i + sum(len(x) + 1 for x in lines[:used]))
+
+    def word(self) -> _RawWord:
+        if self.cur is None:
+            self.cur = _RawWord()
+        return self.cur
+
+    def add(self, bash: str, shlex: str | None = None) -> None:
+        w = self.word()
+        w.bash += bash
+        w.shlex += bash if shlex is None else shlex
+
+    def mark(self, *, subst: bool) -> None:
+        w = self.word()
+        w.expands = True
+        w.subst = w.subst or subst
+
+    def word_char(self, c: str) -> None:
+        if c == "\\":
+            self.backslash()
+        elif c == "'":
+            self.single()
+        elif c == '"':
+            self.double()
+        elif c == "$":
+            self.dollar()
+        else:
+            if c == "`":
+                self.mark(subst=True)
+            self.add(c)
+            self.i += 1
+
+    def backslash(self) -> None:
+        nxt = self.t[self.i + 1 : self.i + 2]
+        self.i += 2
+        if nxt == "\n":  # line continuation
+            return
+        self.word().quoted = True
+        self.add(nxt or "\\")
+
+    def single(self) -> None:
+        end = self.t.find("'", self.i + 1)
+        if end < 0:
+            self.scan.ok = False
+            return
+        self.word().quoted = True
+        self.add(self.t[self.i + 1 : end])
+        self.i = end + 1
+
+    def double(self) -> None:
+        self.word().quoted = True
+        self.i += 1
+        n = len(self.t)
+        while self.i < n:
+            c = self.t[self.i]
+            if c == '"':
+                self.i += 1
+                return
+            if c == "\\" and self.i + 1 < n:
+                self.dq_escape(self.t[self.i + 1])
+                self.i += 2
+                continue
+            after = self.after_dollar() if c == "$" else ""
+            if c == "`" or after in ("(", "{"):
+                self.scan.ok = False  # nested quoting inside the expansion: stay strict
+                return
+            if after and after in _DQ_EXPANDING_AFTER_DOLLAR:
+                self.mark(subst=False)  # any other `$` is literal inside double quotes
+            self.add(c)
+            self.i += 1
+        self.scan.ok = False
+
+    def after_dollar(self) -> str:
+        """First char after the `$` at `self.i`, past any `\\<newline>` continuations ("" at end)."""
+        j = self.i + 1
+        while self.t[j : j + 2] == "\\\n":
+            j += 2
+        return self.t[j : j + 1]
+
+    def dq_escape(self, nxt: str) -> None:
+        if nxt in '$`"\\':
+            self.add(nxt, nxt if nxt in '"\\' else "\\" + nxt)
+        elif nxt == "\n":  # line continuation: joined, as in bash and shellprep
+            self.add("")
+        else:
+            self.add("\\" + nxt)
+
+    def dollar(self) -> None:
+        nxt = self.t[self.i + 1 : self.i + 2]
+        if nxt == "'":  # ANSI-C quoting: escapes decoded by the shell
+            end = self.i + 2
+            while end < len(self.t) and self.t[end] != "'":
+                end += 2 if self.t[end] == "\\" else 1
+            w = self.word()
+            w.ansi = w.quoted = True
+            if end >= len(self.t):
+                self.scan.ok = False
+            self.add(self.t[self.i + 2 : end])
+            self.i = end + 1
+        elif nxt == '"':  # locale translation: a double-quoted string
+            self.i += 1
+            self.double()
+        else:
+            self.mark(subst=nxt == "(")
+            self.add("$")
+            self.i += 1
+
+
+# Characters after which a `$` inside double quotes expands: name start, digits, special
+# parameters (`@ * # ? - $ ! 0`) and legacy arithmetic `$[`. `(` and `{` bail out earlier.
+# End of input is excluded separately: a bare trailing `$` is literal.
+_DQ_EXPANDING_AFTER_DOLLAR = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789@*#?-$!["
+)
+
+
+def _scan_shell(text: str) -> _ShellScan:
+    return _ShellScanner(text).run()
+
+
 # `NAME=value` or the append form `NAME+=value` (write_targets._ASSIGN_RE only has the first)
 _ASSIGN_OR_APPEND_RE = re.compile(r"^[A-Za-z_]\w*\+?=")
 _DECLARATIONS = frozenset({"export", "declare", "typeset", "local", "readonly"})
@@ -806,8 +1343,10 @@ def _trusted_name(head: str) -> str | None:
 
 _XARGS_VALUE = frozenset(
     {"-n", "-I", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--replace", "--max-procs"}
-    | {"--max-lines", "--delimiter", "--arg-file", "--eof", "--max-chars"}
+    | {"--max-lines", "--delimiter", "--arg-file", "--eof", "--max-chars", "--process-slot-var"}
 )
+# xargs tails whose work is chosen by stdin (target/task names): never pinnable
+_XARGS_RUNNERS = frozenset({"make", "pixi", "uv", "npm", "yarn", "pnpm", "npx", "bunx", "pnpx"})
 _PIXI_VALUE = frozenset(
     {"--manifest-path", "-e", "--environment", "--color", "--pypi-keyring-provider", "--auth-file"}
     | {"--concurrent-solves", "--concurrent-downloads"}
@@ -1021,6 +1560,7 @@ class _Analyzer:
         self.base_unknown = False
         self.text = ""  # raw text of the command string being analyzed
         self.raw_words: list[str] = []  # its words, unquoted with literal `$` marked
+        self.scan: _ShellScan | None = None  # its quote-aware scan (words, heredocs)
         # (bases, base_unknown) to restore after a systemd-run unwrap
         self.wd_saved: tuple[list[str], bool] | None = None
 
@@ -1082,6 +1622,7 @@ class _Analyzer:
             return
         saved, self.text = self.text, text
         saved_raw, self.raw_words = self.raw_words, _cooked_words(text)
+        saved_scan, self.scan = self.scan, _scan_shell(text)
         try:
             for cmd in _split_commands(tokens):
                 assigns: list[str] = []
@@ -1092,7 +1633,7 @@ class _Analyzer:
                 if words:
                     self.command(words, cmd, depth)
         finally:
-            self.text, self.raw_words = saved, saved_raw
+            self.text, self.raw_words, self.scan = saved, saved_raw, saved_scan
 
     def probe(self, text: str, depth: int) -> bool:
         """Whether `text`, parsed as a command string, runs a script (or is unpinnable)."""
@@ -1270,22 +1811,207 @@ class _Analyzer:
         # prepare() turns heredoc / here-string openers into sentinel words
         heredoc = any(a.startswith(SENTINEL_PREFIX) for a in args)
         args = [a for a in args if not a.startswith(SENTINEL_PREFIX)]
+        opts = _option_values(spec, args)
+        if not opts.chdir:
+            self.run_interpreter(spec, args, opts, (heredoc, cmd), depth)
+            return
+        saved = (list(self.bases), self.base_unknown)
+        for directory in opts.chdir:  # ruby -C DIR: everything below resolves inside DIR
+            if _literal(directory):
+                self.bases = _extend_bases(self.bases, directory)
+            else:
+                self.base_unknown = True
+        try:
+            self.run_interpreter(spec, args, opts, (heredoc, cmd), depth)
+        finally:
+            self.bases, self.base_unknown = saved
+
+    def run_interpreter(
+        self,
+        spec: _Interp,
+        args: list[str],
+        opts: _Options,
+        source: tuple[bool, _Simple],
+        depth: int,
+    ) -> None:
+        heredoc, cmd = source
+        self.option_refs(spec, opts)
         kind, operand = _scan_options(spec, args)
         if heredoc and kind in ("stdin", "stdin!"):
-            if "$" in self.text or "`" in self.text:
+            if self.text_expands():
                 self.unpin("heredoc/here-string feeding an interpreter expands $ or backticks")
+            elif spec.lang:
+                for body in self.heredoc_bodies():
+                    self.inline_imports(spec.lang, body)
             return
         if kind == "file" and operand is not None:
             self.add_file(operand)
         elif kind == "inline" and operand is not None:
-            if "$(" in operand or "`" in operand:
-                self.unpin("inline code is assembled by a command substitution")
-            elif spec.shell:
-                self.run(operand, depth + 1)
+            self.inline_code(spec, operand, depth)
         elif kind == "module" and operand is not None:
             self.module(operand)
         elif kind in ("stdin", "stdin!"):
             self.stdin(cmd, explicit=kind == "stdin!", depth=depth)
+
+    def text_expands(self) -> bool:
+        """Whether the shell expands `$` / backticks anywhere the interpreter's input is built.
+
+        Single-quoted or escaped characters and the body of a quoted-delimiter heredoc are
+        literal. When the quoting cannot be followed, any `$` or backtick counts.
+        """
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return "$" in self.text or "`" in self.text
+        return any(w.expands for w in scan.words) or any(
+            not h.quoted and ("$" in h.body or "`" in h.body) for h in scan.heredocs
+        )
+
+    def heredoc_bodies(self) -> list[str]:
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return _heredoc_bodies(self.text)
+        return [h.body for h in scan.heredocs]
+
+    def inline_word(self, operand: str) -> tuple[bool, bool, str]:
+        """(shell expands in it, ... by command substitution, code) for inline code `operand`.
+
+        The words of the raw command text containing the operand say how it was quoted; if
+        none does (the tokenizer rewrote it), any `$` / backtick in the operand counts. The
+        code is the bash-unquoted form (`\\$1` in double quotes is `$1`) of an exact match.
+        """
+        cands = self.exact_words(operand)
+        if not cands:
+            return "$" in operand or "`" in operand, "$(" in operand or "`" in operand, operand
+        bashes = {w.bash for w in cands}
+        code = bashes.pop() if len(bashes) == 1 and not any(w.ansi for w in cands) else operand
+        return any(w.expands for w in cands), any(w.subst for w in cands), code
+
+    def exact_words(self, operand: str) -> list[_RawWord]:
+        """Raw words whose shlex-unquoted form is exactly `operand` (none: quoting unknown)."""
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return []
+        return [w for w in scan.words if w.shlex == operand]
+
+    def has_ansi_c(self) -> bool:
+        scan = self.scan
+        if scan is None or not scan.ok:
+            return "$'" in self.text
+        return any(w.ansi for w in scan.words)
+
+    def shell_body(self, operand: str, depth: int) -> None:
+        """Recurse into a shell `-c` body as the inner shell receives it (bash-unquoted)."""
+        if "$(" in operand or "`" in operand:
+            self.unpin("inline code is assembled by a command substitution")
+            return
+        cands = self.exact_words(operand)
+        bashes = {w.bash for w in cands}
+        if len(bashes) == 1 and not any(w.ansi for w in cands):
+            body = bashes.pop()
+        elif "\\$" in operand or "\\`" in operand:
+            self.unpin("shell -c body has an escaped $ or backtick whose quoting is unknown")
+            return
+        else:
+            body = operand
+        self.run(body, depth + 1)
+
+    def inline_code(self, spec: _Interp, operand: str, depth: int) -> None:
+        if spec.shell:  # the nested command string is analyzed on its own
+            self.shell_body(operand, depth)
+            return
+        expands, subst, code = self.inline_word(operand)
+        if subst:
+            self.unpin("inline code is assembled by a command substitution")
+        elif spec.lang and self.has_ansi_c():
+            self.unpin("inline code uses $'...' quoting, whose escapes are decoded by the shell")
+        elif spec.lang:
+            self.inline_imports(spec.lang, code, expanded=expands)
+
+    def local_file_exists(self, operand: str) -> bool:
+        ref = ScriptRef(operand, tuple(self.bases))
+        return any(os.path.isfile(p) for p in _ref_paths(ref, self.cwd))
+
+    def resolve_candidates(self, operand: str, lang: str) -> list[str]:
+        """Files node/ruby would try for `operand` (as given, suffixed, index), in order."""
+        suffixes, indexes = _RESOLVE[lang]
+        return [operand, *(operand + s for s in suffixes)] + [
+            posixpath.join(operand, i) for i in indexes
+        ]
+
+    def resolve_local(self, operand: str, lang: str) -> str | None:
+        """First existing file node/ruby would load for `operand` (as given, suffixed, index)."""
+        cands = self.resolve_candidates(operand, lang)
+        return next((c for c in cands if self.local_file_exists(c)), None)
+
+    def option_refs(self, spec: _Interp, opts: _Options) -> None:
+        """Preload files (node -r/--require/--import/--loader, ruby -r) and -I directories (#98)."""
+        for value in opts.preload:
+            if not _literal(value):
+                self.add_file(value)  # unpinnable: not a literal path
+            elif value.startswith(_OPTION_PATH_PREFIXES):
+                self.add_file(self.resolve_local(value, spec.lang) or value)
+            elif spec.lang == "node" and not _is_node_builtin(value):
+                self.non_durable(_node_modules_reason("preload", value))
+        if opts.include:
+            self.non_durable(_INCLUDE_REASON)
+
+    def inline_imports(self, lang: str, code: str, *, expanded: bool = False) -> None:
+        """Pin the local files inline code (-c / -e / heredoc) imports; fail closed if unsure.
+
+        `expanded`: the shell expands `$` / backticks in the code word (heredocs are checked
+        before this is reached).
+        """
+        if lang == "python":
+            self.inline_python(code, expanded=expanded)
+        elif lang == "node":
+            self.inline_node(code, expanded=expanded)
+        elif _ruby_dynamic(code, expanded=expanded):
+            self.unpin("inline ruby code requires a file that cannot be resolved statically")
+        else:
+            self.pin_inline_paths(_ruby_requires(code), "ruby")
+
+    def pin_inline(self, files: list[str]) -> None:
+        """Pin every candidate file; an absent one is pinned as MISSING (created later: mismatch).
+
+        Only a candidate that exists counts as running a script (non-promotable).
+        """
+        for f in dict.fromkeys(files):
+            self.emit(
+                ScriptRef(f, tuple(self.bases), required=False, script=self.local_file_exists(f))
+            )
+
+    def pin_inline_paths(self, operands: list[str], lang: str) -> None:
+        """Pin what node/ruby would load for local `operands`; unknown cd target: unpinnable."""
+        if self.base_unknown and any(not o.startswith("/") for o in operands):
+            self.unpin(_UNKNOWN_BASE_IMPORT)
+            return
+        files: list[str] = []
+        for o in dict.fromkeys(operands):
+            for cand in self.resolve_candidates(o, lang):
+                files.append(cand)
+                if self.local_file_exists(cand):
+                    break  # later candidates only matter if this one goes away
+        self.pin_inline(files)
+
+    def inline_python(self, code: str, *, expanded: bool) -> None:
+        names = _python_imports(code)
+        if (names is None or expanded) and _PY_IMPORT_RE.search(code):
+            self.unpin("inline python code has an import that cannot be resolved statically")
+        elif names and self.base_unknown:
+            self.unpin(_UNKNOWN_BASE_IMPORT)
+        elif names:
+            self.pin_inline(_python_import_files(names))
+
+    def inline_node(self, code: str, *, expanded: bool) -> None:
+        specs, dynamic = _node_specifiers(code, expanded=expanded)
+        if dynamic:
+            self.unpin("inline node code requires a module that cannot be resolved statically")
+            return
+        local = [s for s in specs if s.startswith(_PATH_PREFIXES)]
+        for spec in dict.fromkeys(specs):
+            if not spec.startswith(_PATH_PREFIXES) and not _is_node_builtin(spec):
+                self.non_durable(_node_modules_reason("require", spec))
+        self.pin_inline_paths(local, "node")
 
     def module(self, name: str) -> None:
         if not re.fullmatch(r"[A-Za-z_][\w.]*", name):
@@ -1312,7 +2038,7 @@ class _Analyzer:
             if op.startswith("<<"):
                 # heredoc / here-string: the content is in the command text, unless
                 # a substitution or variable assembles it
-                if "$" in self.text or "`" in self.text:
+                if self.text_expands():
                     self.unpin("heredoc/here-string feeding an interpreter expands $ or backticks")
                 return
             if op == "<&":
@@ -1394,13 +2120,35 @@ class _Analyzer:
         inner = [sub, *rest]
         saved, self.plan = self.plan, Plan()
         try:
-            self.command(inner, _Simple(list(inner)), depth)
-            fed = bool(self.plan.refs or self.plan.unpinnable)
+            head = self.xargs_tail(inner, depth)
+            tail = self.plan
         finally:
             self.plan = saved
-        is_direct = "/" in sub and posixpath.dirname(sub) not in trusted_bin_dirs()
-        if fed or is_direct or _family(posixpath.basename(sub)) is not None:
-            self.unpin("xargs feeds arguments to a script or interpreter")
+        for reason in tail.non_durable:  # `xargs env VAR=... cmd` loader variables
+            self.non_durable(reason)
+        name = posixpath.basename(head)
+        is_direct = "/" in head and posixpath.dirname(head) not in trusted_bin_dirs()
+        if (
+            tail.unpinnable
+            or any(r.script for r in tail.refs)
+            or is_direct
+            or _family(name) is not None
+            or name in _XARGS_RUNNERS
+        ):
+            self.unpin("xargs feeds arguments to a script, interpreter or runner")
+
+    def xargs_tail(self, inner: list[str], depth: int) -> str:
+        """Analyze the command xargs runs; its head once wrappers (nice, env, ...) are stripped."""
+        unwrapped = self.unwrap(inner, depth)
+        if unwrapped is None:
+            return ""
+        restore = self.wd_saved
+        try:
+            self._command(unwrapped, _Simple(list(unwrapped)), depth)
+        finally:
+            if restore is not None:
+                self.bases, self.base_unknown = restore
+        return unwrapped[0]
 
     def manifest(self, values: list[str], names: tuple[str, ...]) -> None:
         if not values:
@@ -1434,7 +2182,7 @@ class _Analyzer:
             self.node_pm(tool, args, depth)
 
     def uv(self, args: list[str], depth: int) -> None:
-        collect = frozenset({"--directory", "--project", "--script"})
+        collect = frozenset({"--directory", "--project", "--script", "--env-file"})
         sub, rest, got = _split_runner(args, _UV_VALUE, collect)
         if sub != "run":
             return
@@ -1450,12 +2198,27 @@ class _Analyzer:
             for k, v in got:
                 if k == "--script":
                     self.add_file(v)
+                elif k == "--env-file":
+                    self.env_file(v)
             if task is not None and task.endswith(".py"):
                 self.add_file(task)
             elif task is not None:
                 self.command([task, *rest2], _Simple([task, *rest2]), depth)
         finally:
             self.bases = saved
+
+    def env_file(self, path: str) -> None:
+        """`uv run --env-file F`: pin F, and a loader variable inside it is non-durable (#98)."""
+        self.add_file(path, script=False)
+        if not _literal(path):
+            return
+        for real in _ref_paths(ScriptRef(path, tuple(self.bases)), self.cwd):
+            reasons = _env_file_reasons(real, self.cwd)
+            if reasons is None:
+                self.unpin(f"--env-file {path} is too large to scan for loader variables")
+                return
+            for reason in reasons:
+                self.non_durable(f"{reason} (--env-file {path})")
 
     def node_pm(self, tool: str, args: list[str], depth: int) -> None:
         collect = frozenset({"--prefix", "--cwd", "--dir", "-C"})
@@ -1598,13 +2361,18 @@ def _hash_refs(refs: list[ScriptRef], cwd: str) -> tuple[dict[str, str], bool] |
     paths: dict[str, str] = {}
     budget = [MAX_TOTAL_BYTES]
     ok = True
+    existing = missing = 0
     for ref in refs:
         candidates = _ref_paths(ref, cwd)
         for path in candidates:
             if path not in paths:
-                if len(paths) >= MAX_FILES:
+                digest = paths[path] = _file_sha256(path, budget)
+                if digest == MISSING:
+                    missing += 1
+                else:
+                    existing += 1
+                if existing > MAX_FILES or missing > MAX_MISSING_FILES:
                     return None
-                paths[path] = _file_sha256(path, budget)
         if ref.required and all(paths[p] in _UNHASHED for p in candidates):
             ok = False
     if _OVER_BUDGET in paths.values():
