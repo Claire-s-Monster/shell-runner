@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 if TYPE_CHECKING:
     from .seeds import SeedApproval
 
-from .shellprep import template_has_sentinel
+from .shellprep import SENTINEL_PREFIX, template_has_sentinel
 
 logger = logging.getLogger(__name__)
 
@@ -490,6 +490,33 @@ class Persistence:
         with self._write_conn() as conn:
             conn.executescript(_SCHEMA_SQL)
             self._migrate_schema(conn)
+            self._purge_sentinel_verb_rules(conn)
+
+    @staticmethod
+    def _purge_sentinel_verb_rules(conn: sqlite3.Connection) -> None:
+        """Delete verb rules created from sentinel-template prompts (issues #117/#122).
+
+        Idempotent. match_verb_approval already ignores such rows permanently; this
+        removes them so they do not linger. Deleted rather than disabled: the table has
+        no disabled column, and rule_revocations has a fixed `cause` CHECK that cannot
+        express this, so the count is logged instead. Rows with NULL
+        approved_via_prompt_id (seeded or unattributable) or a missing prompt are kept.
+        """
+        cursor = conn.execute(
+            """
+            DELETE FROM verb_approvals
+            WHERE approved_via_prompt_id IN (
+                SELECT id FROM pending_prompts WHERE instr(normalized_template, ?) > 0
+            )
+            """,
+            (SENTINEL_PREFIX,),
+        )
+        if cursor.rowcount > 0:
+            logger.warning(
+                "removed %d verb approval(s) created from sentinel-template prompts "
+                "(issues #117/#122)",
+                cursor.rowcount,
+            )
 
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -1647,6 +1674,14 @@ class Persistence:
         conservative one wins when multiple cwd_prefix/agent scopes overlap),
         or None if no row's cwd_prefix contains cwd.
 
+        Issues #117/#122: a row whose originating prompt (approved_via_prompt_id) has a
+        raw masking sentinel in its stored normalized_template is ignored, permanently:
+        the stored template keeps the sentinel whatever the normalizer does later. The
+        test is instr() on SENTINEL_PREFIX, the same check as template_has_sentinel (a
+        LIKE would treat the underscores as wildcards). Limit: a row with NULL
+        approved_via_prompt_id, or whose prompt row no longer exists, cannot be
+        attributed to a template, so it is honoured.
+
         Issue #98: rows whose manifest_pins do not cover the command's current runner
         manifests (``manifest_pins``; None = no runner manifest) are dropped before the
         MAX, and flag the result as manifest_blocked.
@@ -1655,10 +1690,16 @@ class Persistence:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, cwd_prefix, approved_tier, manifest_pins FROM verb_approvals
-                WHERE verb = ? AND (agent_id = ? OR agent_id IS NULL)
+                SELECT v.id, v.cwd_prefix, v.approved_tier, v.manifest_pins
+                FROM verb_approvals v
+                WHERE v.verb = ? AND (v.agent_id = ? OR v.agent_id IS NULL)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pending_prompts p
+                      WHERE p.id = v.approved_via_prompt_id
+                        AND instr(p.normalized_template, ?) > 0
+                  )
                 """,
-                (verb, agent_id),
+                (verb, agent_id, SENTINEL_PREFIX),
             ).fetchall()
 
         best: int | None = None
