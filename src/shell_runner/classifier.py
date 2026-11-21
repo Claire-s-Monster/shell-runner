@@ -26,6 +26,7 @@ from .catalog import (
     compiled_for,
 )
 from .normalizer import Segment, normalize
+from .shellprep import template_has_sentinel
 
 # ---------------------------------------------------------------------------
 # Permissiveness map — higher = more permissive (more autonomous, less oversight)
@@ -508,14 +509,23 @@ def classify(
             decision_path=(*result.decision_path, f"non_durable: {reason}; approve_once only"),
         )
         result = _require_approval(result)
+    if template_has_sentinel(result.template):
+        # issue #117: the masked `$(..)` / `$VAR` part of this command was never
+        # classified, so the base tier says nothing about it: never auto-execute.
+        result = _require_approval(
+            result,
+            "leaked masking sentinel in template (#117): unclassified part, never auto-executes",
+        )
     labels = path_guard.write_labels(command)
     if labels:
         result = replace(result, decision_path=(*result.decision_path, *labels))
     return result
 
 
-def _require_approval(result: ClassificationResult) -> ClassificationResult:
-    """Defence in depth (#98): a non-durable command never auto-runs.
+def _require_approval(
+    result: ClassificationResult, why: str = "non_durable"
+) -> ClassificationResult:
+    """Defence in depth (#98, #117): such a command never auto-runs.
 
     Raises the tiers to at least APPROVE_ONCE; never lowers one, and DENY stays DENY.
     """
@@ -533,7 +543,7 @@ def _require_approval(result: ClassificationResult) -> ClassificationResult:
         command_tier=command_tier,
         decision_path=(
             *result.decision_path,
-            f"non_durable: tier raised to {Tier.APPROVE_ONCE.name}",
+            f"{why}: tier raised to {Tier.APPROVE_ONCE.name}",
         ),
     )
 
