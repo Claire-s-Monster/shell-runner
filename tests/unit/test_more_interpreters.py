@@ -1004,6 +1004,76 @@ def test_bun_run_known_flag_stays_pinned(tmp_path: Path) -> None:
     _assert_pinned("bun run --silent x.ts", tmp_path, ("x.ts",))
 
 
+# L18. bun loads dotenv files on its own (.env, .env.local, .env.<NODE_ENV>[.local]): their
+# values can set BUN_OPTIONS / NODE_OPTIONS-style loader variables, and are never parsed
+# here, so a Bun command with any of them in the cwd is approve-once only.
+BUN_DOTENV_NAMES = [
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".env.test",
+    ".env.staging",
+    ".env.staging.local",
+    ".env.development.local",
+    ".env.anything.at.all",
+]
+BUN_ENTRY_COMMANDS = [
+    "bun x.ts",
+    "bun run x.ts",
+    "bun run build",
+    "bun x cowsay",
+    "bun -e 'console.log(1)'",
+]
+
+
+def _bun_project(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.ts",))
+    (tmp_path / "package.json").write_text('{"scripts": {"build": "echo hi"}}')
+
+
+@pytest.mark.parametrize("command", BUN_ENTRY_COMMANDS)
+@pytest.mark.parametrize("name", BUN_DOTENV_NAMES)
+def test_bun_with_dotenv_file_is_non_durable(tmp_path: Path, name: str, command: str) -> None:
+    _bun_project(tmp_path)
+    (tmp_path / name).write_text("FOO=1\n")
+    _assert_approve_once_only(command, tmp_path)
+    assert any("dotenv" in r for r in _plan(command, tmp_path).non_durable)
+
+
+@pytest.mark.parametrize("command", BUN_ENTRY_COMMANDS)
+def test_bun_without_dotenv_file_is_unchanged(tmp_path: Path, command: str) -> None:
+    _bun_project(tmp_path)
+    (tmp_path / "env").write_text("x\n")  # not a dotenv name
+    (tmp_path / ".environment").write_text("x\n")
+    (tmp_path / "x.env").write_text("x\n")
+    plan = _plan(command, tmp_path)
+    assert plan.unpinnable is False, command
+    assert plan.non_durable == [], command
+
+
+def test_bun_dotenv_in_cd_base_is_non_durable(tmp_path: Path) -> None:
+    _make(tmp_path, ("sub/x.ts",))
+    (tmp_path / "sub" / ".env.local").write_text("FOO=1\n")
+    _assert_approve_once_only("cd sub && bun x.ts", tmp_path)
+
+
+def test_bun_dotenv_never_less_strict(tmp_path: Path) -> None:
+    _make(tmp_path, ("p.ts",))
+    (tmp_path / ".env").write_text("FOO=1\n")
+    # a refused form stays refused, not downgraded to approve-once
+    _assert_unpinnable("bun exec ls", tmp_path)
+    (tmp_path / "bunfig.toml").write_text('preload = ["./p.ts"]\n')
+    _assert_unpinnable("bun p.ts", tmp_path)
+    _assert_unpinnable("bun run build", tmp_path)
+
+
+def test_dotenv_does_not_affect_other_interpreters(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.js",))
+    (tmp_path / ".env").write_text("FOO=1\n")
+    assert _plan("node x.js", tmp_path).non_durable == []
+
+
 # L18. awk @include traversal budget (shared by every awk invocation of a command)
 def _fan_out(tmp_path: Path, main: str, count: int, prefix: str = "l") -> None:
     _write(tmp_path, main, "".join(f'@include "{prefix}{i}.awk"\n' for i in range(count)))

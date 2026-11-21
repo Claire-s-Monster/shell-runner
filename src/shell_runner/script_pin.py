@@ -726,13 +726,56 @@ def _dotenv_assignment(line: str) -> str | None:
     return f"{key.strip()}={value}"
 
 
+def _path_stat(path: str) -> os.stat_result | None:
+    """The one gate every path named by a pinned command passes before it is probed or read.
+
+    The path comes from the command being pinned, on purpose (script_pin hashes and scans
+    the files a command would run). It is normalised here (`..` and symlinks resolved,
+    embedded NUL refused) and only ever stat'ed, hashed or scanned: never executed or
+    written. Reads on top of this apply the size caps (`_read_capped`, `_file_sha256`).
+    None when it cannot be stat'ed (absent, a NUL byte, a loop, no permission).
+    """
+    try:
+        return os.stat(os.path.realpath(os.path.abspath(path)))
+    except (OSError, ValueError):  # ValueError: embedded NUL
+        return None
+
+
+def _is_regular(path: str) -> bool:
+    """Whether `path` (normalised) is a regular file; same answer as os.path.isfile."""
+    st = _path_stat(path)
+    return st is not None and stat.S_ISREG(st.st_mode)
+
+
+def _is_directory(path: str) -> bool:
+    """Whether `path` (normalised) is a directory; same answer as os.path.isdir."""
+    st = _path_stat(path)
+    return st is not None and stat.S_ISDIR(st.st_mode)
+
+
+def _path_exists(path: str) -> bool:
+    """Whether `path` (normalised) exists; same answer as os.path.exists."""
+    return _path_stat(path) is not None
+
+
+_BUN_DOTENV_REASON = (
+    "bun loads a dotenv file (.env, .env.local, .env.<name>[.local]) in the working "
+    "directory, which can set loader variables and is not scanned"
+)
+
+
+def _is_dotenv_name(name: str) -> bool:
+    """`.env` or `.env.<anything>` (covers .env.local, .env.<NODE_ENV>, .env.<NODE_ENV>.local)."""
+    return name == ".env" or name.startswith(".env.")
+
+
 def _read_capped(path: str) -> bytes | None:
     """The whole file `path` (b"" when it is not a readable regular file), None when it is
     over the scan cap: a file is never scanned in part."""
-    if not os.path.isfile(path):
+    if not _is_regular(path):
         return b""
     try:
-        with open(path, "rb") as fh:
+        with open(os.path.realpath(os.path.abspath(path)), "rb") as fh:
             data = fh.read(_ENV_FILE_MAX + 1)
     except OSError:
         return b""
@@ -2286,7 +2329,7 @@ class _Analyzer:
         found: list[str] = []
         for cand in (name, name + ".awk"):
             for path in _ref_paths(ScriptRef(cand, tuple(self.bases)), self.cwd):
-                if os.path.isfile(path) and path not in found:
+                if _is_regular(path) and path not in found:
                     found.append(path)
         return found
 
@@ -2525,7 +2568,7 @@ class _Analyzer:
 
     def local_file_exists(self, operand: str) -> bool:
         ref = ScriptRef(operand, tuple(self.bases))
-        return any(os.path.isfile(p) for p in _ref_paths(ref, self.cwd))
+        return any(_is_regular(p) for p in _ref_paths(ref, self.cwd))
 
     def resolve_candidates(self, operand: str, lang: str) -> list[str]:
         """Files node/ruby would try for `operand` (as given, suffixed, index), in order."""
@@ -2583,9 +2626,9 @@ class _Analyzer:
             self.unpin(f"config path {value!r} is not a literal path")
             return
         probe = ScriptRef(value, tuple(self.bases))
-        if any(os.path.isfile(p) for p in _ref_paths(probe, self.cwd)):
+        if any(_is_regular(p) for p in _ref_paths(probe, self.cwd)):
             self.add_file(value, script=False)  # a file of any name
-        elif any(os.path.isdir(p) for p in _ref_paths(probe, self.cwd)):
+        elif any(_is_directory(p) for p in _ref_paths(probe, self.cwd)):
             self._ref(value, "search", _PHP_INI_NAMES)
         else:  # absent: pinned as MISSING, as a file and as a directory
             self.add_file(value, script=False)
@@ -2597,7 +2640,7 @@ class _Analyzer:
         probe = ScriptRef(value, tuple(self.bases))
         search = ScriptRef(value, tuple(self.bases), "search", _PHP_INI_NAMES)
         for real in dict.fromkeys([*_ref_paths(probe, self.cwd), *_ref_paths(search, self.cwd)]):
-            if not os.path.isfile(real):
+            if not _is_regular(real):
                 continue
             data = _read_capped(real)
             if data is None:
@@ -2619,12 +2662,34 @@ class _Analyzer:
             )
             if exists and name in _IMPLICIT_SCANS:
                 self.scan_implicit(name)
+        if spec.lang == "bun" and self.bun_dotenv_present():
+            self.non_durable(_BUN_DOTENV_REASON)
+
+    def bun_dotenv_present(self) -> bool:
+        """Whether the cwd (or a cd base) holds a file bun loads implicitly as dotenv.
+
+        Bun reads `.env`, `.env.local` and `.env.<NODE_ENV>` (with a `.local` variant), and
+        NODE_ENV may be anything, so every `.env` / `.env.*` entry counts. The files are
+        not parsed: their values can set loader variables (BUN_OPTIONS, NODE_OPTIONS).
+        """
+        roots = [self.cwd, *(os.path.join(self.cwd, os.path.expanduser(b)) for b in self.bases)]
+        for root in dict.fromkeys(roots):
+            directory = os.path.realpath(os.path.abspath(root))
+            if not _is_directory(directory):
+                continue
+            try:
+                with os.scandir(directory) as entries:
+                    if any(_is_dotenv_name(e.name) for e in entries):
+                        return True
+            except OSError:
+                return True  # cannot tell: fail towards approve-once
+        return False
 
     def scan_implicit(self, name: str) -> None:
         """Scan the implicit file `name` (cwd and every cd base) for what it loads on its own."""
         scan = _IMPLICIT_SCANS[name]
         for real in _ref_paths(ScriptRef(name, tuple(self.bases)), self.cwd):
-            if not os.path.isfile(real):
+            if not _is_regular(real):
                 continue
             if scan == "env":  # ./.Renviron: loader variables are non-durable
                 reasons = _env_file_reasons(real, self.cwd)
@@ -2722,7 +2787,7 @@ class _Analyzer:
         ref = ScriptRef(name, tuple(self.bases), "module", required=False, script=False)
         # Candidates are always pinned (a module created later is a mismatch); only a
         # module that exists locally counts as running a script (non-promotable).
-        if any(os.path.exists(p) for p in _ref_paths(ref, self.cwd)):
+        if any(_path_exists(p) for p in _ref_paths(ref, self.cwd)):
             ref = ScriptRef(name, tuple(self.bases), "module", required=False)
         self.plan.refs.append(ref)
 
@@ -3086,12 +3151,12 @@ def _ref_paths(ref: ScriptRef, cwd: str) -> list[str]:
                 out.add(os.path.realpath(cand))
         elif ref.kind == "search":
             directory = os.path.realpath(target)
-            present = [n for n in ref.names if os.path.isfile(os.path.join(directory, n))]
+            present = [n for n in ref.names if _is_regular(os.path.join(directory, n))]
             out.update(os.path.join(directory, n) for n in (present[:1] or ref.names))
         else:  # upward
             cur = os.path.realpath(target)
             while True:
-                found = [n for n in ref.names if os.path.isfile(os.path.join(cur, n))]
+                found = [n for n in ref.names if _is_regular(os.path.join(cur, n))]
                 if found or os.path.dirname(cur) == cur:
                     out.update(os.path.join(cur, n) for n in found)
                     break
