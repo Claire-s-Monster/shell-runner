@@ -120,6 +120,13 @@ fresh approval, including inside compound commands and wrappers such as
 carries a `scope_warning` saying so), and any template or verb row already
 stored for these shapes is ignored.
 
+**Templates with a leaked masking placeholder are never promotable** (issue #117).
+If the normalized template still contains a raw `__TKSENTINEL_<n>` (a masked
+`$VAR`/`$(..)` inside a larger word), `approve_template`/`approve_template_global`/
+`approve_verb` degrade to a one-shot approval, persistence refuses to store such a
+template (or any reusable rule for such a prompt), and no stored template or verb+cwd
+row is ever matched for it.
+
 Whichever tier results (promoted or catalog), the agent's `agent_cap` is
 re-applied via the PERMISSIVENESS cap-min formula (`_cap_permissiveness`).
 This means an `AUTO_CAPPED`-capped agent can still only receive

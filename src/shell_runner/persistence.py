@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 if TYPE_CHECKING:
     from .seeds import SeedApproval
 
+from .shellprep import SENTINEL_PREFIX, template_has_sentinel
+
 logger = logging.getLogger(__name__)
 
 
@@ -488,6 +490,33 @@ class Persistence:
         with self._write_conn() as conn:
             conn.executescript(_SCHEMA_SQL)
             self._migrate_schema(conn)
+            self._purge_sentinel_verb_rules(conn)
+
+    @staticmethod
+    def _purge_sentinel_verb_rules(conn: sqlite3.Connection) -> None:
+        """Delete verb rules created from sentinel-template prompts (issues #117/#122).
+
+        Idempotent. match_verb_approval already ignores such rows permanently; this
+        removes them so they do not linger. Deleted rather than disabled: the table has
+        no disabled column, and rule_revocations has a fixed `cause` CHECK that cannot
+        express this, so the count is logged instead. Rows with NULL
+        approved_via_prompt_id (seeded or unattributable) or a missing prompt are kept.
+        """
+        cursor = conn.execute(
+            """
+            DELETE FROM verb_approvals
+            WHERE approved_via_prompt_id IN (
+                SELECT id FROM pending_prompts WHERE instr(normalized_template, ?) > 0
+            )
+            """,
+            (SENTINEL_PREFIX,),
+        )
+        if cursor.rowcount > 0:
+            logger.warning(
+                "removed %d verb approval(s) created from sentinel-template prompts "
+                "(issues #117/#122)",
+                cursor.rowcount,
+            )
 
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -858,8 +887,8 @@ class Persistence:
             now_dt = datetime.now(UTC)
             now = now_dt.isoformat()
             row = conn.execute(
-                "SELECT id, approve_decision, consumed_at, expires_at, created_at, script_paths "
-                "FROM pending_prompts WHERE id = ?",
+                "SELECT id, approve_decision, consumed_at, expires_at, created_at, script_paths, "
+                "normalized_template FROM pending_prompts WHERE id = ?",
                 (prompt_id,),
             ).fetchone()
             if row is None:
@@ -894,6 +923,11 @@ class Persistence:
                     revoked_rules=revoked,
                     prompt_updated=False,
                     prompt_state=closed_state,
+                )
+            if rule is not None and template_has_sentinel(row["normalized_template"]):
+                raise ValueError(  # rolls back, no write (issue #117)
+                    "refusing a reusable rule for a prompt whose template contains a raw "
+                    "masking sentinel"
                 )
             if decision == "approve_once":
                 # Durability (issue #26 P2 Part B): extend the TTL well past the
@@ -1326,6 +1360,11 @@ class Persistence:
         Delete+insert run in one transaction. Prompt-driven approvals should use
         decide_prompt so the decision and rule are atomic (issue #94).
         """
+        if template_has_sentinel(template):
+            raise ValueError(
+                "refusing a template approval whose template contains a raw masking sentinel "
+                "(issue #117)"
+            )
         with self._write_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row_id = self._insert_template_approval(
@@ -1359,6 +1398,8 @@ class Persistence:
         new entries win, the rest are carried over, so the rule keeps covering the
         runner manifests approved earlier.
         """
+        if template_has_sentinel(template):  # reached via decide_prompt too (issue #117)
+            raise ValueError("refusing a template approval containing a raw masking sentinel")
         scope_key = agent_id if agent_id is not None else ""
         old = conn.execute(
             "SELECT id, template, agent_id, approved_via_prompt_id, manifest_pins "
@@ -1410,13 +1451,20 @@ class Persistence:
         """Idempotently insert seed approvals as global (agent_id IS NULL) rows.
 
         Skips templates already present in template_approvals (regardless of
-        agent_id), so user-promoted approvals are never overwritten.
+        agent_id), so user-promoted approvals are never overwritten. A seed whose
+        template contains a leaked masking sentinel is skipped with a warning.
 
         Returns the count of newly-inserted rows.
         """
         inserted = 0
         with self._write_conn() as conn:
             for seed in seeds:
+                if template_has_sentinel(seed.template):  # issue #117: never store a wildcard
+                    logger.warning(
+                        "skipping seed approval with a raw masking sentinel in its template: %r",
+                        seed.template,
+                    )
+                    continue
                 existing = conn.execute(
                     "SELECT 1 FROM template_approvals WHERE template = ? LIMIT 1",
                     (seed.template,),
@@ -1452,6 +1500,8 @@ class Persistence:
         command has no runner manifest). A row whose manifest_pins do not cover it is
         skipped, so a global row that is not honoured falls through to the agent row.
         """
+        if template_has_sentinel(template):  # issue #117: a leaked sentinel is a wildcard
+            return RuleMatch(None)
         first_blocked: RuleMatch | None = None
         with self._conn() as conn:
             for kind, scoped in (
@@ -1624,6 +1674,14 @@ class Persistence:
         conservative one wins when multiple cwd_prefix/agent scopes overlap),
         or None if no row's cwd_prefix contains cwd.
 
+        Issues #117/#122: a row whose originating prompt (approved_via_prompt_id) has a
+        raw masking sentinel in its stored normalized_template is ignored, permanently:
+        the stored template keeps the sentinel whatever the normalizer does later. The
+        test is instr() on SENTINEL_PREFIX, the same check as template_has_sentinel (a
+        LIKE would treat the underscores as wildcards). Limit: a row with NULL
+        approved_via_prompt_id, or whose prompt row no longer exists, cannot be
+        attributed to a template, so it is honoured.
+
         Issue #98: rows whose manifest_pins do not cover the command's current runner
         manifests (``manifest_pins``; None = no runner manifest) are dropped before the
         MAX, and flag the result as manifest_blocked.
@@ -1632,10 +1690,16 @@ class Persistence:
         with self._conn() as conn:
             rows = conn.execute(
                 """
-                SELECT id, cwd_prefix, approved_tier, manifest_pins FROM verb_approvals
-                WHERE verb = ? AND (agent_id = ? OR agent_id IS NULL)
+                SELECT v.id, v.cwd_prefix, v.approved_tier, v.manifest_pins
+                FROM verb_approvals v
+                WHERE v.verb = ? AND (v.agent_id = ? OR v.agent_id IS NULL)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pending_prompts p
+                      WHERE p.id = v.approved_via_prompt_id
+                        AND instr(p.normalized_template, ?) > 0
+                  )
                 """,
-                (verb, agent_id),
+                (verb, agent_id, SENTINEL_PREFIX),
             ).fetchall()
 
         best: int | None = None
