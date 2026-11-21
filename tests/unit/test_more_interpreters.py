@@ -614,3 +614,20 @@ def test_suspect_shape_fails_tokenization() -> None:
 
 def test_untokenizable_text_with_go_run_is_unpinnable(tmp_path: Path) -> None:
     _assert_unpinnable(f"{UNTOKENIZABLE} go run x.go", tmp_path)
+
+
+# K. xargs feeding bun (#98) -----------------------------------------------------------
+# xargs supplies the executed script/args from stdin, so the code run by bun or bunx is not
+# statically knowable: refused (UNPINNABLE), never pinned or promoted as durable.
+
+XARGS_BUN_UNPINNABLE = [
+    "printf 'a.js\\n' | xargs bun",
+    "printf 'a.js\\n' | xargs bun run",
+    "printf 'a.js\\n' | xargs bunx foo",
+]
+
+
+@pytest.mark.parametrize("command", XARGS_BUN_UNPINNABLE)
+def test_xargs_feeding_bun_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("a.js",))
+    _assert_unpinnable(command, tmp_path)
