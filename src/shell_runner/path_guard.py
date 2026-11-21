@@ -388,8 +388,8 @@ def evaluate(
     home = env.get("HOME", os.path.expanduser("~"))
     findings: list[GuardFinding] = []
     git_matches: list[PathMatch] = []
-    cps = analyze(command)
-    counted = analyze(folded_command) if folded_command else cps
+    cps = analyze(command, cwd=cwd)
+    counted = analyze(folded_command, cwd=cwd) if folded_command else cps
     unparseable = _unparseable_finding(counted, segment_count)
     if unparseable is not None:
         findings.append(unparseable)
