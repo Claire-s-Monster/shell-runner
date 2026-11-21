@@ -3129,7 +3129,7 @@ class _Analyzer:
             self.unpin(f"uv {flag} value {value!r} is not a literal path")
             return
         paths = _ref_paths(ScriptRef(value, tuple(self.bases)), self.cwd)
-        if any(os.path.isfile(p) for p in paths):
+        if any(_is_regular(p) for p in paths):
             self.add_file(value, script=False)
         else:
             self.unpin(f"uv {flag} {value} is not a regular file")
@@ -3139,7 +3139,7 @@ class _Analyzer:
         if value.endswith(_ARCHIVE_SUFFIXES):
             return True
         refs = _ref_paths(ScriptRef(value, tuple(self.bases)), self.cwd)
-        return any(os.path.lexists(p) for p in refs)
+        return any(_path_exists(p) for p in refs)
 
     def env_file(self, path: str) -> None:
         """`uv run --env-file F`: pin F, and a loader variable inside it is non-durable (#98)."""
@@ -3242,9 +3242,7 @@ class _Analyzer:
         path = posixpath.join(member, "package.json")
         if not _literal(member):
             self.unpin(f"workspace selector {member!r} is not a literal path")
-        elif any(
-            os.path.isfile(p) for p in _ref_paths(ScriptRef(path, tuple(self.bases)), self.cwd)
-        ):
+        elif any(_is_regular(p) for p in _ref_paths(ScriptRef(path, tuple(self.bases)), self.cwd)):
             self.add_file(path, script=False)
         else:
             self.unpin(f"workspace selector {member!r} does not name a package directory")
