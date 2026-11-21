@@ -197,8 +197,8 @@ def test_inline_code_without_local_file_is_unchanged(
 
 
 ABSENT_CANDIDATES = [
-    ("lua -e \"require 'x'\"", {"x", "x.lua", "x/init.lua"}),
-    ("lua -l socket y.lua", {"socket", "socket.lua", "socket/init.lua", "y.lua"}),
+    ("lua -e \"require 'x'\"", {"x.lua", "x/init.lua"}),
+    ("lua -l socket y.lua", {"socket.lua", "socket/init.lua", "y.lua"}),
 ]
 
 
@@ -361,8 +361,8 @@ def test_version_queries_are_not_unpinnable(tmp_path: Path, command: str) -> Non
     assert _plan(command, tmp_path).unpinnable is False
 
 
-@pytest.mark.parametrize("command", ["go build ./...", "go test ./..."])
-def test_go_build_and_test_keep_current_outcome(tmp_path: Path, command: str) -> None:
+@pytest.mark.parametrize("command", ["go build ./..."])
+def test_go_build_keeps_current_outcome(tmp_path: Path, command: str) -> None:
     _make(tmp_path, ("main.go",))
     plan = _plan(command, tmp_path)
     assert plan.unpinnable is False
@@ -388,6 +388,10 @@ RUNNERS_UNPINNABLE = [
     "bun test",
     "bun test x.test.ts",
     "go generate ./...",
+    "go test",
+    "go test ./...",
+    "go test -run TestX ./pkg",
+    "go -C sub test ./...",
 ]
 
 
@@ -397,8 +401,8 @@ def test_test_runners_and_generators_are_unpinnable(tmp_path: Path, command: str
     _assert_unpinnable(command, tmp_path)
 
 
-@pytest.mark.parametrize("command", ["go test ./...", "go build ./..."])
-def test_go_test_and_build_category_is_current(tmp_path: Path, command: str) -> None:
+@pytest.mark.parametrize("command", ["go build ./..."])
+def test_go_build_category_is_current(tmp_path: Path, command: str) -> None:
     _make(tmp_path, ("main.go", "x_test.go"))
     assert _category(command, tmp_path) == _category("true", tmp_path)
 
@@ -1169,3 +1173,106 @@ def test_gawk_include_flag_value_is_not_a_program_file(tmp_path: Path) -> None:
     plan = _plan("gawk -i lib.awk -f x.awk", tmp_path)
     assert plan.unpinnable is False
     assert {r.operand for r in plan.refs if r.script} == {"x.awk", "lib.awk"}
+
+
+# --- PR #111 review round 3 --------------------------------------------------------------
+
+
+def _paths(command: str, tmp_path: Path) -> set[str]:
+    root = str(tmp_path.resolve())
+    return {p.removeprefix(root + "/") for p in _pin_paths(command, tmp_path)}
+
+
+# R1. lua `require` / `-l` search ./?.lua and ./?/init.lua, never the bare stem
+@pytest.mark.parametrize("command", ["lua -e \"require('m')\"", "lua -l m n.lua"])
+def test_lua_module_lookup_pins_lua_files_not_the_bare_stem(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("m", "m.lua", "n.lua"))
+    paths = _paths(command, tmp_path)
+    assert "m.lua" in paths, paths
+    assert "m" not in paths, paths
+
+
+def test_lua_package_directory_is_pinned_through_init(tmp_path: Path) -> None:
+    _make(tmp_path, ("m/init.lua",))
+    _assert_pinned("lua -e \"require('m')\"", tmp_path, ("m/init.lua",))
+
+
+def test_lua_dofile_keeps_the_exact_path(tmp_path: Path) -> None:
+    _make(tmp_path, ("m",))
+    _assert_pinned("lua -e \"dofile('m')\"", tmp_path, ("m",))
+
+
+# R2. bun resolves extensionless imports and preloads to TypeScript too
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bun -e \"require('./x')\"",
+        "bun -e \"import('./x')\"",
+        "bun --preload ./x y.ts",
+        "bun -r ./x y.ts",
+    ],
+)
+def test_bun_extensionless_local_import_pins_typescript(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.ts", "y.ts"))
+    _assert_pinned(command, tmp_path, ("x.ts",))
+
+
+def test_bun_pins_every_existing_candidate(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.ts", "x.js"))
+    _assert_pinned("bun -e \"require('./x')\"", tmp_path, ("x.ts", "x.js"))
+
+
+def test_node_import_resolution_is_unchanged(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.ts",))
+    assert "x.ts" not in _paths("node -e \"require('./x')\"", tmp_path)
+
+
+# R3. php -c: a file of any name, a directory's php-cli.ini before php.ini, loader keys refused
+def test_php_c_file_without_ini_suffix_is_pinned(tmp_path: Path) -> None:
+    _make(tmp_path, ("custom.conf", "x.php"))
+    _assert_pinned("php -c custom.conf x.php", tmp_path, ("custom.conf", "x.php"))
+
+
+def test_php_c_directory_prefers_php_cli_ini(tmp_path: Path) -> None:
+    _make(tmp_path, ("conf/php-cli.ini", "conf/php.ini", "x.php"))
+    _assert_pinned("php -c conf x.php", tmp_path, ("conf/php-cli.ini", "x.php"))
+
+
+def test_php_c_directory_falls_back_to_php_ini(tmp_path: Path) -> None:
+    _make(tmp_path, ("conf/php.ini", "x.php"))
+    _assert_pinned("php -c conf x.php", tmp_path, ("conf/php.ini", "x.php"))
+
+
+@pytest.mark.parametrize(
+    "ini",
+    [
+        "auto_prepend_file=./hook.php\n",
+        "auto_append_file = './hook.php'\n",
+        "extension=./hook.so\n",
+        'zend_extension = "opcache"\n',
+        "[PHP]\n  Extension=hook\n",
+    ],
+)
+@pytest.mark.parametrize("command", ["php -c p.ini x.php", "php -c conf x.php"])
+def test_php_ini_loader_keys_are_unpinnable(tmp_path: Path, command: str, ini: str) -> None:
+    _make(tmp_path, ("x.php",))
+    _write(tmp_path, "p.ini", ini)
+    _write(tmp_path, "conf/php.ini", ini)
+    _assert_unpinnable(command, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "ini",
+    ["memory_limit=1G\n", "; extension=hook\nauto_prepend_file =\n", "display_errors=1\n"],
+)
+def test_php_ini_without_loader_keys_stays_pinned(tmp_path: Path, ini: str) -> None:
+    _make(tmp_path, ("x.php",))
+    _write(tmp_path, "p.ini", ini)
+    _assert_pinned("php -c p.ini x.php", tmp_path, ("p.ini", "x.php"))
+
+
+# R4. `bun run NAME.ext`: a package script of that name may take precedence over the file
+def test_explicit_bun_run_pins_package_manifest_next_to_the_file(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.ts",))
+    _write(tmp_path, "package.json", '{"scripts": {"x.ts": "echo hi"}}')
+    _assert_pinned("bun run x.ts", tmp_path, ("x.ts", "package.json"))

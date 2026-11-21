@@ -452,16 +452,21 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   `pypy*`, versioned `perl5.x`/`ruby3.x`/`php8.x`/`lua5.x`, `gawk`/`mawk`/`nawk`, `csh`/`tcsh`
   (script file only; any `-c` body is unpinnable), `tclsh`/`wish`/`osascript` (file operand;
   any option is unpinnable), `lua`/`luajit` (`-e` literal `require`/`dofile`/`loadfile`,
-  `-l mod`), `Rscript` (`-e` literal `source`/`sys.source`; `./.Rprofile` unless `--vanilla`/
+  `-l mod`; a module is searched as `mod.lua` and `mod/init.lua`, never as the bare name),
+  `Rscript` (`-e` literal `source`/`sys.source`; `./.Rprofile` unless `--vanilla`/
   `--no-init-file`, `./.Renviron` unless `--vanilla`/`--no-environ`), `php` (`-r` literal
   `require`/`include`, `-d auto_prepend_file=`/`auto_append_file=` with spaces/quotes
-  normalised, `-c`), `gawk -i`/`--include` and `@include "file"` (followed recursively in
+  normalised, `-c FILE` of any name or `-c DIR` pinning `php-cli.ini` before `php.ini`; a
+  config that sets `auto_prepend_file`/`auto_append_file`/`extension`/`zend_extension` to a
+  value is unpinnable), `gawk -i`/`--include` and `@include "file"` (followed recursively in
   `-f`/`-E`/`--exec` files and `-e`/`--source` text, cycle-safe, depth 16, whole files only;
   one traversal budget per command across all awk calls: 32 files, 64 MiB, 256 include names,
   over it the command is unpinnable), `bun` (file, `bun run FILE`, `-e`, `--preload`,
-  `./bunfig.toml` on every path; `bun run NAME` pins `package.json`), `deno run FILE` /
+  `./bunfig.toml` on every path; `bun run NAME` and `bun run FILE` pin `package.json`; local
+  imports and preloads pin every TypeScript/JavaScript/JSON candidate bun may resolve),
+  `deno run FILE` /
   `deno eval` / `deno run -` heredocs (`--config`, `--import-map` pinned). Fail closed:
-  `go run`, `go generate`, test runners (`deno test`/`bench`, `bun test`), `bun exec`, a
+  `go run`, `go test`, `go generate`, test runners (`deno test`/`bench`, `bun test`), `bun exec`, a
   `preload` key in the pinned `bunfig.toml`, `deno task` and other deno subcommands that run
   code, remote deno specifiers, any flag before a deno/bun subcommand or script,
   `gawk -l`/`@load` and any gawk long
@@ -482,8 +487,9 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   `luajit -j`/`-O`, `LUA_*`, `R_PROFILE*`, `R_ENVIRON*`,
   `R_LIBS*` (also when set in a pinned `./.Renviron`), `PHPRC`, `PHP_INI_SCAN_DIR`,
   `php -d include_path`, `AWKPATH`, `AWKLIBPATH`, `BUN_OPTIONS`, `PERL5DB`, `TCLLIBPATH`,
-  `TCL_LIBRARY`, `TK_LIBRARY`. Not covered: `go test` (pending a decision; currently not
-  pinned), `npx`/`bunx <pkg>` package code, `$HOME` startup files (`~/.cshrc`,
+  `TCL_LIBRARY`, `TK_LIBRARY`. Not covered: `go vet -vettool`, `go tool`,
+  `go build -toolexec` and `go test -exec` (the latter is refused as `go test`; the others
+  keep their previous outcome), `npx`/`bunx <pkg>` package code, `$HOME` startup files (`~/.cshrc`,
   `~/.Rprofile`), and dynamic loading the literal scans cannot see; deep config modelling
   (`bunfig.toml`, `.Renviron`, php.ini contents beyond the checks above) is tracked in #127.
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
