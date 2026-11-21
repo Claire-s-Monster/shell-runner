@@ -33,7 +33,7 @@ import posixpath
 import re
 import stat
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .executor import trusted_bin_dirs
 from .shellprep import SENTINEL_PREFIX
@@ -53,7 +53,8 @@ _UNRESOLVABLE_CHARS = "$`*?[{\n\0"
 _OVER_BUDGET = "over_budget"
 _MAKEFILES = ("GNUmakefile", "makefile", "Makefile")
 _SUSPECT_RE = re.compile(
-    r"\b(?:bash|sh|zsh|dash|ksh|mksh|ash|fish|python[\d.]*|pypy[\d.]*|node|perl|ruby|php|awk"
+    r"\b(?:bash|sh|zsh|dash|ksh|mksh|ash|fish|python[\d.]*|pypy[\d.]*|node|perl[\d.]*|ruby[\d.]*"
+    r"|php[\d.]*|awk"
     r"|gawk|mawk|nawk|sed|make|pixi|uv|npm|yarn|pnpm|find|eval|source|xargs|csh|tcsh|lua[\d.]*"
     r"|luajit|Rscript|tclsh[\d.]*|wish|deno|bun|osascript|go)\b|^\s*\.\s"
 )
@@ -95,6 +96,10 @@ class _Interp:
     # (implicit file, long options that make the interpreter skip it)
     implicit_off: tuple[tuple[str, frozenset[str]], ...] = ()
     unsafe_flags: str = ""  # short flags whose value makes the command unpinnable (php -z)
+    unpin_flags: str = ""  # short flags that make the command unpinnable (luajit -j, -O)
+    # when set, any long option outside this set is unpinnable (php)
+    long_allow: frozenset[str] | None = None
+    opaque_heredoc: bool = False  # a heredoc/here-string script is another language: unpinnable
 
     def collects(self, ch: str) -> bool:
         """Whether short flag `ch` carries a value that _option_values records."""
@@ -158,7 +163,7 @@ _RUBY = _Interp(
     options_after_code=True,
 )
 _PHP = _Interp(
-    value="dczSt",
+    value="dczStfF",
     inline="rBRE",
     noexec="lvimh",
     file_flags="fF",
@@ -166,10 +171,13 @@ _PHP = _Interp(
     define_flags="d",
     unsafe_flags="z",
     lang="php",
+    options_after_code=True,  # php keeps parsing options after `-r CODE` / `-f FILE`
+    long_allow=frozenset({"--version", "--help", "--info", "--modules", "--ini"}),
 )
 _FISH = _Interp(value="dDoC", inline="c", noexec="n")
-_CSH = _Interp(inline="c", noexec="n", stdin="st", opaque_inline=True)
+_CSH = _Interp(inline="c", noexec="n", stdin="st", opaque_inline=True, opaque_heredoc=True)
 _LUA = _Interp(value="l", code_flags="e", code_then_script=True, preload_flags="l", lang="lua")
+_LUAJIT = replace(_LUA, unpin_flags="jO")  # -j (jit/profiler/dump modules) and -O load code
 _RSCRIPT = _Interp(
     code_flags="e",
     lang="r",
@@ -196,7 +204,8 @@ _BUN = _Interp(
     implicit_files=("bunfig.toml",),
 )
 _DENO = _Interp(cli="deno", lang="deno")
-_OPAQUE = _Interp(unpin_options=True)  # tclsh, wish, osascript: file operand only
+# tclsh, wish, osascript: file operand only
+_OPAQUE = _Interp(unpin_options=True, opaque_heredoc=True)
 _FAMILIES = {
     "node": _NODE,
     "nodejs": _NODE,
@@ -207,7 +216,7 @@ _FAMILIES = {
     "csh": _CSH,
     "tcsh": _CSH,
     "lua": _LUA,
-    "luajit": _LUA,
+    "luajit": _LUAJIT,
     "Rscript": _RSCRIPT,
     "deno": _DENO,
     "bun": _BUN,
@@ -354,6 +363,9 @@ def _short_option_values(spec: _Interp, args: list[str], i: int, out: _Options) 
     a = args[i]
     for pos, ch in enumerate(a[1:]):
         rest = a[pos + 2 :]
+        if ch in spec.unpin_flags:
+            out.unsafe.append(f"-{ch} loads code that cannot be pinned")
+            return 1
         if spec.collects(ch):
             value = rest or (args[i + 1] if i + 1 < len(args) else "")
             if value:
@@ -384,6 +396,8 @@ def _option_values(spec: _Interp, args: list[str]) -> _Options:
         if a.startswith("--"):
             name, eq, val = a.partition("=")
             out.flags.append(name)
+            if spec.long_allow is not None and name not in spec.long_allow:
+                out.unsafe.append(f"{name} is not a known-harmless option and may load code")
             if name in spec.long_preload_flags:
                 value = val if eq else (args[i + 1] if i + 1 < len(args) else "")
                 if value:
@@ -399,6 +413,8 @@ def _option_values(spec: _Interp, args: list[str]) -> _Options:
 
 _INCLUDE_REASON = "-I puts a caller-chosen directory on the module search path"
 _INI_SEARCH_REASON = "-d include_path puts a caller-chosen directory on the include search path"
+_IMPLICIT_SCANS = {".Renviron": "env", "bunfig.toml": "bunfig"}
+_BUNFIG_PRELOAD_RE = re.compile(r"\bpreload\b", re.I)
 _UNKNOWN_BASE_IMPORT = "inline code imports a module, but the cd/pushd target is not known"
 
 
@@ -590,34 +606,49 @@ def _call_literals(code: str, call_re: re.Pattern[str]) -> tuple[list[tuple[str,
 
 
 def _lua_module_path(name: str) -> str:
-    """File stem `require name` / `lua -l name` searches ('a.b' is a/b; `g=mod` is mod)."""
-    name = name.rpartition("=")[2]
+    """File stem `require name` / `lua -l name` searches ('a.b' is a/b)."""
     return name if "/" in name else name.replace(".", "/")
 
 
-# inline code that changes where modules are searched, or loads a file indirectly: unpinnable
-_LUA_SEARCH_RE = re.compile(r"\bpackage\s*(?:\.\s*(?:c?path|searchers|loaders)\b|\[)")
+# inline code that changes where modules are searched, or loads a file/library indirectly:
+# unpinnable (a literal native-library load, `package.loadlib` / `dyn.load` / `dl`, included)
+_LUA_SEARCH_RE = re.compile(r"\bpackage\s*(?:\.\s*(?:c?path|searchers|loaders|loadlib)\b|\[)")
 _R_INDIRECT_RE = re.compile(
     r"\.libPaths\s*\(|(?<![\w.])parse\s*\((?![^)]*\btext\s*=)"
     r"|\bdo\.call\s*\(\s*[\"']?(?:sys\.)?source\b"
+    r"|\bdyn\.load\s*\(|\blibrary\.dynam\s*\("
 )
-_PHP_SEARCH_RE = re.compile(r"\bset_include_path\s*\(|\bini_set\s*\([^)]*include_path", re.I)
+_PHP_SEARCH_RE = re.compile(
+    r"\bset_include_path\s*\(|\bini_set\s*\([^)]*include_path|(?<![\w$])dl\s*\(", re.I
+)
+# a URL / stream wrapper scheme (http:, phar:, data:, php:, ftp:, file:); two or more characters
+# so a drive letter (`C:/x`) and a relative `./a:b` or `/a:b` path are not one
+_SCHEME_RE = re.compile(r"[A-Za-z][\w+.-]+:")
 
 
 def _lua_loads(code: str) -> tuple[list[str], bool]:
     calls, dynamic = _call_literals(code, _LUA_CALL_RE)
-    paths = [_lua_module_path(v) if n == "require" else v for n, v in calls]
+    paths: list[str] = []
+    for name, value in calls:
+        if name != "require":
+            paths.append(value)
+        elif "=" in value:  # only `-l g=mod` has a global-name prefix, never `require`
+            dynamic = True
+        else:
+            paths.append(_lua_module_path(value))
     return paths, dynamic or _LUA_SEARCH_RE.search(code) is not None
 
 
 def _r_loads(code: str) -> tuple[list[str], bool]:
     calls, dynamic = _call_literals(code, _R_CALL_RE)
-    return [v for _, v in calls], dynamic or _R_INDIRECT_RE.search(code) is not None
+    remote = any(_SCHEME_RE.match(v) for _, v in calls)
+    return [v for _, v in calls], dynamic or remote or _R_INDIRECT_RE.search(code) is not None
 
 
 def _php_loads(code: str) -> tuple[list[str], bool]:
     calls, dynamic = _call_literals(code, _PHP_CALL_RE)
-    return [v for _, v in calls], dynamic or _PHP_SEARCH_RE.search(code) is not None
+    remote = any(_SCHEME_RE.match(v) for _, v in calls)
+    return [v for _, v in calls], dynamic or remote or _PHP_SEARCH_RE.search(code) is not None
 
 
 _LOAD_SCANNERS = {"lua": _lua_loads, "r": _r_loads, "php": _php_loads}
@@ -676,6 +707,23 @@ _AWK_INCLUDE_DEPTH = 16
 _AWK_LONG_VALUE = frozenset(
     {"--file", "--include", "--source", "--field-separator", "--assign", "--exec"}
 )
+# the only long options (exact full spelling) a pinned awk command may use; gawk accepts
+# unambiguous abbreviations (`--loa=`, `--incl`), which would slip past exact name checks
+_AWK_LONG_KNOWN = _AWK_LONG_VALUE | {
+    "--version",
+    "--help",
+    "--posix",
+    "--traditional",
+    "--re-interval",
+    "--characters-as-bytes",
+    "--non-decimal-data",
+    "--use-lc-numeric",
+    "--lint",
+    "--csv",
+    "--sandbox",
+    "--bignum",
+}
+_AWK_SHORT_VALUE = "FvfeilE"  # short flags taking a value (attached or next word)
 _AWK_DIRECTIVE_RE = re.compile(r"^[ \t]*@(include|load)\b[ \t]*(.*)$", re.M)
 _AWK_NAME_RE = re.compile(r"""(["'])([^"'\n]+)\1[ \t]*(?:#.*)?$""")
 
@@ -692,7 +740,11 @@ def _awk_includes(text: str) -> tuple[list[str], bool]:
 
 
 def _awk_scan(args: list[str]) -> tuple[bool, str | None]:
-    """(whether gawk -l / --load is given, the first operand) of an awk command's args."""
+    """(whether the options are unpinnable, the first operand) of an awk command's args.
+
+    Unpinnable: gawk -l / --load (a compiled extension) or any long option outside the exact
+    known full-spelling set (an abbreviation of --load / --include would not be recognised).
+    """
     i = 0
     while i < len(args):
         a = args[i]
@@ -700,7 +752,7 @@ def _awk_scan(args: list[str]) -> tuple[bool, str | None]:
             return False, args[i + 1] if i + 1 < len(args) else None
         if a.startswith("--"):
             name, eq, _ = a.partition("=")
-            if name == "--load":
+            if name not in _AWK_LONG_KNOWN:
                 return True, None
             i += 2 if name in _AWK_LONG_VALUE and not eq else 1
         elif a.startswith("-") and a != "-":
@@ -708,7 +760,7 @@ def _awk_scan(args: list[str]) -> tuple[bool, str | None]:
             for pos, ch in enumerate(a[1:]):
                 if ch == "l":
                     return True, None
-                if ch in "Fvfei":
+                if ch in _AWK_SHORT_VALUE:
                     step = 1 if a[pos + 2 :] else 2
                     break
             i += step
@@ -1042,7 +1094,7 @@ _LOADER_ENV_VARS = frozenset(
     | {"NODE_PATH", "RUBYLIB", "PYTHONUSERBASE", "GEM_PATH", "LD_AUDIT"}
     | {"R_PROFILE_USER", "R_PROFILE", "R_ENVIRON_USER", "R_ENVIRON", "PHPRC", "PHP_INI_SCAN_DIR"}
     | {"AWKPATH", "AWKLIBPATH", "BUN_OPTIONS", "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE"}
-    | {"PERL5DB", "TCLLIBPATH", "TCL_LIBRARY"}
+    | {"PERL5DB", "TCLLIBPATH", "TCL_LIBRARY", "TK_LIBRARY"}
 )
 _LOADER_ENV_RE = re.compile(r"LUA_(?:INIT|PATH|CPATH)(?:_\d_\d)?")  # LUA_INIT_5_4, LUA_PATH_5_3
 _SAFE_PATH_REFS = frozenset({"$PATH", "${PATH}"})
@@ -1597,7 +1649,10 @@ _XARGS_VALUE = frozenset(
     | {"--max-lines", "--delimiter", "--arg-file", "--eof", "--max-chars", "--process-slot-var"}
 )
 # xargs tails whose work is chosen by stdin (target/task names): never pinnable
-_XARGS_RUNNERS = frozenset({"make", "pixi", "uv", "npm", "yarn", "pnpm", "npx", "bunx", "pnpx"})
+_XARGS_RUNNERS = frozenset(
+    {"make", "pixi", "uv", "npm", "yarn", "pnpm", "npx", "bunx", "pnpx", "go"}
+    | {"awk", "gawk", "mawk", "nawk"}
+)
 _PIXI_VALUE = frozenset(
     {"--manifest-path", "-e", "--environment", "--color", "--pypi-keyring-provider", "--auth-file"}
     | {"--concurrent-solves", "--concurrent-downloads"}
@@ -1678,7 +1733,7 @@ _EXEC_VALUE = frozenset(
 )
 _BUN_VALUE = _BUN_LONG_VALUE | {"-r", "-d", "-l", "-c", "-e", "-p", "--eval", "--print"}
 _BUN_UNPIN = frozenset({"--cwd", "--config", "-c", "--env-file", "--tsconfig-override"})
-_BUN_PASSIVE = _PM_NON_RUN | {"build", "pm", "repl", "upgrade", "completions", "help"}
+_BUN_PASSIVE = (_PM_NON_RUN - {"exec"}) | {"build", "pm", "repl", "upgrade", "completions", "help"}
 # bun/deno options accepted before the subcommand or script; any other one fails closed
 _BUN_FLAGS = frozenset(
     {"--watch", "--hot", "--smol", "--bun", "-b", "--silent", "--no-install", "--prefer-offline"}
@@ -1687,6 +1742,7 @@ _BUN_FLAGS = frozenset(
 )
 _DENO_GLOBAL_FLAGS = frozenset({"-h", "--help", "-V", "--version", "-q", "--quiet", "--no-color"})
 _DENO_GLOBAL_VALUE = frozenset({"-L", "--log-level"})
+_BUN_INLINE = frozenset({"-e", "--eval", "-p", "--print"})
 _BUN_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
 # deno subcommands that do not run a script given on the command line
 _DENO_PASSIVE = frozenset(
@@ -1705,6 +1761,20 @@ _DENO_VALUE = frozenset(
     {"--config", "-c", "--import-map", "--cert", "--location", "--seed", "--ext"}
 )
 _DENO_FILE_FLAGS = frozenset({"--config", "-c", "--import-map"})
+
+
+def _bun_has_inline(args: list[str]) -> bool:
+    """Whether an option before the first positional is an inline-code flag (-e/-p/--eval/--print)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--" or not a.startswith("-") or a == "-":
+            return False
+        name, eq, _ = a.partition("=")
+        if name in _BUN_INLINE:
+            return True
+        i += 2 if name in _BUN_VALUE and not eq else 1
+    return False
 
 
 def _deno_options(args: list[str]) -> tuple[list[str], list[str], bool]:
@@ -1744,7 +1814,7 @@ _DATA_HEADS = frozenset(
 )
 _RUNNER_NAMES = frozenset(
     {"awk", "gawk", "mawk", "nawk", "sed", "make", "pixi", "uv", "npm", "npx", "bunx", "pnpx"}
-    | {"yarn", "pnpm", "find", "xargs", "eval", "source", "."}
+    | {"yarn", "pnpm", "find", "xargs", "eval", "source", ".", "go"}
 )
 
 
@@ -1891,6 +1961,10 @@ class _Analyzer:
         self.scan: _ShellScan | None = None  # its quote-aware scan (words, heredocs)
         # (bases, base_unknown) to restore after a systemd-run unwrap
         self.wd_saved: tuple[list[str], bool] | None = None
+        # awk @include traversal budget, shared by every awk invocation of one analyze():
+        # [files read, bytes read, include names collected]; awk_spent once it is exceeded
+        self.awk_used = [0, 0, 0]
+        self.awk_spent = False
 
     # -- helpers --
     def unpin(self, reason: str) -> None:
@@ -2103,20 +2177,22 @@ class _Analyzer:
             self.unknown_head(base, args, depth)
 
     def awk(self, args: list[str]) -> None:
-        loads, operand = _awk_scan(args)
-        if loads:
-            self.unpin("gawk -l/--load loads a compiled extension that cannot be pinned")
-        files = _prog_files(args, "Fvel")
+        unsafe, operand = _awk_scan(args)
+        if unsafe:
+            self.unpin("awk -l/--load or an unrecognised long option may load code or an extension")
+        # -f FILE, and gawk -E FILE / --exec FILE (a program file too)
+        files = _prog_files(args, _AWK_SHORT_VALUE)
+        files += _prog_files(args, _AWK_SHORT_VALUE, file_flag="E", long_file="--exec")
         for f in files:
             self.add_file(f)
         # gawk -i FILE / --include=FILE: found as given, then with `.awk` appended
-        includes = _prog_files(args, "Fvefl", file_flag="i", long_file="--include")
+        includes = _prog_files(args, _AWK_SHORT_VALUE, file_flag="i", long_file="--include")
         for f in includes:
             if _literal(f):
                 self.pin_inline([f, f + ".awk"])
             else:
                 self.add_file(f)  # unpinnable
-        texts = _prog_files(args, "Fvfil", file_flag="e", long_file="--source")
+        texts = _prog_files(args, _AWK_SHORT_VALUE, file_flag="e", long_file="--source")
         if not files and not texts and operand is not None:
             texts = [operand]
         seen: set[str] = set()
@@ -2126,27 +2202,45 @@ class _Analyzer:
         for text in texts:
             self.awk_follow_text(text, seen, 0)
 
-    def awk_path(self, name: str) -> str | None:
-        """Realpath of the first existing file among `name`, `name.awk` (gawk's @include rule)."""
+    def awk_paths(self, name: str) -> list[str]:
+        """Realpaths of every existing file among `name`, `name.awk` under the cwd and each base."""
+        found: list[str] = []
         for cand in (name, name + ".awk"):
             for path in _ref_paths(ScriptRef(cand, tuple(self.bases)), self.cwd):
-                if os.path.isfile(path):
-                    return path
-        return None
+                if os.path.isfile(path) and path not in found:
+                    found.append(path)
+        return found
+
+    def awk_spend(self, index: int, amount: int, limit: int, what: str) -> bool:
+        """Charge the shared awk budget; False (and unpinned) once `limit` is exceeded."""
+        self.awk_used[index] += amount
+        if self.awk_used[index] > limit:
+            self.awk_spent = True
+            self.unpin(f"awk @include traversal exceeds the {what} budget")
+            return False
+        return True
 
     def awk_follow_file(self, name: str, seen: set[str], depth: int) -> None:
-        path = self.awk_path(name)
-        if path is None or path in seen:
-            return
-        seen.add(path)
-        data = _read_capped(path)
-        if data is None:
-            self.unpin(f"awk source {name} is too large to scan for @include")
-            return
-        self.awk_follow_text(data.decode("utf-8", "replace"), seen, depth)
+        for path in self.awk_paths(name):
+            if self.awk_spent:
+                return
+            if path in seen:
+                continue
+            seen.add(path)
+            if not self.awk_spend(0, 1, MAX_FILES, "file count"):
+                return
+            data = _read_capped(path)
+            if data is None:
+                self.unpin(f"awk source {name} is too large to scan for @include")
+                continue
+            if not self.awk_spend(1, len(data), MAX_TOTAL_BYTES, "byte"):
+                return
+            self.awk_follow_text(data.decode("utf-8", "replace"), seen, depth)
 
     def awk_follow_text(self, text: str, seen: set[str], depth: int) -> None:
         """Pin the files `@include` pulls into awk source `text`, recursively (cycle-safe)."""
+        if self.awk_spent:
+            return
         if depth >= _AWK_INCLUDE_DEPTH:
             self.unpin("awk @include nesting is too deep to pin")
             return
@@ -2154,7 +2248,11 @@ class _Analyzer:
         if not ok:
             self.unpin("awk source loads an extension or has a non-literal @include")
             return
+        if not self.awk_spend(2, len(names), MAX_MISSING_FILES, "include name"):
+            return
         for name in names:
+            if self.awk_spent:
+                return
             if not _literal(name):
                 self.add_file(name)  # unpinnable
                 continue
@@ -2254,7 +2352,10 @@ class _Analyzer:
         if kind != "none" or opts.code:
             self.implicit_refs(spec, opts)
         if heredoc and kind in ("stdin", "stdin!"):
-            self.heredoc_stdin(spec.lang)
+            if spec.opaque_heredoc:  # csh, tclsh, osascript, ...: no scanner for the body
+                self.unpin("heredoc/here-string script of this interpreter cannot be pinned")
+            else:
+                self.heredoc_stdin(spec.lang)
             return
         if kind == "file" and operand is not None:
             self.add_file(operand)
@@ -2363,13 +2464,17 @@ class _Analyzer:
             if not _literal(value):
                 self.add_file(value)  # unpinnable: not a literal path
             elif spec.lang == "lua":  # lua -l NAME: a module found through ./?.lua
-                self.pin_inline_paths([_lua_module_path(value)], "lua")
+                # `-l g=mod` requires mod into the global g
+                self.pin_inline_paths([_lua_module_path(value.rpartition("=")[2])], "lua")
             elif value.startswith(_OPTION_PATH_PREFIXES):
                 self.add_file(self.resolve_local(value, spec.lang) or value)
             elif spec.lang == "node" and not _is_node_builtin(value):
                 self.non_durable(_node_modules_reason("preload", value))
         for value in opts.files:  # php -d auto_prepend_file= / auto_append_file=
-            self.add_file(value)
+            if _SCHEME_RE.match(value):
+                self.unpin(f"php ini file {value!r} is a URL or stream wrapper")
+            else:
+                self.add_file(value)
         for value in opts.configs:  # php -c
             self.config_ref(value)
         if opts.include:
@@ -2398,6 +2503,27 @@ class _Analyzer:
             self.emit(
                 ScriptRef(".", tuple(self.bases), "search", (name,), required=False, script=exists)
             )
+            if exists and name in _IMPLICIT_SCANS:
+                self.scan_implicit(name)
+
+    def scan_implicit(self, name: str) -> None:
+        """Scan the implicit file `name` (cwd and every cd base) for what it loads on its own."""
+        scan = _IMPLICIT_SCANS[name]
+        for real in _ref_paths(ScriptRef(name, tuple(self.bases)), self.cwd):
+            if not os.path.isfile(real):
+                continue
+            if scan == "env":  # ./.Renviron: loader variables are non-durable
+                reasons = _env_file_reasons(real, self.cwd)
+                if reasons is None:
+                    self.unpin(f"{name} is too large to scan for loader variables")
+                    return
+                for reason in reasons:
+                    self.non_durable(f"{reason} ({name})")
+            else:  # ./bunfig.toml: a `preload` key runs files before the script
+                data = _read_capped(real)
+                if data is None or _BUNFIG_PRELOAD_RE.search(data.decode("utf-8", "replace")):
+                    self.unpin(f"{name} preloads files that cannot be pinned")
+                    return
 
     def inline_imports(self, lang: str, code: str, *, expanded: bool = False) -> None:
         """Pin the local files inline code (-c / -e / heredoc) imports; fail closed if unsure.
@@ -2416,7 +2542,7 @@ class _Analyzer:
                 self.pin_inline_paths(_ruby_requires(code), "ruby")
         else:
             operands, dynamic = _LOAD_SCANNERS[lang](code)
-            if dynamic:
+            if dynamic or expanded:  # `expanded`: the shell rewrites the code word
                 self.unpin(f"inline {lang} code loads a file that cannot be resolved statically")
             else:
                 self.pin_inline_paths(operands, lang)
@@ -2753,6 +2879,16 @@ class _Analyzer:
             or self.local_file_exists(operand)
         )
 
+    def bun_run_options_unsafe(self, rest: list[str]) -> bool:
+        """Unpin `bun run` options that change the config/cwd, or are unknown; True if unpinned."""
+        if _split_runner(rest, _BUN_VALUE, _BUN_UNPIN)[2]:
+            self.unpin("bun option changes the config file or working directory")
+        elif _unknown_leading_flag(rest, _BUN_FLAGS, _BUN_VALUE):
+            self.unpin("unrecognised bun option after run")
+        else:
+            return False
+        return True
+
     def bun_args(self, args: list[str], depth: int) -> list[str] | None:
         """bun args to interpret as a script run (`run` dropped); None when handled here.
 
@@ -2767,12 +2903,17 @@ class _Analyzer:
         if _unknown_leading_flag(args, _BUN_FLAGS, _BUN_VALUE):
             self.unpin("unrecognised bun option before the subcommand or script")
             return None
-        if sub is None:
-            return args
+        if sub is None or _bun_has_inline(args):
+            return args  # inline code (-e/-p) is always scanned; a positional is not a subcommand
         if sub == "test":
             self.unpin("bun test runs discovered code that cannot be pinned")
             return None
+        if sub == "exec":
+            self.unpin("bun exec runs a shell command that cannot be pinned")
+            return None
         if sub in _BUN_PASSIVE:
+            return None
+        if sub == "run" and self.bun_run_options_unsafe(rest):
             return None
         if sub == "x":
             self.implicit_refs(_BUN, _Options())

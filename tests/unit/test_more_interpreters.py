@@ -631,3 +631,426 @@ XARGS_BUN_UNPINNABLE = [
 def test_xargs_feeding_bun_is_unpinnable(tmp_path: Path, command: str) -> None:
     _make(tmp_path, ("a.js",))
     _assert_unpinnable(command, tmp_path)
+
+
+# L. PR #111 review round (issue #98); deep config modelling is tracked in #127 ----------
+
+# L1. versioned interpreter heads in the untokenizable-text fallback
+SUSPECT_VERSIONED = [
+    f"{UNTOKENIZABLE} {head} x"
+    for head in ("php8.2", "ruby3.2", "perl5.36", "php", "ruby", "perl", "ruby3.2.2")
+]
+
+
+@pytest.mark.parametrize("command", SUSPECT_VERSIONED)
+def test_untokenizable_text_with_versioned_interpreter_is_unpinnable(
+    tmp_path: Path, command: str
+) -> None:
+    _assert_unpinnable(command, tmp_path)
+
+
+# L2. php long options: only a short allowlist of harmless ones keeps a command pinned
+PHP_LONG_UNPINNABLE = [
+    "php --define auto_prepend_file=./p.php x.php",
+    "php --define=auto_prepend_file=./p.php x.php",
+    "php --zend-extension=./z.so x.php",
+    "php --zend-extension ./z.so x.php",
+    "php --extension=./e.so x.php",
+    "php --extension ./e.so x.php",
+    "php --unknown-option x.php",
+    "php -f x.php --define=auto_prepend_file=./p.php",
+]
+
+
+@pytest.mark.parametrize("command", PHP_LONG_UNPINNABLE)
+def test_php_unknown_long_option_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.php", "p.php"))
+    _assert_unpinnable(command, tmp_path)
+
+
+@pytest.mark.parametrize("command", ["php --version", "php --help", "php --ini", "php --info"])
+def test_php_harmless_long_option_stays_unchanged(tmp_path: Path, command: str) -> None:
+    _assert_unchanged(command, "true", tmp_path)
+
+
+# L3. php keeps parsing options after `-r CODE` / `-f FILE`
+def test_php_option_after_inline_code_is_collected(tmp_path: Path) -> None:
+    _make(tmp_path, ("p.php",))
+    _assert_pinned("php -r 'echo 1;' -d auto_prepend_file=./p.php", tmp_path, ("p.php",))
+
+
+def test_php_option_after_file_flag_is_collected(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.php", "p.php"))
+    _assert_pinned("php -f x.php -d auto_prepend_file=./p.php", tmp_path, ("x.php", "p.php"))
+    _assert_pinned("php -F x.php -d auto_prepend_file=./p.php", tmp_path, ("x.php", "p.php"))
+
+
+PHP_TRAILING_UNPINNABLE = [
+    "php -f x.php -d extension=./e.so",
+    "php -r 'echo 1;' -d zend_extension=./z.so",
+    "php -r 'echo 1;' -z ./z.so",
+    "php -F x.php -z ./z.so",
+]
+
+
+@pytest.mark.parametrize("command", PHP_TRAILING_UNPINNABLE)
+def test_php_trailing_loader_flag_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.php",))
+    _assert_unpinnable(command, tmp_path)
+
+
+def test_php_script_arguments_are_not_options(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.php",))
+    _assert_pinned("php x.php --define=auto_prepend_file=./p.php", tmp_path, ("x.php",))
+
+
+# L4. luajit -j / -O load code
+LUAJIT_UNPINNABLE = [
+    "luajit -j off x.lua",
+    "luajit -jdump x.lua",
+    "luajit -O3 x.lua",
+    "luajit -Ofoldl x.lua",
+    "luajit -e 'print(1)' -j off x.lua",
+]
+
+
+@pytest.mark.parametrize("command", LUAJIT_UNPINNABLE)
+def test_luajit_jit_and_opt_flags_are_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.lua",))
+    _assert_unpinnable(command, tmp_path)
+
+
+def test_luajit_plain_script_stays_pinned(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.lua",))
+    _assert_pinned("luajit x.lua", tmp_path, ("x.lua",))
+
+
+# L5. R: ./.Renviron is scanned for loader variables
+@pytest.mark.parametrize("var", ["R_PROFILE_USER", "R_ENVIRON_USER", "R_LIBS_USER", "R_LIBS"])
+def test_renviron_loader_variable_is_non_durable(tmp_path: Path, var: str) -> None:
+    _make(tmp_path, ("x.R",))
+    _write(tmp_path, ".Renviron", f"{var}=./evil\n")
+    _assert_non_durable("Rscript x.R", tmp_path, ("x.R", ".Renviron"))
+
+
+def test_renviron_loader_variable_in_cd_base_is_non_durable(tmp_path: Path) -> None:
+    _make(tmp_path, ("z/x.R",))
+    _write(tmp_path, "z/.Renviron", "export R_PROFILE_USER=./evil\n")
+    _assert_non_durable("cd z && Rscript x.R", tmp_path, ("z/x.R", "z/.Renviron"))
+
+
+def test_renviron_without_loader_variable_stays_durable(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.R",))
+    _write(tmp_path, ".Renviron", "MY_SETTING=1\n")
+    _assert_pinned("Rscript x.R", tmp_path, ("x.R", ".Renviron"))
+    assert _plan("Rscript x.R", tmp_path).non_durable == []
+
+
+def test_renviron_loader_variable_ignored_with_vanilla(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.R",))
+    _write(tmp_path, ".Renviron", "R_PROFILE_USER=./evil\n")
+    assert _plan("Rscript --vanilla x.R", tmp_path).non_durable == []
+
+
+# L6. bun: a `preload` key in the pinned bunfig.toml
+@pytest.mark.parametrize(
+    "bunfig", ['preload = ["./p.ts"]\n', "[test]\npreload = './p.ts'\n", 'PRELOAD="./p.ts"\n']
+)
+@pytest.mark.parametrize("command", ["bun x.ts", "bun run x.ts", "bun run build", "bun x cowsay"])
+def test_bunfig_preload_is_unpinnable(tmp_path: Path, command: str, bunfig: str) -> None:
+    _make(tmp_path, ("x.ts", "p.ts"))
+    (tmp_path / "package.json").write_text('{"scripts": {"build": "echo hi"}}')
+    _write(tmp_path, "bunfig.toml", bunfig)
+    _assert_unpinnable(command, tmp_path)
+
+
+def test_bunfig_without_preload_stays_pinned(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.ts",))
+    _write(tmp_path, "bunfig.toml", "[install]\nregistry = 'https://r.example'\n")
+    _assert_pinned("bun x.ts", tmp_path, ("x.ts", "bunfig.toml"))
+
+
+# L7. literal native-library loads
+NATIVE_LOADS = [
+    "lua -e \"package.loadlib('./x.so', 'luaopen_x')\"",
+    "lua -e \"local f = package.loadlib('./x.so', '*')\"",
+    "Rscript -e \"dyn.load('./x.so')\"",
+    "Rscript -e \"library.dynam('x', 'x', '.')\"",
+    "php -r \"dl('x.so');\"",
+]
+
+
+@pytest.mark.parametrize("command", NATIVE_LOADS)
+def test_literal_native_library_load_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _assert_unpinnable(command, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command", ["php -r \"echo 'idl(1)';\"", "lua -e \"print('loadlib')\"", "Rscript -e 'print(1)'"]
+)
+def test_inline_code_without_native_load_stays_unchanged(tmp_path: Path, command: str) -> None:
+    assert _plan(command, tmp_path).unpinnable is False, command
+
+
+# L8. a lua `require` name containing `=` is not a `g=mod` pair
+def test_lua_require_name_with_equals_is_unpinnable(tmp_path: Path) -> None:
+    _make(tmp_path, ("m.lua",))
+    _assert_unpinnable("lua -e \"require 'g=m'\"", tmp_path)
+    _assert_unpinnable("lua -e \"require('a=b')\"", tmp_path)
+
+
+def test_lua_l_flag_still_splits_global_name(tmp_path: Path) -> None:
+    _make(tmp_path, ("m.lua", "x.lua"))
+    _assert_pinned("lua -l g=m x.lua", tmp_path, ("m.lua", "x.lua"))
+
+
+# L9. gawk long options: only the exact full spellings
+GAWK_LONG_UNPINNABLE = [
+    "gawk --loa=./ext -f x.awk",
+    "gawk --incl=lib.awk -f x.awk",
+    "gawk --incl lib.awk -f x.awk",
+    "gawk --lo ./ext -f x.awk",
+    "gawk --unknown -f x.awk",
+    "gawk --load=./ext -f x.awk",
+]
+
+
+@pytest.mark.parametrize("command", GAWK_LONG_UNPINNABLE)
+def test_gawk_unknown_or_abbreviated_long_option_is_unpinnable(
+    tmp_path: Path, command: str
+) -> None:
+    _make(tmp_path, ("x.awk", "lib.awk"))
+    _assert_unpinnable(command, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command", ["gawk --posix -f x.awk", "gawk --file=x.awk", "gawk --field-separator=: -f x.awk"]
+)
+def test_gawk_known_long_options_stay_pinned(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.awk",))
+    _assert_pinned(command, tmp_path, ("x.awk",))
+
+
+# L10. more loader variables
+def test_tk_library_env_is_non_durable(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.tcl",))
+    _assert_non_durable("TK_LIBRARY=./l wish x.tcl", tmp_path, ("x.tcl",))
+
+
+# L11. xargs / launchers around go and awk
+XARGS_GO_AWK = [
+    "printf 'a\\n' | xargs go build",
+    "printf 'a\\n' | xargs go test",
+    "printf 'a\\n' | xargs awk '{print}'",
+    "printf 'a\\n' | xargs gawk '{print}'",
+    "printf 'a\\n' | xargs mawk '{print}'",
+    "printf 'a\\n' | xargs nawk '{print}'",
+]
+
+
+@pytest.mark.parametrize("command", XARGS_GO_AWK)
+def test_xargs_feeding_go_or_awk_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _assert_unpinnable(command, tmp_path)
+
+
+@pytest.mark.parametrize("command", ["watch go test ./...", "ssh host go version"])
+def test_launcher_naming_go_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _assert_unpinnable(command, tmp_path)
+
+
+# L12. quoted heredoc bodies for interpreters without a scanner
+OPAQUE_HEREDOC = [
+    "csh <<'EOF'\necho hi\nEOF",
+    "tcsh <<'EOF'\necho hi\nEOF",
+    "tclsh <<'EOF'\nputs hi\nEOF",
+    "wish <<'EOF'\nputs hi\nEOF",
+    "osascript <<'EOF'\nsay \"hi\"\nEOF",
+]
+
+
+@pytest.mark.parametrize("command", OPAQUE_HEREDOC)
+def test_opaque_interpreter_heredoc_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _assert_unpinnable(command, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "perl <<'EOF'\nprint 1;\nEOF",
+        "python3 <<'EOF'\nprint(1)\nEOF",
+        "node <<'EOF'\nconsole.log(1)\nEOF",
+        "ruby <<'EOF'\nputs 1\nEOF",
+        "awk -f /dev/stdin <<'EOF'\nBEGIN { print 1 }\nEOF",
+    ],
+)
+def test_scanned_language_heredoc_behaviour_is_unchanged(tmp_path: Path, command: str) -> None:
+    assert _plan(command, tmp_path).unpinnable is False, command
+
+
+# L13. shell expansion inside lua / R / php inline code
+EXPANDED_INLINE = [
+    "lua -e \"print('$HOME'); require 'x'\"",
+    "Rscript -e \"x <- '$HOME'; source('x.R')\"",
+    "php -r \"echo '$HOME'; require 'x.php';\"",
+]
+
+
+@pytest.mark.parametrize("command", EXPANDED_INLINE)
+def test_expanded_inline_code_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.lua", "x.R", "x.php"))
+    _assert_unpinnable(command, tmp_path)
+
+
+def test_single_quoted_inline_code_with_dollar_stays_pinned(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.lua",))
+    _assert_pinned('lua -e \'print("$HOME"); require "x"\'', tmp_path, ("x.lua",))
+
+
+# L14. URL / stream wrapper operands of R source and php include/require
+SCHEME_LOADS = [
+    "Rscript -e \"source('http://example.com/x.R')\"",
+    "Rscript -e \"source('https://example.com/x.R')\"",
+    "Rscript -e \"source('file:///tmp/x.R')\"",
+    "Rscript -e \"source('ftp://example.com/x.R')\"",
+    "php -r \"include 'http://example.com/x.php';\"",
+    "php -r \"require 'phar:///tmp/x.phar/a.php';\"",
+    "php -r \"require_once 'data://text/plain,x';\"",
+    "php -r \"include 'php://stdin';\"",
+    "php -r \"include 'ftp://example.com/x.php';\"",
+    "php -r \"include 'file:///tmp/x.php';\"",
+    "php -d auto_prepend_file=data://text/plain,x x.php",
+    "php -d auto_prepend_file=http://example.com/p.php x.php",
+]
+
+
+@pytest.mark.parametrize("command", SCHEME_LOADS)
+def test_url_or_stream_wrapper_load_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.php",))
+    _assert_unpinnable(command, tmp_path)
+
+
+def test_colon_in_relative_path_is_not_a_scheme(tmp_path: Path) -> None:
+    _make(tmp_path, ("a:b.php", "a:b.R"))
+    _assert_pinned("php -r \"include './a:b.php';\"", tmp_path, ("a:b.php",))
+    _assert_pinned("Rscript -e \"source('./a:b.R')\"", tmp_path, ("a:b.R",))
+    assert not _plan("php -r \"include '/tmp/a:b.php';\"", tmp_path).unpinnable
+    assert not _plan("php -r \"include 'C:/x.php';\"", tmp_path).unpinnable
+
+
+# L15. bun: inline code is always scanned, whatever follows it
+def test_bun_inline_code_followed_by_positional_is_scanned(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.js",))
+    _assert_unpinnable('bun -e "require(foo)" build', tmp_path)
+    _assert_unpinnable('bun --eval "require(foo)" install', tmp_path)
+    _assert_unpinnable('bun -p "require(foo)" pm', tmp_path)
+    _assert_pinned("bun -e \"require('./x.js')\" build", tmp_path, ("x.js",))
+    _assert_pinned("bun --print=\"require('./x.js')\" help", tmp_path, ("x.js",))
+
+
+# L16. bun exec
+@pytest.mark.parametrize("command", ["bun exec ls", "bun exec 'echo hi'", "bun exec ./x.sh"])
+def test_bun_exec_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.sh",))
+    _assert_unpinnable(command, tmp_path)
+
+
+# L17. bun: options after `run` fail closed like the ones before it
+BUN_RUN_OPTIONS_UNPINNABLE = [
+    "bun run --cwd ./other x.ts",
+    "bun run --config ./c.toml x.ts",
+    "bun run --env-file ./e x.ts",
+    "bun run --tsconfig-override ./t.json x.ts",
+    "bun run --unknown x.ts",
+    "bun run --filter pkg build",
+]
+
+
+@pytest.mark.parametrize("command", BUN_RUN_OPTIONS_UNPINNABLE)
+def test_bun_run_unknown_or_dir_changing_option_is_unpinnable(tmp_path: Path, command: str) -> None:
+    _make(tmp_path, ("x.ts", "other/x.ts"))
+    _assert_unpinnable(command, tmp_path)
+
+
+def test_bun_run_known_flag_stays_pinned(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.ts",))
+    _assert_pinned("bun run --silent x.ts", tmp_path, ("x.ts",))
+
+
+# L18. awk @include traversal budget (shared by every awk invocation of a command)
+def _fan_out(tmp_path: Path, main: str, count: int, prefix: str = "l") -> None:
+    _write(tmp_path, main, "".join(f'@include "{prefix}{i}.awk"\n' for i in range(count)))
+    _make(tmp_path, tuple(f"{prefix}{i}.awk" for i in range(count)))
+
+
+def test_awk_include_fan_out_over_file_budget_is_unpinnable(tmp_path: Path) -> None:
+    _fan_out(tmp_path, "main.awk", script_pin.MAX_FILES + 8)
+    _assert_unpinnable("gawk -f main.awk", tmp_path)
+
+
+def test_awk_include_fan_out_within_budget_is_pinned(tmp_path: Path) -> None:
+    _fan_out(tmp_path, "main.awk", 10)
+    _assert_pinned("gawk -f main.awk", tmp_path, ("main.awk", "l0.awk", "l9.awk"))
+
+
+def test_awk_include_budget_is_shared_across_invocations(tmp_path: Path) -> None:
+    half = script_pin.MAX_FILES // 2 + 4
+    _fan_out(tmp_path, "a.awk", half, "a")
+    _fan_out(tmp_path, "b.awk", half, "b")
+    _assert_pinned("gawk -f a.awk", tmp_path, ("a.awk",))
+    _assert_pinned("gawk -f b.awk", tmp_path, ("b.awk",))
+    _assert_unpinnable("gawk -f a.awk; gawk -f b.awk", tmp_path)
+
+
+def test_awk_include_name_count_over_budget_is_unpinnable(tmp_path: Path) -> None:
+    count = script_pin.MAX_MISSING_FILES + 20
+    _write(tmp_path, "main.awk", "".join(f'@include "m{i}.awk"\n' for i in range(count)))
+    _assert_unpinnable("gawk -f main.awk", tmp_path)
+
+
+def test_awk_include_byte_budget_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(script_pin, "MAX_TOTAL_BYTES", 100)
+    pad = "# " + "x" * 80 + "\n"
+    _write(tmp_path, "main.awk", '@include "a.awk"\n@include "b.awk"\n')
+    _write(tmp_path, "a.awk", pad)
+    _write(tmp_path, "b.awk", pad)
+    assert _plan("gawk -f main.awk", tmp_path).unpinnable is True
+
+
+# L19. awk_path follows every existing candidate under every base
+def test_awk_follows_every_base_candidate(tmp_path: Path) -> None:
+    _write(tmp_path, "main.awk", "BEGIN { print 1 }\n")
+    _write(tmp_path, "z/main.awk", '@include "inner.awk"\n')
+    _write(tmp_path, "z/inner.awk", '@include "deep.awk"\n')
+    _make(tmp_path, ("z/deep.awk",))
+    _assert_pinned(
+        "cd z && gawk -f main.awk", tmp_path, ("z/main.awk", "z/inner.awk", "z/deep.awk")
+    )
+
+
+def test_awk_load_in_shadowed_base_candidate_is_unpinnable(tmp_path: Path) -> None:
+    _write(tmp_path, "main.awk", "BEGIN { print 1 }\n")
+    _write(tmp_path, "z/main.awk", '@load "ext"\n')
+    _assert_unpinnable("cd z && gawk -f main.awk", tmp_path)
+
+
+# L20. gawk -E FILE / --exec=FILE / --exec FILE are program files
+@pytest.mark.parametrize("command", ["gawk -E x.awk", "gawk --exec=x.awk", "gawk --exec x.awk"])
+def test_gawk_exec_file_is_pinned_and_followed(tmp_path: Path, command: str) -> None:
+    _write(tmp_path, "x.awk", '@include "lib.awk"\n')
+    _write(tmp_path, "lib.awk", '@include "inner.awk"\n')
+    _make(tmp_path, ("inner.awk",))
+    _assert_pinned(command, tmp_path, ("x.awk", "lib.awk", "inner.awk"))
+
+
+def test_gawk_exec_file_with_load_is_unpinnable(tmp_path: Path) -> None:
+    _write(tmp_path, "x.awk", '@load "ext"\n')
+    _assert_unpinnable("gawk -E x.awk", tmp_path)
+
+
+def test_gawk_include_flag_value_is_not_a_program_file(tmp_path: Path) -> None:
+    _make(tmp_path, ("x.awk", "lib.awk"))
+    plan = _plan("gawk -i lib.awk -f x.awk", tmp_path)
+    assert plan.unpinnable is False
+    assert {r.operand for r in plan.refs if r.script} == {"x.awk", "lib.awk"}

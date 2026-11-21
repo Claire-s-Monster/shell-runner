@@ -456,20 +456,33 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   `--no-init-file`, `./.Renviron` unless `--vanilla`/`--no-environ`), `php` (`-r` literal
   `require`/`include`, `-d auto_prepend_file=`/`auto_append_file=` with spaces/quotes
   normalised, `-c`), `gawk -i`/`--include` and `@include "file"` (followed recursively in
-  `-f` files and `-e`/`--source` text, cycle-safe, depth 16, whole files only), `bun` (file,
-  `bun run FILE`, `-e`, `--preload`, `./bunfig.toml` on every path; `bun run NAME` pins
-  `package.json`), `deno run FILE` / `deno eval` / `deno run -` heredocs (`--config`,
-  `--import-map` pinned). Fail closed: `go run`, `go generate`, test runners (`deno test`/
-  `bench`, `bun test`), `deno task` and other deno subcommands that run code, remote deno
-  specifiers, any flag before a deno/bun subcommand or script outside a known-flag
-  allowlist, `gawk -l`/`@load`, `php -d extension=`/`zend_extension=`/`-z`, and search-path
-  changes in inline code (lua `package.path`/`cpath`, php `set_include_path`/`ini_set
-  include_path`, R `.libPaths`, `parse(file)`, `do.call(source)`). Non-durable: `LUA_*`,
-  `R_PROFILE*`, `R_ENVIRON*`, `R_LIBS*`, `PHPRC`, `PHP_INI_SCAN_DIR`, `php -d include_path`,
-  `AWKPATH`, `AWKLIBPATH`, `BUN_OPTIONS`, `PERL5DB`, `TCLLIBPATH`, `TCL_LIBRARY`. Not covered:
-  `go test` (pending a decision; currently not pinned), `npx`/`bunx <pkg>` package code,
-  `$HOME` startup files (`~/.cshrc`, `~/.Rprofile`), and dynamic loading the literal scans
-  cannot see.
+  `-f`/`-E`/`--exec` files and `-e`/`--source` text, cycle-safe, depth 16, whole files only;
+  one traversal budget per command across all awk calls: 32 files, 64 MiB, 256 include names,
+  over it the command is unpinnable), `bun` (file, `bun run FILE`, `-e`, `--preload`,
+  `./bunfig.toml` on every path; `bun run NAME` pins `package.json`), `deno run FILE` /
+  `deno eval` / `deno run -` heredocs (`--config`, `--import-map` pinned). Fail closed:
+  `go run`, `go generate`, test runners (`deno test`/`bench`, `bun test`), `bun exec`, a
+  `preload` key in the pinned `bunfig.toml`, `deno task` and other deno subcommands that run
+  code, remote deno specifiers, any flag before a deno/bun subcommand or script, and any
+  flag after `bun run`, outside a known-flag allowlist, `gawk -l`/`@load` and any gawk long
+  option outside the exact known full spellings (abbreviations such as `--loa=` are
+  refused), `php -d extension=`/`zend_extension=`/`-z` and any php `--long` option other
+  than `--version`/`--help`/`--info`/`--modules`/`--ini` (php keeps parsing options after
+  `-r CODE` / `-f FILE`, so trailing ones are checked too), `luajit -j`/`-O`, here-doc /
+  here-string scripts for `csh`/`tcsh`/`tclsh`/`wish`/`osascript`, `xargs` or a launcher
+  (`watch`, `ssh`, ...) around `go` or an awk, inline lua/R/php code containing shell
+  expansion, and R `source` / php `include`/`require`/`auto_prepend_file` operands that are
+  URLs or stream wrappers (`http:`, `phar:`, `data:`, `php:`, `file:`, ...), and inline code
+  that loads a native library (lua `package.loadlib`, R `dyn.load`/`library.dynam`, php
+  `dl`), a lua `require` name containing `=`, and search-path changes in inline code (lua
+  `package.path`/`cpath`, php `set_include_path`/`ini_set include_path`, R `.libPaths`,
+  `parse(file)`, `do.call(source)`). Non-durable: `LUA_*`, `R_PROFILE*`, `R_ENVIRON*`,
+  `R_LIBS*` (also when set in a pinned `./.Renviron`), `PHPRC`, `PHP_INI_SCAN_DIR`,
+  `php -d include_path`, `AWKPATH`, `AWKLIBPATH`, `BUN_OPTIONS`, `PERL5DB`, `TCLLIBPATH`,
+  `TCL_LIBRARY`, `TK_LIBRARY`. Not covered: `go test` (pending a decision; currently not
+  pinned), `npx`/`bunx <pkg>` package code, `$HOME` startup files (`~/.cshrc`,
+  `~/.Rprofile`), and dynamic loading the literal scans cannot see; deep config modelling
+  (`bunfig.toml`, `.Renviron`, php.ini contents beyond the checks above) is tracked in #127.
 - Per command at most 32 files / 64 MiB are hashed; only regular files are hashed
   (directories, FIFOs and devices are unreadable and refused at approval time).
 
