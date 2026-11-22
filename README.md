@@ -394,6 +394,42 @@ file burns the approval and issues a fresh prompt. Such commands are never promo
   are refused).
 - **`pixi`**: an unrecognised option before the subcommand (`pixi -C dir run x`) is
   unpinnable rather than misparsed.
+- **`uv`/`npm`/`yarn`/`pnpm`** now fail closed on unrecognised flags before the script name
+  (global and after `run`), like pixi. Flags that change the shell, node binary or config file
+  are refused: `--script-shell`, `--shell-mode`, `--node-options`, `--userconfig`,
+  `--use-yarnrc`, `--config.*`.
+  - **npm** also parses flags after the script name (`npm run build --script-shell=./x`,
+    `npm test --userconfig=./rc`), so every flag between the script name and `--` is
+    checked against a small allowlist of harmless ones (`--silent`, `--if-present`,
+    `--loglevel`, ...); anything else is unpinnable. Arguments after `--` go to the
+    script and are not inspected. yarn and pnpm pass trailing arguments to the script and
+    are unchanged. `--X=false` is accepted when `--X` is allowlisted (`--audit=false`,
+    `--fund=false`); `--no-progress` and `--no-update-notifier` are allowed.
+  - **Whole-workspace selection.** npm `-ws`/`--workspaces`/`--include-workspace-root` before
+    the script run it in every workspace and are unpinnable (`--workspaces=false` is fine).
+    pnpm `-r`/`--recursive` and `yarn workspaces ...` (`foreach`, `run`) are unpinnable.
+  - **Workspaces and prefix.** npm `-w`/`--workspace DIR` (anywhere before `--`), pnpm
+    `--filter`/`-F DIR` and `yarn workspace DIR ...` pin `<cwd>/<DIR>/package.json` in
+    addition to the upward `package.json`; a value that is not a directory with a
+    `package.json` is unpinnable. Name-based selectors (`npm -w <name>` when the name is not
+    a directory, `pnpm --filter <name>`, `yarn workspace <name>`) are therefore refused:
+    workspace names are not resolved to directories. npm `--prefix DIR` pins the manifest
+    by a search in DIR (instead of the upward search) and also requires `DIR/package.json`
+    to exist.
+  - **uv path-valued options.** `--python`/`-p` and `--with` whose value looks like a path
+    (contains `/`, or starts with `.` or `~`) pin that file; a directory or missing path is
+    unpinnable. `--find-links`/`-f` and `--with-editable` treat any value as a path.
+    `--with` also does so for a value ending in `.whl`, `.tar.gz` or `.zip`, or naming an
+    existing entry in the working directory. `--with-requirements`, `-c`/`--constraints`,
+    `-b`/`--build-constraints`, `--overrides` and `--config-file` always name a file: it is
+    pinned (unpinnable if missing). Versions and package names that do not exist on disk
+    (`3.12`, `requests`) are unchanged. `uv run -m MOD` / `--module MOD` is treated as
+    `python -m MOD` (the local module is pinned). `uv run` also pins a `uv.toml` that sits
+    next to the `pyproject.toml` it finds, and the `uv.toml` of a `--directory`/`--project`
+    directory. Also allowed: `--no-install-project`, `--no-install-workspace`,
+    `--no-install-package PKG`, `--no-sources`, `--inexact`, `--verify-hashes`.
+  - Not yet pinned (tracked separately): `uvx`, `uv tool run`, `uv pip`, `uv sync`,
+    `uv build`.
 - **Not a boundary.** The security boundary is the approval itself plus the systemd
   sandbox (see above). Pinning narrows the approve/execute gap; it does not contain
   what an approved script does.
