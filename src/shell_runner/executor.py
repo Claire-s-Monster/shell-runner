@@ -436,7 +436,7 @@ def execute(
     timed_out = False
 
     try:
-        proc = subprocess.Popen(  # noqa: S603
+        proc = subprocess.Popen(  # noqa: S603  # codeql[py/path-injection]
             ["/bin/bash", "-c", command],
             cwd=str(resolved),
             env=env,
