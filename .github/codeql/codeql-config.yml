@@ -1,10 +1,11 @@
 ---
 name: "shell-runner CodeQL config"
 
-# Default query suite. Loaded by .github/workflows/codeql.yml.
+# Default query suite. Data for a ci-framework CodeQL job to consume (shell-runner#129).
 #
-# The model pack in .github/codeql/extensions/ (picked up automatically by the
-# CodeQL action) declares the script_pin path gate a py/path-injection barrier.
+# The model pack in .github/codeql/models/ declares the script_pin path gate a
+# py/path-injection barrier. It is a data extension pack (qlpack.yml with
+# extensionTargets codeql/python-all); the consuming job must load it.
 #
 # executor.py: the sandboxed executor accepts a client-provided cwd on purpose
 # (realpath + exists + is_dir checks before subprocess execution). That is handled
