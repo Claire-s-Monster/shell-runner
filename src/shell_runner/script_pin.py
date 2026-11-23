@@ -26,6 +26,7 @@ file afterwards; a swap in that window is not detected.
 from __future__ import annotations
 
 import ast
+import errno
 import hashlib
 import json
 import os
@@ -727,12 +728,12 @@ def _dotenv_assignment(line: str) -> str | None:
 
 
 def _path_stat(path: str) -> os.stat_result | None:
-    """The one gate every path named by a pinned command passes before it is probed or read.
+    """The gate for metadata probes of a path named by a pinned command (reads: _open_regular).
 
     The path comes from the command being pinned, on purpose (script_pin hashes and scans
     the files a command would run). It is normalised here (`..` and symlinks resolved,
-    embedded NUL refused) and only ever stat'ed, hashed or scanned: never executed or
-    written. Reads on top of this apply the size caps (`_read_capped`, `_file_sha256`).
+    embedded NUL refused) and only ever stat'ed: never opened, executed or written. The
+    answer is advisory (a probe for candidates); every read re-checks on its own fd.
     None when it cannot be stat'ed (absent, a NUL byte, a loop, no permission).
     """
     try:
@@ -769,13 +770,41 @@ def _is_dotenv_name(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
+class _NotRegularError(OSError):
+    """The opened object is not a regular file (directory, FIFO, device, socket)."""
+
+
+def _open_regular(path: str) -> tuple[int, os.stat_result]:
+    """The one gate every read of a command-named path goes through: (fd, fstat of that fd).
+
+    The path comes from the command being pinned, on purpose. It is normalised (`..` and
+    symlinks resolved, NUL refused with ValueError), opened read-only and non-blocking
+    without following a final symlink (O_NOFOLLOW), and the regular-file check runs with
+    fstat on the descriptor that is then read, so a swap between check and read cannot
+    redirect the read to a different object. Never written or executed. Raises OSError
+    (_NotRegularError for a non-regular file); the caller owns the returned fd.
+    """
+    real = os.path.realpath(os.path.abspath(path))
+    fd = os.open(real, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _NotRegularError(errno.EINVAL, "not a regular file", real)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st
+
+
 def _read_capped(path: str) -> bytes | None:
     """The whole file `path` (b"" when it is not a readable regular file), None when it is
     over the scan cap: a file is never scanned in part."""
-    if not _is_regular(path):
+    try:
+        fd, _ = _open_regular(path)
+    except (OSError, ValueError):
         return b""
     try:
-        with open(os.path.realpath(os.path.abspath(path)), "rb") as fh:
+        with os.fdopen(fd, "rb") as fh:
             data = fh.read(_ENV_FILE_MAX + 1)
     except OSError:
         return b""
@@ -3413,22 +3442,13 @@ def _file_sha256(path: str, budget: list[int]) -> str:
     `budget` is the remaining total bytes for the command; going over it gives _OVER_BUDGET.
     """
     try:
-        st = os.stat(path)
+        fd, opened = _open_regular(path)
     except (FileNotFoundError, NotADirectoryError):
         return MISSING
     except (OSError, ValueError):  # ValueError: embedded NUL
         return UNREADABLE
-    if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SCRIPT_BYTES:
-        return UNREADABLE
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-    except (FileNotFoundError, NotADirectoryError):
-        return MISSING
-    except OSError:
-        return UNREADABLE
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size > MAX_SCRIPT_BYTES:
+        if opened.st_size > MAX_SCRIPT_BYTES:
             return UNREADABLE
         budget[0] -= opened.st_size
         if budget[0] < 0:

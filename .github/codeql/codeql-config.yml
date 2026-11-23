@@ -1,13 +1,20 @@
 ---
 name: "shell-runner CodeQL config"
 
-# Default query suite. Data for a ci-framework CodeQL job to consume (shell-runner#129).
+# Pass to github/codeql-action/init as `config-file: ./.github/codeql/codeql-config.yml`.
+# The ci-framework sast-codeql job (reusable-ci.yml) has no such input yet, so until it
+# gains one this file is not consumed by CI (shell-runner#129).
 #
-# The model pack in .github/codeql/models/ declares the script_pin path gate a
-# py/path-injection barrier. It is a data extension pack (qlpack.yml with
-# extensionTargets codeql/python-all); the consuming job must load it.
-#
-# executor.py: the sandboxed executor accepts a client-provided cwd on purpose
-# (realpath + exists + is_dir checks before subprocess execution). That is handled
-# by inline `# codeql[py/path-injection]` suppressions at the call site. A
-# query-filters exclude cannot be scoped by path, so none is configured here.
+# The local suite is the default Python code-scanning suite with py/path-injection swapped
+# for .github/codeql/queries/PathInjection.ql, which adds ShellRunnerGates.qll: a barrier on
+# the path parameter of script_pin._path_stat and script_pin._open_regular only (read-only,
+# regular-file-only gates). Default queries are disabled because the suite already
+# contains them.
+disable-default-queries: true
+queries:
+  - uses: ./.github/codeql/queries/shell-runner.qls
+
+# executor.py: the sandboxed executor accepts a client-provided cwd on purpose (confined to
+# the configured roots by resolve_cwd). The alerts are reported at the `resolved.exists()` /
+# `resolved.is_dir()` calls in resolve_cwd, so the inline `# codeql[py/path-injection]`
+# suppressions sit on those lines. A query-filters exclude cannot be scoped by path.

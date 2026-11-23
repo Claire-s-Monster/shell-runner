@@ -317,9 +317,9 @@ def resolve_cwd(cwd: str) -> tuple[Path | None, str | None]:
     if not any(resolved.is_relative_to(r) for r in current_roots):
         sorted_roots = sorted(str(r) for r in current_roots)
         return None, f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"
-    if not resolved.exists():
+    if not resolved.exists():  # codeql[py/path-injection]
         return None, f"cwd does not exist: {cwd}"
-    if not resolved.is_dir():
+    if not resolved.is_dir():  # codeql[py/path-injection]
         return None, f"cwd is not a directory: {cwd}"
     return resolved, None
 
@@ -436,7 +436,7 @@ def execute(
     timed_out = False
 
     try:
-        proc = subprocess.Popen(  # noqa: S603  # codeql[py/path-injection]
+        proc = subprocess.Popen(  # noqa: S603
             ["/bin/bash", "-c", command],
             cwd=str(resolved),
             env=env,

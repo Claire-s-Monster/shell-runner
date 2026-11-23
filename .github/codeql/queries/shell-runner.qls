@@ -1,0 +1,8 @@
+---
+# Default Python code-scanning suite, with the stock py/path-injection query replaced by
+# the local one (PathInjection.ql) that knows script_pin's read gates.
+- import: codeql-suites/python-code-scanning.qls
+  from: codeql/python-queries
+- exclude:
+    query path: Security/CWE-022/PathInjection.ql
+- query: PathInjection.ql
