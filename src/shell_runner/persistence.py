@@ -1259,23 +1259,24 @@ class Persistence:
                 "script_sha256": row["script_sha256"],
             }
 
-    def restore_approval(self, prompt_id: str) -> bool:
+    def restore_approval(self, prompt_id: str, *, detach_only: bool = True) -> bool:
         """Un-consume a prompt (clear consumed_at) when its approved run never started.
 
-        Only used when a detach cap recheck refuses after the approval was consumed,
-        so it only touches a consumed detach prompt. Returns whether a row changed.
+        Used when a detach cap recheck refuses after the approval was consumed (default:
+        only a consumed detach prompt is touched), and, with ``detach_only=False``, when
+        the execution-time classify recheck times out. Returns whether a row changed.
         Expiry still applies, so this never extends an approval's lifetime.
         """
         with self._write_conn() as conn:
             cur = conn.execute(
                 "UPDATE pending_prompts SET consumed_at = NULL"
-                " WHERE id = ? AND consumed_at IS NOT NULL AND detach = 1"
+                " WHERE id = ? AND consumed_at IS NOT NULL AND (detach = 1 OR ? = 0)"
                 # A deny recorded while the prompt was closed leaves approve_decision
                 # untouched, so the history is the only record of it. A live deny
                 # already nulls approve_token, so restoring after it is harmless.
                 " AND NOT EXISTS (SELECT 1 FROM prompt_decisions WHERE prompt_id = ?"
                 " AND effective_decision = 'deny' AND prompt_state <> 'live')",
-                (prompt_id, prompt_id),
+                (prompt_id, int(detach_only), prompt_id),
             )
             return cur.rowcount > 0
 

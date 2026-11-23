@@ -242,6 +242,12 @@ class HealthResponse(BaseModel):
     pending_prompts: int
     sandbox: Literal["enforced", "absent", "disabled"]
     last_error: str | None = None
+    # Max event-loop wake-up delay over the last ~60 s (None: monitor not running).
+    event_loop_lag_ms: float | None = None
+    # Offloaded classify calls still executing, including timed-out ones (issue #131).
+    classify_inflight: int = 0
+    # Offloaded classify calls submitted but waiting for a free worker.
+    classify_queued: int = 0
 
 
 class ObserveRequest(BaseModel):

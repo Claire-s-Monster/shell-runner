@@ -260,7 +260,7 @@ def test_execution_time_deny_recheck_refuses_stale_approval(
 
     # Simulate a catalog update (between approval and execution) that now
     # hard-DENYs this command -- the stale approve_token must not bypass it.
-    monkeypatch.setattr("shell_runner.server.classify", _fake_deny_classify)
+    monkeypatch.setattr("shell_runner.classifier.classify", _fake_deny_classify)
 
     exec_resp = client.post(
         "/execute",
