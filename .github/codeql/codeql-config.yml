@@ -15,6 +15,8 @@ queries:
   - uses: ./.github/codeql/queries/shell-runner.qls
 
 # executor.py: the sandboxed executor accepts a client-provided cwd on purpose (confined to
-# the configured roots by resolve_cwd). The alerts are reported at the `resolved.exists()` /
-# `resolved.is_dir()` calls in resolve_cwd, so the inline `# codeql[py/path-injection]`
-# suppressions sit on those lines. A query-filters exclude cannot be scoped by path.
+# the configured roots by resolve_cwd). CodeQL reports it at the `resolved.exists()` /
+# `resolved.is_dir()` calls in resolve_cwd (alerts 33 and 34, dismissed as won't fix). No
+# inline suppression is used: `# codeql[py/path-injection]` on those lines did not close the
+# alerts in the ci-framework job (PR 130 alerts 55 and 56), and a query-filters exclude
+# cannot be scoped by path.

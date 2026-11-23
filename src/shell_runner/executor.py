@@ -317,9 +317,9 @@ def resolve_cwd(cwd: str) -> tuple[Path | None, str | None]:
     if not any(resolved.is_relative_to(r) for r in current_roots):
         sorted_roots = sorted(str(r) for r in current_roots)
         return None, f"cwd escapes allowed root(s) {sorted_roots}: {cwd}"
-    if not resolved.exists():  # codeql[py/path-injection]
+    if not resolved.exists():
         return None, f"cwd does not exist: {cwd}"
-    if not resolved.is_dir():  # codeql[py/path-injection]
+    if not resolved.is_dir():
         return None, f"cwd is not a directory: {cwd}"
     return resolved, None
 
