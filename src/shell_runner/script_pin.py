@@ -33,6 +33,7 @@ import os
 import posixpath
 import re
 import stat
+import threading
 import warnings
 from dataclasses import dataclass, field, replace
 
@@ -45,6 +46,7 @@ MISSING = "missing"
 UNREADABLE = "unreadable"
 _UNHASHED = frozenset({MISSING, UNREADABLE})
 MAX_SCRIPT_BYTES = 64 << 20  # larger files are treated as unreadable (bounded hashing)
+_WARNINGS_LOCK = threading.Lock()
 _MAX_DEPTH = 3  # nested `-c` bodies
 _MAX_WRAP = 12
 MAX_TOTAL_BYTES = 64 << 20  # total bytes hashed per command
@@ -497,7 +499,9 @@ _NODE_BUILTINS = frozenset(
 def _python_imports(code: str) -> set[str] | None:
     """Dotted names a level-0 `import` in `code` could load (ast, no exec); None if unparseable."""
     try:
-        with warnings.catch_warnings():
+        # catch_warnings() swaps the process-global filters list: serialize it, as
+        # classify() runs on several worker threads.
+        with _WARNINGS_LOCK, warnings.catch_warnings():
             warnings.simplefilter("ignore")
             tree = ast.parse(code)
     except (SyntaxError, ValueError, RecursionError):

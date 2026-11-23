@@ -32,14 +32,13 @@ from typing import Any, Literal, cast
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import executor, monitor, path_guard, restart, script_pin
+from . import executor, monitor, offload, path_guard, restart, script_pin
 from .catalog import Tier, all_rules
 from .classifier import (
     PERMISSIVENESS,
     ApprovalRuleMatch,
     ClassificationResult,
     _cap_permissiveness,
-    classify,
     denial_reason,
     is_primary_identity,
 )
@@ -101,6 +100,8 @@ logger = logging.getLogger(__name__)
 
 _db_path = os.environ.get("SHELL_RUNNER_DB", str(DEFAULT_DB_PATH))
 db = Persistence(db_path=_db_path)
+
+HEALTH_STATS_TIMEOUT_S = 2.0
 
 _cleanup_task: asyncio.Task[None] | None = None
 _sandbox_state: SandboxState | None = None  # set once at startup (issue #82)
@@ -439,54 +440,58 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         if math.isinf(SHELL_CALLS_RETENTION_S)
         else f"{SHELL_CALLS_RETENTION_S / 86400:g} days ({SHELL_CALLS_RETENTION_S:g}s)",
     )
-    _cleanup_task = asyncio.create_task(_periodic_cleanup())
-
-    # Register SIGHUP handler for live cwd-roots reload (Linux only).
+    cleanup_task = _cleanup_task = asyncio.create_task(_periodic_cleanup())
+    lag_task = asyncio.create_task(offload.lag_monitor())
     loop = asyncio.get_running_loop()
+    # The outer finally covers every startup step, so a startup failure cannot leak the tasks.
     try:
-        loop.add_signal_handler(signal.SIGHUP, _on_sighup)
-    except (NotImplementedError, AttributeError):
-        logger.debug("SIGHUP not supported on this platform; skipping signal handler")
-
-    if os.environ.get("SHELL_RUNNER_LOAD_SEED_APPROVALS", "1") != "0":
-        n = await asyncio.to_thread(db.seed_approvals, DEFAULT_SEED_APPROVALS)
-        if n > 0:
-            logger.info("Seeded %d approval template(s) into template_approvals", n)
-
-    telemetry_writer = TelemetryWriter(db)
-    await telemetry_writer.start()
-    application.state.telemetry_writer = telemetry_writer
-
-    catalog_writer = CatalogWriter(db)
-    await catalog_writer.start()
-    application.state.catalog_writer = catalog_writer
-
-    orphaned = await asyncio.to_thread(monitor.reconcile_orphans, db)
-    if orphaned:
-        logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
-    await _reconcile_units()  # detached units survive restarts; settle any that finished
-
-    _sandbox_state = sandbox_canary()
-    if _sandbox_state == "absent":
-        logger.warning(
-            "sandbox not enforced on this process (/ is writable); "
-            "install scripts/shell-runner.service.d/sandbox.conf (issue #82)"
-        )
-
-    try:
-        yield
-    finally:
-        await monitor.shutdown()
-        await telemetry_writer.stop()
-        await catalog_writer.stop()
-        db.close()
-
-        _cleanup_task.cancel()
+        # Register SIGHUP handler for live cwd-roots reload (Linux only).
         try:
-            await _cleanup_task
-        except asyncio.CancelledError:
-            pass
+            loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+        except (NotImplementedError, AttributeError):
+            logger.debug("SIGHUP not supported on this platform; skipping signal handler")
+
+        if os.environ.get("SHELL_RUNNER_LOAD_SEED_APPROVALS", "1") != "0":
+            n = await asyncio.to_thread(db.seed_approvals, DEFAULT_SEED_APPROVALS)
+            if n > 0:
+                logger.info("Seeded %d approval template(s) into template_approvals", n)
+
+        telemetry_writer = TelemetryWriter(db)
+        await telemetry_writer.start()
+        application.state.telemetry_writer = telemetry_writer
+
+        catalog_writer = CatalogWriter(db)
+        await catalog_writer.start()
+        application.state.catalog_writer = catalog_writer
+
+        orphaned = await asyncio.to_thread(monitor.reconcile_orphans, db)
+        if orphaned:
+            logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
+        await _reconcile_units()  # detached units survive restarts; settle any that finished
+
+        _sandbox_state = sandbox_canary()
+        if _sandbox_state == "absent":
+            logger.warning(
+                "sandbox not enforced on this process (/ is writable); "
+                "install scripts/shell-runner.service.d/sandbox.conf (issue #82)"
+            )
+
+        try:
+            yield
+        finally:
+            await monitor.shutdown()
+            await telemetry_writer.stop()
+            await catalog_writer.stop()
+            db.close()
+    finally:
+        for task in (cleanup_task, lag_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         _cleanup_task = None
+        offload.shutdown_executor()
 
         try:
             loop.remove_signal_handler(signal.SIGHUP)
@@ -495,6 +500,14 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="shell-runner", version="0.1.0", lifespan=_lifespan)
+
+_CLASSIFY_TIMEOUT_DETAIL = "classification timed out; retry"
+
+
+@app.exception_handler(offload.OffloadTimeout)
+async def _offload_timeout_handler(_request: Request, _exc: offload.OffloadTimeout) -> JSONResponse:
+    """Fail closed: a classification that timed out never executes or approves anything."""
+    return JSONResponse(status_code=503, content={"detail": _CLASSIFY_TIMEOUT_DETAIL})
 
 
 def _inline_budget_divert_note(*, budget: int, job_id: str, timeout_s: int) -> str:
@@ -769,7 +782,15 @@ async def _execute_approved_command(
     captured at prompt-creation must not be trusted -- re-classify against the
     CURRENT catalog and refuse execution on a hard DENY.
     """
-    recheck_cls = classify(req.command, req.cwd, req.agent_id)
+    try:
+        recheck_cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
+    except (offload.OffloadTimeout, asyncio.CancelledError):
+        # Nothing ran (timeout or client disconnect): give the consumed approval back so
+        # the retry can still use it. Shielded so a cancelled task still completes it.
+        await asyncio.shield(
+            asyncio.to_thread(db.restore_approval, prompt["id"], detach_only=False)
+        )
+        raise
     if recheck_cls.command_tier == Tier.DENY:
         duration_ms = int((time.monotonic() - t0) * 1000)
         telemetry_id = str(uuid.uuid4())
@@ -1237,8 +1258,10 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         )
 
     # Path B: no token — classify first
-    cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd, req.detach, req.command)
+    cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
+    cls = await offload.run_bounded(
+        _apply_template_approval, cls, req.agent_id, req.cwd, req.detach, req.command
+    )
 
     # DENY
     if cls.tier == Tier.DENY:
@@ -1535,8 +1558,10 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
-    cls = classify(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd, command=req.command)
+    cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
+    cls = await offload.run_bounded(
+        _apply_template_approval, cls, req.agent_id, req.cwd, command=req.command
+    )
     _preview_map: dict[Tier, str] = {
         Tier.DENY: "would_deny",
         Tier.AUTO_LOG: "would_execute",
@@ -1564,8 +1589,21 @@ async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
 
 
 @app.post("/observe", response_model=ObserveResponse)
-async def observe_route(request: Request, req: ObserveRequest) -> ObserveResponse:
-    cls = classify(req.command, req.cwd, req.agent_id)
+async def observe_route(request: Request, req: ObserveRequest) -> ObserveResponse | JSONResponse:
+    # Passive telemetry: the client fails open, so shed load instead of queueing (#131).
+    if not offload.observe_try_acquire():
+        return JSONResponse(status_code=503, content={"error": "overloaded"})
+    try:
+        return await _observe_handle(request, req)
+    finally:
+        offload.observe_release()
+
+
+async def _observe_handle(request: Request, req: ObserveRequest) -> ObserveResponse | JSONResponse:
+    try:
+        cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
+    except offload.OffloadTimeout:
+        return JSONResponse(status_code=503, content={"error": "classify_timeout"})
     telemetry_id = str(uuid.uuid4())
     telemetry_writer = getattr(request.app.state, "telemetry_writer", None)
     catalog_writer = getattr(request.app.state, "catalog_writer", None)
@@ -1756,7 +1794,11 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
     rule: PromotionRule | None = None
     if reusable:
         pending = prompt_for_guard
-        guard = path_guard.evaluate(pending["raw_cmd"], pending["cwd"]) if pending else None
+        guard = (
+            await offload.run_bounded(path_guard.evaluate, pending["raw_cmd"], pending["cwd"])
+            if pending
+            else None
+        )
         if pending is not None and pending["detach"]:
             guarded_note = (
                 f"{req.decision} downgraded to a one-shot approval: detach=true approvals "
@@ -1771,7 +1813,9 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
         elif (
             pending is not None
             and (
-                pending_cls := classify(pending["raw_cmd"], pending["cwd"], pending["agent_id"])
+                pending_cls := await offload.classify_async(
+                    pending["raw_cmd"], pending["cwd"], pending["agent_id"]
+                )
             ).non_promotable
         ):
             if pending_cls.non_durable_reason:
@@ -1823,7 +1867,9 @@ async def approve_route(req: ApproveRequest) -> ApproveResponse:
 
         # Reuse the existing normalizer/classify path to extract the verb of
         # the pending prompt's raw command (first pipeline segment's verb).
-        prompt_cls = classify(prompt["raw_cmd"], prompt["cwd"], prompt["agent_id"])
+        prompt_cls = await offload.classify_async(
+            prompt["raw_cmd"], prompt["cwd"], prompt["agent_id"]
+        )
         verb = prompt_cls.segments[0].segment.verb if prompt_cls.segments else ""
         cwd_prefix = os.path.realpath(prompt["cwd"])
         rule = PromotionRule(
@@ -2267,20 +2313,30 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
 
 @app.get("/health", response_model=HealthResponse)
 async def health_route() -> HealthResponse:
-    stats = db.health_stats()
+    try:
+        stats = await offload.run_health_bounded(db.health_stats, HEALTH_STATS_TIMEOUT_S)
+        stats_error = None
+    except offload.OffloadTimeout:
+        stats = {}
+        stats_error = f"health stats timed out after {HEALTH_STATS_TIMEOUT_S:g}s"
     roots_error = executor.cwd_roots_error()
+    inflight = offload.classify_inflight()
+    saturated = inflight >= offload.classify_workers()
     return HealthResponse(
-        status="degraded" if roots_error else "ok",
-        total_calls_24h=stats["total_calls_24h"],
+        status="degraded" if roots_error or stats_error or saturated else "ok",
+        total_calls_24h=stats.get("total_calls_24h", 0),
         observed_24h=stats.get("observed_24h", 0),
-        denied_rate_24h=stats["denied_rate_24h"],
-        prompt_rate_24h=stats["prompt_rate_24h"],
+        denied_rate_24h=stats.get("denied_rate_24h", 0.0),
+        prompt_rate_24h=stats.get("prompt_rate_24h", 0.0),
         p50_latency_ms=stats.get("p50_latency_ms", 0),
         p99_latency_ms=stats.get("p99_latency_ms", 0),
         catalog_size=len(all_rules()),
         pending_prompts=stats.get("pending_prompts_count", 0),
         sandbox=_sandbox_state or sandbox_canary(),
-        last_error=roots_error or stats.get("last_error"),
+        last_error=roots_error or stats_error or stats.get("last_error"),
+        event_loop_lag_ms=offload.event_loop_lag_ms(),
+        classify_inflight=inflight,
+        classify_queued=offload.classify_queued(),
     )
 
 
@@ -2343,7 +2399,10 @@ async def handle_mcp_post(request: Request) -> JSONResponse:
         )
 
     if method == "tools/call":
-        result = await _dispatch_tool_call(request, params)
+        try:
+            result = await _dispatch_tool_call(request, params)
+        except offload.OffloadTimeout:
+            result = {"error": _CLASSIFY_TIMEOUT_DETAIL}
         return JSONResponse(
             content={
                 "jsonrpc": "2.0",
@@ -2463,7 +2522,7 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
             return {"error": "invalid arguments"}
         try:
             return (await execute_route(request, exec_req)).model_dump()
-        except HTTPException:
+        except (HTTPException, offload.OffloadTimeout):
             raise
         except Exception as exc:  # noqa: BLE001
             logger.exception("shell_execute failed")
