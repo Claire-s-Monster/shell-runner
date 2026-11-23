@@ -18,7 +18,7 @@ jobs:
       actions: read
       security-events: write
       id-token: write
-    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@e4eb667206af98c5499c8adf2ba46d395220b0f9  # v2.9.1
+    uses: Claire-s-Monster/ci-framework/.github/workflows/reusable-ci.yml@f58ca6cbdc509968ea5f60d559caf86bc2d435fe  # v5.0.0
     with:
       pixi-environment: "ci"
       python-versions: '["3.11", "3.12"]'
@@ -26,7 +26,14 @@ jobs:
       enable-performance: false
       enable-postgres: false
       editable-install: false
-    secrets: inherit
+      codeql-config-file: ".github/codeql/codeql-config.yml"
+      pixi-version: "v0.49.0"  # pixi.lock is v6; v5.0.0 defaults to v0.82.0
+    # Explicit secrets: CI_BOT_TOKEN is withheld on purpose. reusable-ci v5's SARIF upload
+    # prefers it over github.token, and it returned 404 on code scanning (#130).
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      SOURCERY_TOKEN: ${{ secrets.SOURCERY_TOKEN }}
 
   # Enforce main only accepts PRs from development
   branch-policy:

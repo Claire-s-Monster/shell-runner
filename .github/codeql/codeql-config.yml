@@ -1,22 +1,21 @@
 ---
 name: "shell-runner CodeQL config"
 
-# Exclude py/path-injection on the sandboxed executor where cwd is intentional,
-# validated input. The shell-runner architecture explicitly accepts user-provided
-# cwd values from the MCP client; defense-in-depth is applied via realpath +
-# exists + is_dir checks before subprocess execution. This is documented in the
-# agent's threat model and is a deliberate design decision.
+# ci.yml passes this file to ci-framework v5.0.0 reusable-ci via `codeql-config-file`
+# (added in ci-framework #468), so the sast-codeql job consumes it.
 #
-# Note: inline suppressions (# codeql[py/path-injection]) are placed at the
-# subprocess.run call site (executor.py) as the primary suppression mechanism.
-# This config is a belt-and-suspenders fallback.
-#
-# To activate: pass config-file to github/codeql-action/init in ci workflow,
-# e.g. add codeql-config-file: ".github/codeql/codeql-config.yml" to
-# ci-framework inputs if supported, or add a standalone CodeQL init step.
+# The local suite is the default Python code-scanning suite with py/path-injection swapped
+# for .github/codeql/queries/PathInjection.ql, which adds ShellRunnerGates.qll: a barrier on
+# the path parameter of script_pin._path_stat and script_pin._open_regular only (read-only,
+# regular-file-only gates). Default queries are disabled because the suite already
+# contains them.
+disable-default-queries: true
+queries:
+  - uses: ./.github/codeql/queries/shell-runner.qls
 
-query-filters:
-  - exclude:
-      id: py/path-injection
-      paths:
-        - "src/shell_runner/executor.py"
+# executor.py: the sandboxed executor accepts a client-provided cwd on purpose (confined to
+# the configured roots by resolve_cwd). CodeQL reports it at the `resolved.exists()` /
+# `resolved.is_dir()` calls in resolve_cwd (alerts 33 and 34, dismissed as won't fix). No
+# inline suppression is used: `# codeql[py/path-injection]` on those lines did not close the
+# alerts in the ci-framework job (PR 130 alerts 55 and 56), and a query-filters exclude
+# cannot be scoped by path.

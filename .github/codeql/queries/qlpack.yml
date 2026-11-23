@@ -1,0 +1,6 @@
+name: shell-runner/python-queries
+version: 0.0.1
+description: shell-runner CodeQL customizations (py/path-injection barrier for script_pin's read gates)
+dependencies:
+  codeql/python-all: "*"
+  codeql/python-queries: "*"
