@@ -14,6 +14,7 @@ exposes how many are running so health can show it.
 Env vars (read at call time, so tests can monkeypatch):
   SHELL_RUNNER_CLASSIFY_WORKERS         pool size, read when the pool is created (4)
   SHELL_RUNNER_CLASSIFY_TIMEOUT_S       per-call timeout in seconds (5.0)
+  SHELL_RUNNER_CLASSIFY_MAX_QUEUED      admission cap on queued calls, then fail closed (64)
   SHELL_RUNNER_OBSERVE_MAX_INFLIGHT     concurrent /observe cap (32)
 """
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import math
 import os
 import threading
 import time
@@ -52,11 +54,17 @@ class OffloadTimeout(Exception):  # noqa: N818 - name fixed by the #131 design
     """The offloaded call did not finish within its timeout (its thread may still run)."""
 
 
+class OffloadOverloaded(OffloadTimeout):  # noqa: N818 - is-a OffloadTimeout so callers fail closed
+    """Admission limit reached: too much classify work is already queued."""
+
+
 def _env_float(name: str, default: float) -> float:
+    """Positive finite float from the environment, else ``default``."""
     try:
-        return float(os.environ.get(name, default))
+        value = float(os.environ.get(name, default))
     except ValueError:
         return default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 def _env_int(name: str, default: int) -> int:
@@ -133,7 +141,10 @@ async def run_bounded(
     global _queued
     if timeout_s is None:
         timeout_s = _env_float("SHELL_RUNNER_CLASSIFY_TIMEOUT_S", 5.0)
+    max_queued = _env_int("SHELL_RUNNER_CLASSIFY_MAX_QUEUED", 64)
     with _lock:
+        if _queued >= max_queued:
+            raise OffloadOverloaded(f"{_queued} calls already queued")
         _queued += 1
     try:
         cf = _get_executor().submit(functools.partial(_tracked, fn, *args, **kwargs))
@@ -177,6 +188,15 @@ async def run_health_bounded(fn: Callable[[], T], timeout_s: float) -> T:
         with _lock:
             _health_busy = False
         raise
+
+    def _release_if_cancelled(fut: Future[Any]) -> None:
+        # Cancelled before _run started: its finally never runs, so free the slot here.
+        global _health_busy
+        if fut.cancelled():
+            with _lock:
+                _health_busy = False
+
+    cf.add_done_callback(_release_if_cancelled)
     try:
         return await asyncio.wait_for(asyncio.wrap_future(cf), timeout_s)
     except TimeoutError:

@@ -784,9 +784,12 @@ async def _execute_approved_command(
     """
     try:
         recheck_cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
-    except offload.OffloadTimeout:
-        # Nothing ran: give the consumed approval back so the retry can still use it.
-        await asyncio.to_thread(db.restore_approval, prompt["id"], detach_only=False)
+    except (offload.OffloadTimeout, asyncio.CancelledError):
+        # Nothing ran (timeout or client disconnect): give the consumed approval back so
+        # the retry can still use it. Shielded so a cancelled task still completes it.
+        await asyncio.shield(
+            asyncio.to_thread(db.restore_approval, prompt["id"], detach_only=False)
+        )
         raise
     if recheck_cls.command_tier == Tier.DENY:
         duration_ms = int((time.monotonic() - t0) * 1000)
@@ -1591,11 +1594,16 @@ async def observe_route(request: Request, req: ObserveRequest) -> ObserveRespons
     if not offload.observe_try_acquire():
         return JSONResponse(status_code=503, content={"error": "overloaded"})
     try:
+        return await _observe_handle(request, req)
+    finally:
+        offload.observe_release()
+
+
+async def _observe_handle(request: Request, req: ObserveRequest) -> ObserveResponse | JSONResponse:
+    try:
         cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
     except offload.OffloadTimeout:
         return JSONResponse(status_code=503, content={"error": "classify_timeout"})
-    finally:
-        offload.observe_release()
     telemetry_id = str(uuid.uuid4())
     telemetry_writer = getattr(request.app.state, "telemetry_writer", None)
     catalog_writer = getattr(request.app.state, "catalog_writer", None)

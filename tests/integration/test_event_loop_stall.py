@@ -248,6 +248,77 @@ async def test_recheck_timeout_restores_approval_and_retry_succeeds(
         outside.unlink(missing_ok=True)
 
 
+async def test_recheck_cancel_restores_approval(
+    gate: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client disconnect mid-recheck must not burn the consumed approval (#132 review)."""
+    monkeypatch.setattr(executor, "_CWD_ROOTS", [tmp_path.resolve()])
+    monkeypatch.setenv("SHELL_RUNNER_CLASSIFY_TIMEOUT_S", "10")
+    outside = Path("/var/tmp") / f"sr131c_{uuid.uuid4().hex}"
+    body = {"command": f"echo x > {outside}", "cwd": str(tmp_path), "agent_id": AGENT}
+    try:
+        async with _client() as client:
+            first = await client.post("/execute", json=body)
+            approved = await client.post(
+                "/approve_pending",
+                json={
+                    "prompt_id": first.json()["prompt"]["id"],
+                    "decision": "approve_once",
+                    "approver_agent_id": "primary",
+                },
+            )
+            token = approved.json()["approve_token"]
+
+            gate.on = True
+            task = asyncio.create_task(
+                client.post("/execute", json={**body, "approve_token": token})
+            )
+            deadline = time.monotonic() + 3
+            while offload.classify_inflight() == 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert offload.classify_inflight() == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not outside.exists()
+
+            gate.on = False
+            gate.release.set()
+            retry = await client.post("/execute", json={**body, "approve_token": token})
+            assert retry.status_code == 200, retry.text
+            assert retry.json()["decision"] == "executed"
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+async def test_observe_slot_held_until_response_work_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The /observe cap covers the whole handler, not just classification (#132 review)."""
+    monkeypatch.setenv("SHELL_RUNNER_OBSERVE_MAX_INFLIGHT", "1")
+    release = threading.Event()
+    entered = threading.Event()
+
+    def slow_upsert(**_kw: object) -> None:
+        entered.set()
+        release.wait(10)
+
+    monkeypatch.setattr(server_module.db, "upsert_template", slow_upsert)
+    monkeypatch.setattr(app.state, "catalog_writer", None, raising=False)
+    monkeypatch.setattr(app.state, "telemetry_writer", None, raising=False)
+    try:
+        async with _client() as client:
+            first = asyncio.create_task(client.post("/observe", json=OBSERVE_BODY))
+            assert await asyncio.to_thread(entered.wait, 3)
+            second = await client.post("/observe", json=OBSERVE_BODY)
+            assert second.status_code == 503
+            assert second.json() == {"error": "overloaded"}
+            release.set()
+            assert (await first).status_code == 200
+    finally:
+        release.set()
+
+
 async def test_classify_timeout_fails_closed(
     stall: threading.Event, tmp_path: Path, db: Persistence
 ) -> None:
