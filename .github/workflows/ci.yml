@@ -28,7 +28,12 @@ jobs:
       editable-install: false
       codeql-config-file: ".github/codeql/codeql-config.yml"
       pixi-version: "v0.49.0"  # pixi.lock is v6; v5.0.0 defaults to v0.82.0
-    secrets: inherit
+    # Explicit secrets: CI_BOT_TOKEN is withheld on purpose. reusable-ci v5's SARIF upload
+    # prefers it over github.token, and it returned 404 on code scanning (#130).
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      SOURCERY_TOKEN: ${{ secrets.SOURCERY_TOKEN }}
 
   # Enforce main only accepts PRs from development
   branch-policy:
