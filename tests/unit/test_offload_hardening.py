@@ -48,6 +48,25 @@ async def test_health_busy_cleared_when_future_cancelled_before_start() -> None:
     assert await offload.run_health_bounded(lambda: 7, 2) == 7
 
 
+async def test_timed_out_queued_items_still_count_against_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelled work items linger in the pool queue; they must keep counting (#132 review)."""
+    monkeypatch.setenv("SHELL_RUNNER_CLASSIFY_WORKERS", "1")
+    monkeypatch.setenv("SHELL_RUNNER_CLASSIFY_MAX_QUEUED", "2")
+    release = threading.Event()
+    blocker = asyncio.create_task(offload.run_bounded(release.wait, 10, timeout_s=10))
+    await asyncio.sleep(0.1)  # the single worker is now stuck
+    for _ in range(2):
+        with pytest.raises(offload.OffloadTimeout):
+            await offload.run_bounded(lambda: 1, timeout_s=0.05)  # queued, then cancelled
+    assert offload.classify_queued() == 0  # the live counter forgot them ...
+    with pytest.raises(offload.OffloadOverloaded):  # ... but admission still sees them
+        await offload.run_bounded(lambda: 1, timeout_s=0.05)
+    release.set()
+    await blocker
+
+
 async def test_queue_admission_cap_rejects_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHELL_RUNNER_CLASSIFY_WORKERS", "1")
     monkeypatch.setenv("SHELL_RUNNER_CLASSIFY_MAX_QUEUED", "2")

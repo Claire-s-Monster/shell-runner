@@ -142,12 +142,16 @@ async def run_bounded(
     if timeout_s is None:
         timeout_s = _env_float("SHELL_RUNNER_CLASSIFY_TIMEOUT_S", 5.0)
     max_queued = _env_int("SHELL_RUNNER_CLASSIFY_MAX_QUEUED", 64)
+    pool = _get_executor()
+    # A timed-out call is cancelled but its work item stays in the pool's queue until a
+    # worker drains it, so the real backlog is the queue length, not just _queued.
+    backlog = pool._work_queue.qsize()
     with _lock:
-        if _queued >= max_queued:
-            raise OffloadOverloaded(f"{_queued} calls already queued")
+        if max(_queued, backlog) >= max_queued:
+            raise OffloadOverloaded(f"{max(_queued, backlog)} calls already queued")
         _queued += 1
     try:
-        cf = _get_executor().submit(functools.partial(_tracked, fn, *args, **kwargs))
+        cf = pool.submit(functools.partial(_tracked, fn, *args, **kwargs))
     except BaseException:
         with _lock:
             _queued -= 1
