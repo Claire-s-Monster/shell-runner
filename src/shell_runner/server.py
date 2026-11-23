@@ -440,61 +440,57 @@ async def _lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         if math.isinf(SHELL_CALLS_RETENTION_S)
         else f"{SHELL_CALLS_RETENTION_S / 86400:g} days ({SHELL_CALLS_RETENTION_S:g}s)",
     )
-    _cleanup_task = asyncio.create_task(_periodic_cleanup())
+    cleanup_task = _cleanup_task = asyncio.create_task(_periodic_cleanup())
     lag_task = asyncio.create_task(offload.lag_monitor())
-
-    # Register SIGHUP handler for live cwd-roots reload (Linux only).
     loop = asyncio.get_running_loop()
+    # The outer finally covers every startup step, so a startup failure cannot leak the tasks.
     try:
-        loop.add_signal_handler(signal.SIGHUP, _on_sighup)
-    except (NotImplementedError, AttributeError):
-        logger.debug("SIGHUP not supported on this platform; skipping signal handler")
+        # Register SIGHUP handler for live cwd-roots reload (Linux only).
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+        except (NotImplementedError, AttributeError):
+            logger.debug("SIGHUP not supported on this platform; skipping signal handler")
 
-    if os.environ.get("SHELL_RUNNER_LOAD_SEED_APPROVALS", "1") != "0":
-        n = await asyncio.to_thread(db.seed_approvals, DEFAULT_SEED_APPROVALS)
-        if n > 0:
-            logger.info("Seeded %d approval template(s) into template_approvals", n)
+        if os.environ.get("SHELL_RUNNER_LOAD_SEED_APPROVALS", "1") != "0":
+            n = await asyncio.to_thread(db.seed_approvals, DEFAULT_SEED_APPROVALS)
+            if n > 0:
+                logger.info("Seeded %d approval template(s) into template_approvals", n)
 
-    telemetry_writer = TelemetryWriter(db)
-    await telemetry_writer.start()
-    application.state.telemetry_writer = telemetry_writer
+        telemetry_writer = TelemetryWriter(db)
+        await telemetry_writer.start()
+        application.state.telemetry_writer = telemetry_writer
 
-    catalog_writer = CatalogWriter(db)
-    await catalog_writer.start()
-    application.state.catalog_writer = catalog_writer
+        catalog_writer = CatalogWriter(db)
+        await catalog_writer.start()
+        application.state.catalog_writer = catalog_writer
 
-    orphaned = await asyncio.to_thread(monitor.reconcile_orphans, db)
-    if orphaned:
-        logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
-    await _reconcile_units()  # detached units survive restarts; settle any that finished
+        orphaned = await asyncio.to_thread(monitor.reconcile_orphans, db)
+        if orphaned:
+            logger.info("Marked %d orphaned monitor job(s) killed (server_restarted)", orphaned)
+        await _reconcile_units()  # detached units survive restarts; settle any that finished
 
-    _sandbox_state = sandbox_canary()
-    if _sandbox_state == "absent":
-        logger.warning(
-            "sandbox not enforced on this process (/ is writable); "
-            "install scripts/shell-runner.service.d/sandbox.conf (issue #82)"
-        )
+        _sandbox_state = sandbox_canary()
+        if _sandbox_state == "absent":
+            logger.warning(
+                "sandbox not enforced on this process (/ is writable); "
+                "install scripts/shell-runner.service.d/sandbox.conf (issue #82)"
+            )
 
-    try:
-        yield
+        try:
+            yield
+        finally:
+            await monitor.shutdown()
+            await telemetry_writer.stop()
+            await catalog_writer.stop()
+            db.close()
     finally:
-        await monitor.shutdown()
-        await telemetry_writer.stop()
-        await catalog_writer.stop()
-        db.close()
-
-        _cleanup_task.cancel()
-        try:
-            await _cleanup_task
-        except asyncio.CancelledError:
-            pass
+        for task in (cleanup_task, lag_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         _cleanup_task = None
-
-        lag_task.cancel()
-        try:
-            await lag_task
-        except asyncio.CancelledError:
-            pass
         offload.shutdown_executor()
 
         try:
@@ -786,7 +782,12 @@ async def _execute_approved_command(
     captured at prompt-creation must not be trusted -- re-classify against the
     CURRENT catalog and refuse execution on a hard DENY.
     """
-    recheck_cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
+    try:
+        recheck_cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
+    except offload.OffloadTimeout:
+        # Nothing ran: give the consumed approval back so the retry can still use it.
+        await asyncio.to_thread(db.restore_approval, prompt["id"], detach_only=False)
+        raise
     if recheck_cls.command_tier == Tier.DENY:
         duration_ms = int((time.monotonic() - t0) * 1000)
         telemetry_id = str(uuid.uuid4())
@@ -1255,7 +1256,9 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 
     # Path B: no token — classify first
     cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd, req.detach, req.command)
+    cls = await offload.run_bounded(
+        _apply_template_approval, cls, req.agent_id, req.cwd, req.detach, req.command
+    )
 
     # DENY
     if cls.tier == Tier.DENY:
@@ -1553,7 +1556,9 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify_route(req: ClassifyRequest) -> ClassifyResponse:
     cls = await offload.classify_async(req.command, req.cwd, req.agent_id)
-    cls = _apply_template_approval(cls, req.agent_id, req.cwd, command=req.command)
+    cls = await offload.run_bounded(
+        _apply_template_approval, cls, req.agent_id, req.cwd, command=req.command
+    )
     _preview_map: dict[Tier, str] = {
         Tier.DENY: "would_deny",
         Tier.AUTO_LOG: "would_execute",
@@ -2301,14 +2306,16 @@ async def shell_kill_route(body: ShellKillRequest) -> ShellKillResponse:
 @app.get("/health", response_model=HealthResponse)
 async def health_route() -> HealthResponse:
     try:
-        stats = await asyncio.wait_for(asyncio.to_thread(db.health_stats), HEALTH_STATS_TIMEOUT_S)
+        stats = await offload.run_health_bounded(db.health_stats, HEALTH_STATS_TIMEOUT_S)
         stats_error = None
-    except TimeoutError:
+    except offload.OffloadTimeout:
         stats = {}
         stats_error = f"health stats timed out after {HEALTH_STATS_TIMEOUT_S:g}s"
     roots_error = executor.cwd_roots_error()
+    inflight = offload.classify_inflight()
+    saturated = inflight >= offload.classify_workers()
     return HealthResponse(
-        status="degraded" if roots_error or stats_error else "ok",
+        status="degraded" if roots_error or stats_error or saturated else "ok",
         total_calls_24h=stats.get("total_calls_24h", 0),
         observed_24h=stats.get("observed_24h", 0),
         denied_rate_24h=stats.get("denied_rate_24h", 0.0),
@@ -2320,7 +2327,8 @@ async def health_route() -> HealthResponse:
         sandbox=_sandbox_state or sandbox_canary(),
         last_error=roots_error or stats_error or stats.get("last_error"),
         event_loop_lag_ms=offload.event_loop_lag_ms(),
-        classify_inflight=offload.classify_inflight(),
+        classify_inflight=inflight,
+        classify_queued=offload.classify_queued(),
     )
 
 
@@ -2506,7 +2514,7 @@ async def _dispatch_tool_call(request: Request, params: dict[str, Any]) -> dict[
             return {"error": "invalid arguments"}
         try:
             return (await execute_route(request, exec_req)).model_dump()
-        except HTTPException:
+        except (HTTPException, offload.OffloadTimeout):
             raise
         except Exception as exc:  # noqa: BLE001
             logger.exception("shell_execute failed")

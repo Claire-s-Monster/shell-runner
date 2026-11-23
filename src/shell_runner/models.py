@@ -246,6 +246,8 @@ class HealthResponse(BaseModel):
     event_loop_lag_ms: float | None = None
     # Offloaded classify calls still executing, including timed-out ones (issue #131).
     classify_inflight: int = 0
+    # Offloaded classify calls submitted but waiting for a free worker.
+    classify_queued: int = 0
 
 
 class ObserveRequest(BaseModel):

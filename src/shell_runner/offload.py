@@ -26,7 +26,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, TypeVar
 
 from . import classifier
@@ -40,6 +40,9 @@ LAG_WINDOW_S = 60.0
 _lock = threading.Lock()
 _executor: ThreadPoolExecutor | None = None
 _running = 0  # worker calls actually executing (a timed-out thread still counts)
+_queued = 0  # submitted, not yet started
+_health_executor: ThreadPoolExecutor | None = None
+_health_busy = False
 _observe_inflight = 0
 # (monotonic timestamp, lag_ms); ~120 samples cover the 60 s window.
 _lag_samples: deque[tuple[float, float]] = deque(maxlen=int(LAG_WINDOW_S / LAG_INTERVAL_S) + 8)
@@ -76,16 +79,20 @@ def _get_executor() -> ThreadPoolExecutor:
 
 def shutdown_executor() -> None:
     """Release the pool without waiting for stuck threads."""
-    global _executor
+    global _executor, _health_executor
     with _lock:
         pool, _executor = _executor, None
+        health_pool, _health_executor = _health_executor, None
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
+    if health_pool is not None:
+        health_pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _tracked(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    global _running
+    global _running, _queued
     with _lock:
+        _queued -= 1
         _running += 1
     try:
         return fn(*args, **kwargs)
@@ -94,23 +101,84 @@ def _tracked(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
             _running -= 1
 
 
+def _on_done(fut: Future[Any]) -> None:
+    """A future cancelled before it started never ran _tracked: drop it from the queue."""
+    global _queued
+    if fut.cancelled():
+        with _lock:
+            _queued -= 1
+
+
 def classify_inflight() -> int:
     """Number of offloaded calls currently executing, including timed-out ones."""
     with _lock:
         return _running
 
 
+def classify_queued() -> int:
+    """Number of offloaded calls submitted but not yet started (waiting for a worker)."""
+    with _lock:
+        return _queued
+
+
+def classify_workers() -> int:
+    """Configured pool size (what classify_inflight() saturates at)."""
+    return _env_int("SHELL_RUNNER_CLASSIFY_WORKERS", 4)
+
+
 async def run_bounded(
     fn: Callable[..., T], *args: Any, timeout_s: float | None = None, **kwargs: Any
 ) -> T:
     """Run ``fn`` in the dedicated pool; raise OffloadTimeout after ``timeout_s``."""
+    global _queued
     if timeout_s is None:
         timeout_s = _env_float("SHELL_RUNNER_CLASSIFY_TIMEOUT_S", 5.0)
-    fut = asyncio.get_running_loop().run_in_executor(
-        _get_executor(), functools.partial(_tracked, fn, *args, **kwargs)
-    )
+    with _lock:
+        _queued += 1
     try:
-        return await asyncio.wait_for(fut, timeout_s)
+        cf = _get_executor().submit(functools.partial(_tracked, fn, *args, **kwargs))
+    except BaseException:
+        with _lock:
+            _queued -= 1
+        raise
+    cf.add_done_callback(_on_done)
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(cf), timeout_s)
+    except TimeoutError:
+        raise OffloadTimeout(f"timed out after {timeout_s:g}s") from None
+
+
+async def run_health_bounded(fn: Callable[[], T], timeout_s: float) -> T:
+    """Run the /health stats query in its own 1-worker pool, never queueing a second call.
+
+    Raises OffloadTimeout on timeout, or at once while a previous call is still running
+    (a stuck DB must not pile up threads or share a pool with classify).
+    """
+    global _health_executor, _health_busy
+    with _lock:
+        if _health_busy:
+            raise OffloadTimeout("previous health stats call still running")
+        _health_busy = True
+        if _health_executor is None:
+            _health_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sr-health")
+        pool = _health_executor
+
+    def _run() -> T:
+        global _health_busy
+        try:
+            return fn()
+        finally:
+            with _lock:
+                _health_busy = False
+
+    try:
+        cf = pool.submit(_run)
+    except BaseException:
+        with _lock:
+            _health_busy = False
+        raise
+    try:
+        return await asyncio.wait_for(asyncio.wrap_future(cf), timeout_s)
     except TimeoutError:
         raise OffloadTimeout(f"timed out after {timeout_s:g}s") from None
 
@@ -139,6 +207,7 @@ def observe_release() -> None:
 
 async def lag_monitor() -> None:
     """Record how late each 0.5 s sleep wakes up: a direct measure of loop stalls."""
+    _lag_samples.clear()
     while True:
         start = time.monotonic()
         await asyncio.sleep(LAG_INTERVAL_S)
@@ -147,7 +216,10 @@ async def lag_monitor() -> None:
 
 
 def event_loop_lag_ms() -> float | None:
-    """Max loop lag over the last ~60 s; None if the monitor is not running."""
-    cutoff = time.monotonic() - LAG_WINDOW_S
-    recent = [lag for ts, lag in tuple(_lag_samples) if ts >= cutoff]
+    """Max loop lag over the last ~60 s; None if the monitor is not running or died."""
+    now = time.monotonic()
+    samples = tuple(_lag_samples)
+    if not samples or now - samples[-1][0] > 2 * LAG_INTERVAL_S:
+        return None
+    recent = [lag for ts, lag in samples if ts >= now - LAG_WINDOW_S]
     return round(max(recent), 1) if recent else None
