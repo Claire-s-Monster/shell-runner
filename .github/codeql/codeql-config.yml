@@ -1,9 +1,8 @@
 ---
 name: "shell-runner CodeQL config"
 
-# Pass to github/codeql-action/init as `config-file: ./.github/codeql/codeql-config.yml`.
-# The ci-framework sast-codeql job (reusable-ci.yml) has no such input yet, so until it
-# gains one this file is not consumed by CI (shell-runner#129).
+# ci.yml passes this file to ci-framework v5.0.0 reusable-ci via `codeql-config-file`
+# (added in ci-framework #468), so the sast-codeql job consumes it.
 #
 # The local suite is the default Python code-scanning suite with py/path-injection swapped
 # for .github/codeql/queries/PathInjection.ql, which adds ShellRunnerGates.qll: a barrier on
