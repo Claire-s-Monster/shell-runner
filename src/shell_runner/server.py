@@ -2101,6 +2101,15 @@ async def _wait_for_prompt_decision(prompt_id: str, wait_s: float) -> dict | Non
         await asyncio.sleep(min(WAIT_POLL_INTERVAL_S, remaining))
 
 
+async def _bounded_prompt_wait(prompt_id: str, wait_s: float) -> dict | None:
+    """Wait for a prompt decision under the shared wait semaphore (shell_wait and
+    shell_execute). Saturated: a single check rather than queueing behind other waiters."""
+    if _wait_semaphore.locked():
+        return await _wait_for_prompt_decision(prompt_id, 0.0)
+    async with _wait_semaphore:
+        return await _wait_for_prompt_decision(prompt_id, wait_s)
+
+
 async def _wait_for_prompt(
     prompt_id: str, agent_id: str | None, wait_s: float, started: float
 ) -> ShellWaitResponse:
@@ -2116,12 +2125,7 @@ async def _wait_for_prompt(
     if row is None or row["agent_id"] != agent_id:
         return _wait_error(None, not_yours, started, prompt_id=prompt_id)
 
-    # Saturated: do a single check rather than queueing behind other waiters.
-    if _wait_semaphore.locked():
-        row = await _wait_for_prompt_decision(prompt_id, 0.0)
-    else:
-        async with _wait_semaphore:
-            row = await _wait_for_prompt_decision(prompt_id, wait_s)
+    row = await _bounded_prompt_wait(prompt_id, wait_s)
     if row is None:  # expired and swept by cleanup while we waited
         return ShellWaitResponse(
             prompt_id=prompt_id, state="expired", elapsed_s=time.monotonic() - started

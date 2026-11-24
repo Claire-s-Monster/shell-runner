@@ -7,6 +7,7 @@ jobs rows, so no real process is involved.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -253,3 +254,43 @@ async def test_semaphore_released_after_wait(db: Persistence, tmp_path: Path) ->
     before = server_module._wait_semaphore._value
     await shell_wait_route(ShellWaitRequest(job_id=job_id, wait_s=0))
     assert server_module._wait_semaphore._value == before
+
+
+def _make_prompt(db: Persistence, tmp_path: Path) -> str:
+    return db.create_pending_prompt(
+        agent_id="test-agent",
+        cwd=str(tmp_path),
+        raw_cmd="mytool --flag",
+        normalized_template="mytool --flag",
+        command_tier=3,
+        matched_rule_category=None,
+        decision_path=[],
+    )
+
+
+async def test_bounded_prompt_wait_saturated_does_single_check(
+    db: Persistence, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server_module, "_wait_semaphore", asyncio.Semaphore(0))
+    pid = _make_prompt(db, tmp_path)
+    started = time.monotonic()
+    row = await server_module._bounded_prompt_wait(pid, 5)
+    assert row is not None
+    assert row["id"] == pid
+    assert time.monotonic() - started < 1
+
+
+async def test_prompt_mode_shell_wait_uses_shared_helper(
+    db: Persistence, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid = _make_prompt(db, tmp_path)
+    seen: list[tuple[str, float]] = []
+
+    async def _spy(prompt_id: str, wait_s: float) -> dict | None:
+        seen.append((prompt_id, wait_s))
+        return db.get_pending_prompt(prompt_id)
+
+    monkeypatch.setattr(server_module, "_bounded_prompt_wait", _spy)
+    resp = await shell_wait_route(ShellWaitRequest(prompt_id=pid, agent_id="test-agent", wait_s=3))
+    assert resp.state == "waiting"
+    assert seen == [(pid, 3.0)]
