@@ -273,11 +273,18 @@ async def test_bounded_prompt_wait_saturated_does_single_check(
 ) -> None:
     monkeypatch.setattr(server_module, "_wait_semaphore", asyncio.Semaphore(0))
     pid = _make_prompt(db, tmp_path)
-    started = time.monotonic()
+    seen: list[tuple[str, float]] = []
+    real_wait = server_module._wait_for_prompt_decision
+
+    async def _spy(prompt_id: str, wait_s: float) -> dict | None:
+        seen.append((prompt_id, wait_s))
+        return await real_wait(prompt_id, wait_s)
+
+    monkeypatch.setattr(server_module, "_wait_for_prompt_decision", _spy)
     row = await server_module._bounded_prompt_wait(pid, 5)
     assert row is not None
     assert row["id"] == pid
-    assert time.monotonic() - started < 1
+    assert seen == [(pid, 0.0)]
 
 
 async def test_prompt_mode_shell_wait_uses_shared_helper(
@@ -313,10 +320,6 @@ async def test_prompt_mode_shell_wait_uses_shared_helper(
 )
 def test_approval_wait_budget(requested: float, elapsed: float, expected: float) -> None:
     assert server_module._approval_wait_budget(requested, elapsed) == pytest.approx(expected)
-
-
-def test_approval_wait_deadline_is_18s() -> None:
-    assert server_module.APPROVAL_WAIT_DEADLINE_S == 18
 
 
 def _row(**overrides: object) -> dict:

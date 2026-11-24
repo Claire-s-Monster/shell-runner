@@ -12,6 +12,7 @@ import json
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,10 +36,72 @@ def client() -> TestClient:
     return TestClient(app)
 
 
+def _execute(client: TestClient, cwd: Path, **extra: object) -> dict:
+    body = {"command": COMMAND, "cwd": str(cwd), "agent_id": AGENT, **extra}
+    resp = client.post("/execute", json=body)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _on_poll(
+    monkeypatch: pytest.MonkeyPatch,
+    action: Callable[[str], object] | None = None,
+    at: int = 1,
+) -> dict[str, int]:
+    """Run action(prompt_id) once, just before the at-th get_pending_prompt read.
+
+    Returns a counter ({"n": reads so far}); action may be None to only count reads.
+    """
+    original = srv.db.get_pending_prompt
+    reads = {"n": 0}
+
+    def hooked(prompt_id: str) -> dict | None:
+        reads["n"] += 1
+        if action is not None and reads["n"] == at:
+            action(prompt_id)
+        return original(prompt_id)
+
+    monkeypatch.setattr(srv.db, "get_pending_prompt", hooked)
+    return reads
+
+
+def _break_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(_prompt_id: str) -> dict | None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(srv.db, "get_pending_prompt", broken)
+
+
+def _expire(prompt_id: str) -> None:
+    with srv.db._write_conn() as conn:
+        conn.execute(
+            "UPDATE pending_prompts SET expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", prompt_id),
+        )
+
+
+def _sweep(prompt_id: str) -> None:
+    with srv.db._write_conn() as conn:
+        conn.execute("DELETE FROM pending_prompts WHERE id = ?", (prompt_id,))
+
+
+def _approve_and_consume(cwd: Path) -> Callable[[str], None]:
+    def action(pid: str) -> None:
+        srv.db.approve_prompt(prompt_id=pid, decision="approve_once")
+        srv.db.consume_approval_by_command(raw_cmd=COMMAND, cwd=str(cwd), agent_id=AGENT)
+
+    return action
+
+
+_DECIDE: dict[str, Callable[[str], object]] = {
+    "approved": lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="approve_once"),
+    "denied": lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="deny"),
+    "expired": _expire,
+}
+
+
 def _request_prompt(client: TestClient, cwd: Path, agent_id: str = AGENT) -> str:
-    resp = client.post("/execute", json={"command": COMMAND, "cwd": str(cwd), "agent_id": agent_id})
-    assert resp.status_code == 200
-    data = resp.json()
+    data = _execute(client, cwd, agent_id=agent_id)
     assert data["decision"] == "prompt_required"
     return data["prompt"]["id"]
 
@@ -124,16 +187,8 @@ def test_wait_unblocks_when_approved_during_the_wait(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pid = _request_prompt(client, tmp_path)
-    original = srv.db.get_pending_prompt
-    calls = {"n": 0}
-
-    def _approve_on_third_read(prompt_id: str) -> dict | None:
-        calls["n"] += 1
-        if calls["n"] == 3:  # 1: ownership check, 2: first poll, 3: after one sleep
-            srv.db.approve_prompt(prompt_id=prompt_id, decision="approve_once")
-        return original(prompt_id)
-
-    monkeypatch.setattr(srv.db, "get_pending_prompt", _approve_on_third_read)
+    # at=3: past the ownership check and the first poll, so the decision lands mid-wait
+    _on_poll(monkeypatch, _DECIDE["approved"], at=3)
     waited = _wait(client, pid, wait_s=5)
     assert waited["state"] == "approved"
     assert waited["approve_token"]
@@ -206,8 +261,7 @@ def test_approving_expired_prompt_is_refused_and_withholds_token(client: TestCli
 
 def test_swept_prompt_reports_error_not_found(client: TestClient, tmp_path: Path) -> None:
     pid = _request_prompt(client, tmp_path)
-    with srv.db._write_conn() as conn:
-        conn.execute("DELETE FROM pending_prompts WHERE id = ?", (pid,))
+    _sweep(pid)
     assert _wait(client, pid)["state"] == "error"
 
 
@@ -256,40 +310,6 @@ def test_response_reports_reattached(client: TestClient, tmp_path: Path) -> None
 
 
 # --- issue #119: approval_wait_s ----------------------------------------------
-
-
-def _execute(client: TestClient, cwd: Path, **extra: object) -> dict:
-    body = {"command": COMMAND, "cwd": str(cwd), "agent_id": AGENT, **extra}
-    resp = client.post("/execute", json=body)
-    assert resp.status_code == 200, resp.text
-    return resp.json()
-
-
-def _on_poll(monkeypatch: pytest.MonkeyPatch, action: Callable[[str], object], at: int = 1) -> None:
-    """Run action(prompt_id) once, just before the at-th get_pending_prompt read."""
-    original = srv.db.get_pending_prompt
-    reads = {"n": 0}
-
-    def hooked(prompt_id: str) -> dict | None:
-        reads["n"] += 1
-        if reads["n"] == at:
-            action(prompt_id)
-        return original(prompt_id)
-
-    monkeypatch.setattr(srv.db, "get_pending_prompt", hooked)
-
-
-def _expire(prompt_id: str) -> None:
-    with srv.db._write_conn() as conn:
-        conn.execute(
-            "UPDATE pending_prompts SET expires_at = ? WHERE id = ?",
-            ("2000-01-01T00:00:00+00:00", prompt_id),
-        )
-
-
-def _sweep(prompt_id: str) -> None:
-    with srv.db._write_conn() as conn:
-        conn.execute("DELETE FROM pending_prompts WHERE id = ?", (prompt_id,))
 
 
 def _spy_wait(monkeypatch: pytest.MonkeyPatch) -> list[float]:
@@ -357,20 +377,13 @@ def test_deadline_counts_classify_queue_time(
     clock = _FakeTime()
     original_classify = srv.offload.classify_async
 
-    async def _slow_classify(*args: object, **kwargs: object) -> object:
+    async def _slow_classify(command: str, cwd: str, agent_id: str, **kw: Any) -> Any:
         clock.offset += 18.5
-        return await original_classify(*args, **kwargs)
-
-    reads = {"n": 0}
-    original_get = srv.db.get_pending_prompt
-
-    def _counting(prompt_id: str) -> dict | None:
-        reads["n"] += 1
-        return original_get(prompt_id)
+        return await original_classify(command, cwd, agent_id, **kw)
 
     monkeypatch.setattr(srv, "time", clock)
     monkeypatch.setattr(srv.offload, "classify_async", _slow_classify)
-    monkeypatch.setattr(srv.db, "get_pending_prompt", _counting)
+    reads = _on_poll(monkeypatch)
     prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
     assert prompt["state"] == "waiting"
     assert prompt["waited_s"] < 1
@@ -388,24 +401,21 @@ def test_saturated_semaphore_returns_waiting_immediately(
 
 def test_short_wait_without_decision_is_waiting(client: TestClient, tmp_path: Path) -> None:
     data = _execute(client, tmp_path, approval_wait_s=0.05)
+    prompt = data["prompt"]
     assert data["decision"] == "prompt_required"
-    assert data["prompt"]["state"] == "waiting"
-    assert data["prompt"]["waited_s"] >= 0
-
-
-def test_wait_reports_denied(
-    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _on_poll(monkeypatch, lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="deny"))
-    data = _execute(client, tmp_path, approval_wait_s=5)
-    assert data["decision"] == "denied"
-    assert data["prompt"]["state"] == "denied"
+    assert prompt["state"] == "waiting"
+    waited_s = prompt["waited_s"]
+    assert isinstance(waited_s, float)
+    assert 0 <= waited_s < 1
+    assert f"re-attaches to prompt {prompt['id']}" in prompt["next_steps"]
+    assert "approval_wait_s" in prompt["next_steps"]
+    assert "shell_wait" not in prompt["next_steps"]
 
 
 def test_wait_reports_approved_without_executing_or_consuming(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _on_poll(monkeypatch, lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="approve_once"))
+    _on_poll(monkeypatch, _DECIDE["approved"])
     data = _execute(client, tmp_path, approval_wait_s=5)
     assert data["decision"] == "prompt_required"
     assert data["stdout"] == ""
@@ -420,11 +430,7 @@ def test_wait_reports_approved_without_executing_or_consuming(
 def test_wait_reports_consumed(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def approve_and_consume(pid: str) -> None:  # a concurrent identical call used it
-        srv.db.approve_prompt(prompt_id=pid, decision="approve_once")
-        srv.db.consume_approval_by_command(raw_cmd=COMMAND, cwd=str(tmp_path), agent_id=AGENT)
-
-    _on_poll(monkeypatch, approve_and_consume)
+    _on_poll(monkeypatch, _approve_and_consume(tmp_path))  # a concurrent identical call used it
     data = _execute(client, tmp_path, approval_wait_s=5)
     assert data["decision"] == "prompt_required"
     assert data["prompt"]["state"] == "consumed"
@@ -436,10 +442,7 @@ def test_db_error_during_wait_still_returns_the_prompt(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    def broken(_prompt_id: str) -> dict | None:
-        raise RuntimeError("database is locked")
-
-    monkeypatch.setattr(srv.db, "get_pending_prompt", broken)
+    _break_reads(monkeypatch)
     with caplog.at_level("WARNING", logger="shell_runner.server"):
         data = _execute(client, tmp_path, approval_wait_s=5)
     pid = data["prompt"]["id"]
@@ -447,23 +450,17 @@ def test_db_error_during_wait_still_returns_the_prompt(
     assert pid
     assert data["prompt"]["state"] is None  # unwaited response, as without approval_wait_s
     assert data["prompt"]["waited_s"] is None
+    assert "shell_wait(prompt_id=" in data["prompt"]["next_steps"]
     assert [r["id"] for r in srv.db.list_pending_prompts()] == [pid]
     assert any(pid in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
 
 
-_DECIDE: dict[str, Callable[[str], object]] = {
-    "approved": lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="approve_once"),
-    "denied": lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="deny"),
-    "expired": _expire,
-}
-
-
 @pytest.mark.parametrize(
-    ("state", "needle"),
+    ("state", "decision", "needle"),
     [
-        ("approved", "Re-issue the identical shell_execute call"),
-        ("denied", "Stop: do not re-issue"),
-        ("expired", "expired before a decision. Stop"),
+        ("approved", "prompt_required", "Re-issue the identical shell_execute call"),
+        ("denied", "denied", "Stop: do not re-issue"),
+        ("expired", "prompt_required", "expired before a decision. Stop"),
     ],
 )
 def test_next_steps_for_decided_states(
@@ -471,34 +468,32 @@ def test_next_steps_for_decided_states(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     state: str,
+    decision: str,
     needle: str,
 ) -> None:
     _on_poll(monkeypatch, _DECIDE[state])
-    prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
+    data = _execute(client, tmp_path, approval_wait_s=5)
+    prompt = data["prompt"]
+    assert data["decision"] == decision
     assert prompt["state"] == state
     assert needle in prompt["next_steps"]
     assert "shell_wait" not in prompt["next_steps"]
     assert "approve_token" not in prompt["next_steps"]
-    if state == "approved":
-        assert "detach and approval_wait_s" in prompt["next_steps"]
 
 
-def test_next_steps_when_still_waiting(client: TestClient, tmp_path: Path) -> None:
-    prompt = _execute(client, tmp_path, approval_wait_s=0.05)["prompt"]
-    assert prompt["state"] == "waiting"
-    assert f"re-attaches to prompt {prompt['id']}" in prompt["next_steps"]
-    assert "approval_wait_s" in prompt["next_steps"]
-    assert "shell_wait" not in prompt["next_steps"]
+def test_next_steps_when_approved_mention_detach(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _on_poll(monkeypatch, _DECIDE["approved"])
+    prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
+    assert prompt["state"] == "approved"
+    assert "detach and approval_wait_s" in prompt["next_steps"]
 
 
 def test_next_steps_when_consumed(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def approve_and_consume(pid: str) -> None:
-        srv.db.approve_prompt(prompt_id=pid, decision="approve_once")
-        srv.db.consume_approval_by_command(raw_cmd=COMMAND, cwd=str(tmp_path), agent_id=AGENT)
-
-    _on_poll(monkeypatch, approve_and_consume)
+    _on_poll(monkeypatch, _approve_and_consume(tmp_path))
     prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
     assert prompt["state"] == "consumed"
     assert prompt["next_steps"] == (
@@ -507,25 +502,10 @@ def test_next_steps_when_consumed(
     )
 
 
-def test_db_error_keeps_unwaited_next_steps(
+def test_wait_reports_swept_prompt_as_expired(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def broken(_prompt_id: str) -> dict | None:
-        raise RuntimeError("database is locked")
-
-    monkeypatch.setattr(srv.db, "get_pending_prompt", broken)
-    prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
-    assert "shell_wait(prompt_id=" in prompt["next_steps"]
-
-
-@pytest.mark.parametrize("action", [_expire, _sweep])
-def test_wait_reports_expired_and_swept_as_expired(
-    client: TestClient,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    action: Callable[[str], None],
-) -> None:
-    _on_poll(monkeypatch, action)
+    _on_poll(monkeypatch, _sweep)
     data = _execute(client, tmp_path, approval_wait_s=5)
     assert data["decision"] == "prompt_required"
     assert data["prompt"]["state"] == "expired"
