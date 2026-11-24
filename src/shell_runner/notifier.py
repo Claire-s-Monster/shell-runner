@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 CMD_LIMIT = 120
@@ -65,3 +69,65 @@ def build_body(prompt: Mapping[str, Any], remaining_s: float, home: str) -> str:
         "decide on the Pending Prompts page",
     ]
     return "\n".join(lines)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _log(message: str) -> None:
+    print(f"shell-runner-notify: {message}", file=sys.stderr)
+
+
+def parse_expiry(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+@dataclass
+class Notifier:
+    """Polling core. `fetch()` returns prompt dicts or raises OSError/ValueError;
+    `notify(title, body, urgency)` raises one popup; `clock()` returns aware UTC."""
+
+    fetch: Callable[[], list[dict]]
+    notify: Callable[[str, str, str], None]
+    clock: Callable[[], datetime] = _utcnow
+    home: str = field(default_factory=lambda: str(Path.home()))
+    seen: set[str] = field(default_factory=set)
+
+    def tick(self) -> None:
+        now = self.clock()
+        self._handle(self.fetch(), now)
+
+    def _handle(self, prompts: list[dict], now: datetime) -> None:
+        live: set[str] = set()
+        for prompt in prompts:
+            try:
+                self._handle_one(prompt, now, live)
+            except (KeyError, TypeError, ValueError) as exc:
+                _log(f"skipping malformed prompt {prompt.get('id')}: {exc!r}")
+        self.seen &= live
+
+    def _handle_one(self, prompt: dict, now: datetime, live: set[str]) -> None:
+        expiry = parse_expiry(prompt.get("expires_at"))
+        if expiry is None:
+            _log(f"skipping prompt {prompt.get('id')}: bad expires_at")
+            return
+        remaining = (expiry - now).total_seconds()
+        if remaining <= 0 or prompt.get("approve_decision") is not None:
+            return
+        live.add(prompt["id"])
+        if prompt["id"] not in self.seen:
+            self.seen.add(prompt["id"])
+            self._popup(prompt, remaining, "approval needed")
+
+    def _popup(self, prompt: dict, remaining: float, what: str) -> None:
+        tier = int(prompt["command_tier"])
+        urgency = "critical" if tier == 4 else "normal"
+        title = f"shell-runner: T{tier} {what}"
+        self.notify(title, build_body(prompt, remaining, self.home), urgency)

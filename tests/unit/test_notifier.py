@@ -6,7 +6,9 @@ network, the desktop or real time.
 
 from __future__ import annotations
 
-from shell_runner.notifier import build_body, clean, format_remaining, shorten_home
+from datetime import UTC, datetime, timedelta
+
+from shell_runner.notifier import Notifier, build_body, clean, format_remaining, shorten_home
 
 
 def test_clean_escapes_markup() -> None:
@@ -129,3 +131,142 @@ def test_build_body_tolerates_none_fields() -> None:
     assert "agent: ?" in body.splitlines()
     assert "cwd: ?" in body.splitlines()
     assert "cmd: ?" in body.splitlines()
+
+
+NOW = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = NOW
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+class Feed:
+    """Injected fetcher: returns `prompts`, or raises `error` when set."""
+
+    def __init__(self) -> None:
+        self.prompts: list[dict] = []
+        self.error: Exception | None = None
+        self.calls = 0
+
+    def __call__(self) -> list[dict]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return list(self.prompts)
+
+
+def make_prompt(pid: str = "p1", tier: int = 3, expires_in: float = 300, **extra) -> dict:
+    return {
+        "id": pid,
+        "agent_id": "agent-1",
+        "cwd": "/home/me/proj",
+        "raw_cmd": "curl -sI https://example.com",
+        "command_tier": tier,
+        "expires_at": (NOW + timedelta(seconds=expires_in)).isoformat(),
+        "approve_decision": None,
+        "scope_warning": None,
+        **extra,
+    }
+
+
+def make_notifier() -> tuple[Notifier, Feed, Clock, list[tuple[str, str, str]]]:
+    feed, clock = Feed(), Clock()
+    popups: list[tuple[str, str, str]] = []
+    notifier = Notifier(
+        fetch=feed,
+        notify=lambda title, body, urgency: popups.append((title, body, urgency)),
+        clock=clock,
+        home="/home/me",
+    )
+    return notifier, feed, clock, popups
+
+
+def test_new_prompt_gives_one_popup() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt()]
+    notifier.tick()
+    assert len(popups) == 1
+    title, body, urgency = popups[0]
+    assert title == "shell-runner: T3 approval needed"
+    assert urgency == "normal"
+    assert "cwd: ~/proj" in body
+
+
+def test_same_id_is_not_repeated() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt()]
+    for _ in range(3):
+        notifier.tick()
+        clock.advance(3)
+    assert len(popups) == 1
+
+
+def test_second_prompt_gets_its_own_popup() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt("p1")]
+    notifier.tick()
+    feed.prompts = [make_prompt("p1"), make_prompt("p2")]
+    notifier.tick()
+    assert len(popups) == 2
+
+
+def test_t4_is_critical() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt(tier=4)]
+    notifier.tick()
+    assert popups[0][0] == "shell-runner: T4 approval needed"
+    assert popups[0][2] == "critical"
+
+
+def test_scope_warning_is_first_line_of_body() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt(scope_warning="broad template")]
+    notifier.tick()
+    assert popups[0][1].splitlines()[0] == "broad template"
+
+
+def test_expired_prompts_are_skipped() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt(expires_in=-1), make_prompt("p2", expires_in=0)]
+    notifier.tick()
+    assert popups == []
+
+
+def test_decided_prompts_are_skipped() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt(approve_decision="approve_once")]
+    notifier.tick()
+    assert popups == []
+
+
+def test_unparseable_expiry_is_skipped_not_fatal() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt(expires_at="garbage"), make_prompt("p2")]
+    notifier.tick()
+    assert len(popups) == 1
+
+
+def test_malformed_prompt_does_not_kill_the_poll_loop() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    broken = make_prompt("bad", tier="not-a-number")  # type: ignore[arg-type]
+    feed.prompts = [broken, make_prompt("p2")]
+    notifier.tick()  # must not raise
+    assert len(popups) == 1
+    assert "agent: agent-1" in popups[0][1]
+
+
+def test_prompt_missing_raw_cmd_still_gets_a_popup() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    broken = make_prompt("bad")
+    del broken["raw_cmd"]
+    feed.prompts = [broken, make_prompt("p2")]
+    notifier.tick()
+    assert len(popups) == 2
+    assert "cmd: ?" in popups[0][1].splitlines()
