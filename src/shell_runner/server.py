@@ -1563,7 +1563,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         prompt=prompt_info,
     )
     # issue #119: the shell_calls row above stays decision="prompt_required"; the wait
-    # does not update it (spec deviation 5).
+    # does not update it (#119 plan, "Spec deviations" item 5).
     if not req.approval_wait_s:  # None or 0: return at once, as before #119
         return resp
     return await _wait_on_prompt(resp, prompt_info, req.approval_wait_s, t0)
@@ -2099,7 +2099,7 @@ async def _wait_for_prompt_decision(prompt_id: str, wait_s: float) -> dict | Non
     """Poll the prompt row until it leaves "waiting" or *wait_s* elapses; return the last row."""
     deadline = time.monotonic() + wait_s
     while True:
-        row = db.get_pending_prompt(prompt_id)
+        row = await asyncio.to_thread(db.get_pending_prompt, prompt_id)
         if row is None or _prompt_wait_state(row) != "waiting":
             return row
         remaining = deadline - time.monotonic()
@@ -2150,10 +2150,20 @@ async def _wait_on_prompt(
     the prompt create/re-attach. Read-only: it never consumes an approval or hands out
     a token, and never executes; an approved command runs when the caller re-issues
     the identical call, so wait plus execution never share one call's ~20s budget.
+
+    A failed read returns *resp* unwaited (state/waited_s unset): the prompt and its
+    shell_calls row already exist, so the caller must still get the prompt id.
     """
     wait_s = _approval_wait_budget(requested_s, time.monotonic() - t0)
     started = time.monotonic()
-    state = _execute_prompt_state(await _bounded_prompt_wait(prompt.id, wait_s))
+    try:
+        row = await _bounded_prompt_wait(prompt.id, wait_s)
+    except Exception:  # not BaseException: cancellation still propagates
+        logger.warning(
+            "approval wait on prompt %s failed; returning unwaited", prompt.id, exc_info=True
+        )
+        return resp
+    state = _execute_prompt_state(row)
     waited = prompt.model_copy(update={"state": state, "waited_s": time.monotonic() - started})
     decision = "denied" if state == "denied" else "prompt_required"
     return resp.model_copy(update={"decision": decision, "prompt": waited})

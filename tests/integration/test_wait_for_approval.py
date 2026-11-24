@@ -422,6 +422,27 @@ def test_wait_reports_consumed(
     assert data["prompt"]["state"] == "consumed"
 
 
+def test_db_error_during_wait_still_returns_the_prompt(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def broken(_prompt_id: str) -> dict | None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(srv.db, "get_pending_prompt", broken)
+    with caplog.at_level("WARNING", logger="shell_runner.server"):
+        data = _execute(client, tmp_path, approval_wait_s=5)
+    pid = data["prompt"]["id"]
+    assert data["decision"] == "prompt_required"
+    assert pid
+    assert data["prompt"]["state"] is None  # unwaited response, as without approval_wait_s
+    assert data["prompt"]["waited_s"] is None
+    assert [r["id"] for r in srv.db.list_pending_prompts()] == [pid]
+    assert any(pid in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
 @pytest.mark.parametrize("action", [_expire, _sweep])
 def test_wait_reports_expired_and_swept_as_expired(
     client: TestClient,
