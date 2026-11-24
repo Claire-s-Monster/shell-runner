@@ -285,6 +285,93 @@ def test_seen_is_pruned_when_prompt_disappears() -> None:
     assert notifier.seen == set()
 
 
+def test_reminder_fires_once_about_60s_before_expiry() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt(expires_in=300)]
+    notifier.tick()  # 300s left: initial popup only
+    clock.advance(239)  # 61s left
+    notifier.tick()
+    assert len(popups) == 1
+    clock.advance(1)  # 60s left
+    notifier.tick()
+    assert len(popups) == 2
+    assert popups[1][0] == "shell-runner: T3 approval expiring"
+    assert "expires in 1m 0s" in popups[1][1]
+    clock.advance(3)
+    notifier.tick()
+    clock.advance(3)
+    notifier.tick()
+    assert len(popups) == 2  # once only
+
+
+def test_no_reminder_when_prompt_was_decided() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt(expires_in=300)]
+    notifier.tick()
+    feed.prompts = []  # /pending no longer lists decided prompts
+    clock.advance(245)
+    notifier.tick()
+    feed.prompts = [make_prompt(expires_in=300, approve_decision="deny")]
+    notifier.tick()
+    assert len(popups) == 1
+
+
+def test_no_second_reminder_when_first_seen_inside_window() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt(expires_in=40)]
+    notifier.tick()
+    clock.advance(3)
+    notifier.tick()
+    assert len(popups) == 1  # initial popup already doubles as the reminder
+
+
+def test_t4_reminder_is_critical() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt(tier=4, expires_in=300)]
+    notifier.tick()
+    clock.advance(245)
+    notifier.tick()
+    assert popups[1][0] == "shell-runner: T4 approval expiring"
+    assert popups[1][2] == "critical"
+
+
+def test_no_reminder_after_expiry() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt(expires_in=300)]
+    notifier.tick()
+    clock.advance(301)
+    notifier.tick()
+    assert len(popups) == 1
+
+
+def test_reminded_is_pruned_when_prompt_disappears() -> None:
+    notifier, feed, clock, _popups = make_notifier()
+    feed.prompts = [make_prompt("p1"), make_prompt("p2")]
+    notifier.tick()
+    clock.advance(245)
+    notifier.tick()
+    assert notifier.reminded == {"p1", "p2"}
+    feed.prompts = [make_prompt("p1", expires_in=300)]
+    notifier.tick()
+    assert notifier.reminded == {"p1"}
+    feed.prompts = []
+    notifier.tick()
+    assert notifier.reminded == set()
+
+
+def test_failed_reminder_popup_is_not_retried() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt(expires_in=300)]
+    notifier.tick()
+    feed.prompts[0]["command_tier"] = "not-a-number"
+    clock.advance(245)
+    notifier.tick()  # reminder popup raises ValueError, which is caught
+    feed.prompts[0]["command_tier"] = 3
+    clock.advance(3)
+    notifier.tick()
+    assert len(popups) == 1
+
+
 def test_prompt_missing_raw_cmd_still_gets_a_popup() -> None:
     notifier, feed, _clock, popups = make_notifier()
     broken = make_prompt("bad")

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 CMD_LIMIT = 120
+REMIND_BEFORE_S = 60
 TRUNCATED = "… (truncated)"
 _WHITESPACE_CTRL = re.compile(r"[\n\r\t\x85]")
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
@@ -99,6 +100,7 @@ class Notifier:
     clock: Callable[[], datetime] = _utcnow
     home: str = field(default_factory=lambda: str(Path.home()))
     seen: set[str] = field(default_factory=set)
+    reminded: set[str] = field(default_factory=set)
 
     def tick(self) -> None:
         now = self.clock()
@@ -117,6 +119,7 @@ class Notifier:
             except (KeyError, TypeError, ValueError) as exc:
                 _log(f"skipping malformed prompt {prompt.get('id')}: {exc!r}")
         self.seen &= live
+        self.reminded &= live
 
     def _handle_one(self, prompt: dict[str, Any], now: datetime, live: set[str]) -> None:
         expiry = parse_expiry(prompt.get("expires_at"))
@@ -129,7 +132,12 @@ class Notifier:
         live.add(prompt["id"])
         if prompt["id"] not in self.seen:
             self.seen.add(prompt["id"])
+            if remaining <= REMIND_BEFORE_S:
+                self.reminded.add(prompt["id"])
             self._popup(prompt, remaining, "approval needed")
+        elif prompt["id"] not in self.reminded and remaining <= REMIND_BEFORE_S:
+            self.reminded.add(prompt["id"])
+            self._popup(prompt, remaining, "approval expiring")
 
     def _popup(self, prompt: dict[str, Any], remaining: float, what: str) -> None:
         tier = int(prompt["command_tier"])
