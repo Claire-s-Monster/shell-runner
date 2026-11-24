@@ -294,3 +294,103 @@ async def test_prompt_mode_shell_wait_uses_shared_helper(
     resp = await shell_wait_route(ShellWaitRequest(prompt_id=pid, agent_id="test-agent", wait_s=3))
     assert resp.state == "waiting"
     assert seen == [(pid, 3.0)]
+
+
+# --- issue #119: shell_execute(approval_wait_s) -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("requested", "elapsed", "expected"),
+    [
+        (5, 0, 5),
+        (9999, 0, MAX_WAIT_S),  # clamp to MAX_WAIT_S
+        (15, 10, 8),  # deadline 18 minus elapsed
+        (15, 18, 0),  # deadline reached: single check
+        (15, 30, 0),  # floored at 0
+        (0, 0, 0),
+        (-3, 0, 0),
+    ],
+)
+def test_approval_wait_budget(requested: float, elapsed: float, expected: float) -> None:
+    assert server_module._approval_wait_budget(requested, elapsed) == pytest.approx(expected)
+
+
+def test_approval_wait_deadline_is_18s() -> None:
+    assert server_module.APPROVAL_WAIT_DEADLINE_S == 18
+
+
+def _row(**overrides: object) -> dict:
+    row: dict = {
+        "approve_decision": None,
+        "approve_token": None,
+        "consumed_at": None,
+        "expires_at": "9999-12-31T00:00:00+00:00",
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (None, "expired"),  # swept by cleanup
+        (_row(), "waiting"),
+        (_row(approve_decision="approve_once", approve_token="t"), "approved"),
+        (_row(approve_decision="deny"), "denied"),
+        (
+            _row(approve_decision="approve_once", approve_token="t", consumed_at="2026-01-01"),
+            "consumed",
+        ),
+        (_row(expires_at="2000-01-01T00:00:00+00:00"), "expired"),
+    ],
+)
+def test_execute_prompt_state_mapping(row: dict | None, expected: str) -> None:
+    assert server_module._execute_prompt_state(row) == expected
+
+
+async def test_wait_on_prompt_near_deadline_checks_once_without_sleeping(
+    db: Persistence, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Request entered execute_route 18.5s ago: the budget is spent, so one read, no sleep."""
+    pid = _make_prompt(db, tmp_path)
+    reads: list[str] = []
+    original = db.get_pending_prompt
+
+    def _counting(prompt_id: str) -> dict | None:
+        reads.append(prompt_id)
+        return original(prompt_id)
+
+    async def _no_sleep(_delay: float) -> None:
+        raise AssertionError("the wait slept although the deadline was spent")
+
+    monkeypatch.setattr(db, "get_pending_prompt", _counting)
+    monkeypatch.setattr(server_module.asyncio, "sleep", _no_sleep)
+    prompt = server_module.ExecutePromptInfo(
+        id=pid,
+        raw_cmd="mytool --flag",
+        template="mytool --flag",
+        category=None,
+        tier=3,
+        why="w",
+        next_steps="n",
+    )
+    resp = server_module.ExecuteResponse(
+        decision="prompt_required",
+        tier=3,
+        matched_rule=None,
+        exit_code=None,
+        stdout="",
+        stderr="",
+        stdout_full_path=None,
+        stderr_full_path=None,
+        duration_ms=0,
+        telemetry_id="t",
+        prompt=prompt,
+    )
+    out = await server_module._wait_on_prompt(resp, prompt, 15, time.monotonic() - 18.5)
+    assert reads == [pid]
+    assert out.decision == "prompt_required"
+    assert out.prompt is not None
+    assert out.prompt.state == "waiting"
+    assert out.prompt.waited_s is not None
+    assert out.prompt.waited_s < 1

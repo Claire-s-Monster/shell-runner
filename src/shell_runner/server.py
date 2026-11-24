@@ -63,6 +63,7 @@ from .models import (
     ClassifyRequest,
     ClassifyResponse,
     ExecutePromptInfo,
+    ExecutePromptState,
     ExecuteRequest,
     ExecuteResponse,
     GetPendingRequest,
@@ -1531,7 +1532,24 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             "(template/verb approvals never apply to detached runs)"
         )
         detach_rerun = " Re-run with detach=true; the token is refused for any other detach value."
-    return ExecuteResponse(
+    prompt_info = ExecutePromptInfo(
+        id=prompt_id,
+        raw_cmd=req.command,
+        template=cls.template,
+        category=cls.matched_rule.category if cls.matched_rule else None,
+        tier=int(cls.tier),
+        why=why,
+        next_steps=(
+            f"A primary session must approve prompt {prompt_id} via shell_approve_pending. "
+            f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
+            "repeatedly until state is 'approved', then re-run shell_execute with the "
+            "identical command, cwd and agent_id plus approve_token. "
+            "Stop if state is 'denied' or 'expired'." + detach_rerun
+        ),
+        detach=req.detach,
+        reattached=reattached,
+    )
+    resp = ExecuteResponse(
         decision="prompt_required",
         tier=int(cls.tier),
         matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
@@ -1542,24 +1560,13 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         stderr_full_path=None,
         duration_ms=duration_ms,
         telemetry_id=telemetry_id,
-        prompt=ExecutePromptInfo(
-            id=prompt_id,
-            raw_cmd=req.command,
-            template=cls.template,
-            category=cls.matched_rule.category if cls.matched_rule else None,
-            tier=int(cls.tier),
-            why=why,
-            next_steps=(
-                f"A primary session must approve prompt {prompt_id} via shell_approve_pending. "
-                f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
-                "repeatedly until state is 'approved', then re-run shell_execute with the "
-                "identical command, cwd and agent_id plus approve_token. "
-                "Stop if state is 'denied' or 'expired'." + detach_rerun
-            ),
-            detach=req.detach,
-            reattached=reattached,
-        ),
+        prompt=prompt_info,
     )
+    # issue #119: the shell_calls row above stays decision="prompt_required"; the wait
+    # does not update it (spec deviation 5).
+    if not req.approval_wait_s:  # None or 0: return at once, as before #119
+        return resp
+    return await _wait_on_prompt(resp, prompt_info, req.approval_wait_s, t0)
 
 
 @app.post("/classify", response_model=ClassifyResponse)
@@ -2108,6 +2115,48 @@ async def _bounded_prompt_wait(prompt_id: str, wait_s: float) -> dict | None:
         return await _wait_for_prompt_decision(prompt_id, 0.0)
     async with _wait_semaphore:
         return await _wait_for_prompt_decision(prompt_id, wait_s)
+
+
+# issue #119 — shell_execute(approval_wait_s). The wait must fit the ~20s MCP transport
+# cutoff (#46) with a 2s margin; the inline budget setting is deliberately not used.
+APPROVAL_WAIT_DEADLINE_S = 18
+
+# _prompt_wait_state reports a spent approval as "error"; shell_execute calls it "consumed".
+_EXECUTE_PROMPT_STATES: dict[str, ExecutePromptState] = {
+    "approved": "approved",
+    "denied": "denied",
+    "expired": "expired",
+    "waiting": "waiting",
+    "error": "consumed",
+}
+
+
+def _approval_wait_budget(requested_s: float, elapsed_s: float) -> float:
+    """max(0, min(requested, MAX_WAIT_S, APPROVAL_WAIT_DEADLINE_S - elapsed)); 0 = one check."""
+    return max(0.0, min(requested_s, float(MAX_WAIT_S), APPROVAL_WAIT_DEADLINE_S - elapsed_s))
+
+
+def _execute_prompt_state(row: dict | None) -> ExecutePromptState:
+    """shell_execute's view of its prompt after the wait; a swept row (None) is expired."""
+    return "expired" if row is None else _EXECUTE_PROMPT_STATES[_prompt_wait_state(row)]
+
+
+async def _wait_on_prompt(
+    resp: ExecuteResponse, prompt: ExecutePromptInfo, requested_s: float, t0: float
+) -> ExecuteResponse:
+    """Opt-in bounded wait for the decision on resp's prompt (issue #119).
+
+    *t0* is execute_route's entry time, so the budget includes classify queueing and
+    the prompt create/re-attach. Read-only: it never consumes an approval or hands out
+    a token, and never executes; an approved command runs when the caller re-issues
+    the identical call, so wait plus execution never share one call's ~20s budget.
+    """
+    wait_s = _approval_wait_budget(requested_s, time.monotonic() - t0)
+    started = time.monotonic()
+    state = _execute_prompt_state(await _bounded_prompt_wait(prompt.id, wait_s))
+    waited = prompt.model_copy(update={"state": state, "waited_s": time.monotonic() - started})
+    decision = "denied" if state == "denied" else "prompt_required"
+    return resp.model_copy(update={"decision": decision, "prompt": waited})
 
 
 async def _wait_for_prompt(
