@@ -14,6 +14,9 @@ from shell_runner.persistence import ApprovalDecision
 DEFAULT_MAX_TIMEOUT_S = 3600  # 1 hour
 MAX_TIMEOUT_S = int(os.environ.get("SHELL_RUNNER_MAX_TIMEOUT_S", str(DEFAULT_MAX_TIMEOUT_S)))
 
+# issue #119: where a prompt stands after shell_execute(approval_wait_s) waited on it.
+ExecutePromptState = Literal["approved", "denied", "expired", "consumed", "waiting"]
+
 
 class ExecuteRequest(BaseModel):
     command: str
@@ -49,6 +52,15 @@ class ExecuteRequest(BaseModel):
             "never apply to detach."
         ),
     )
+    approval_wait_s: float | None = Field(
+        default=None,
+        allow_inf_nan=False,
+        description=(
+            "Opt-in (issue #119): on prompt_required, wait up to this many seconds for "
+            "the approver's decision. Clamped to [0, 15] and to an 18s per-call deadline. "
+            "None or 0 returns at once."
+        ),
+    )
 
 
 class ExecutePromptInfo(BaseModel):
@@ -60,6 +72,11 @@ class ExecutePromptInfo(BaseModel):
     why: str
     next_steps: str = ""
     detach: bool = False
+    # issue #119: reattached is True when this call reused an identical open prompt;
+    # state and waited_s are set only when approval_wait_s made the call wait.
+    reattached: bool = False
+    state: ExecutePromptState | None = None
+    waited_s: float | None = None
 
 
 class ExecuteResponse(BaseModel):

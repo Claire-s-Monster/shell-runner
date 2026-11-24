@@ -236,3 +236,10 @@ def test_reattached_call_is_tagged_in_shell_calls(client: TestClient, tmp_path: 
         ).fetchone()[0]
     assert "reattached" not in json.loads(stored)
     assert _request_prompt(client, tmp_path) == pid
+
+
+def test_response_reports_reattached(client: TestClient, tmp_path: Path) -> None:
+    body = {"command": COMMAND, "cwd": str(tmp_path), "agent_id": AGENT}
+    first = client.post("/execute", json=body).json()["prompt"]
+    second = client.post("/execute", json=body).json()["prompt"]
+    assert (first["reattached"], second["reattached"]) == (False, True)

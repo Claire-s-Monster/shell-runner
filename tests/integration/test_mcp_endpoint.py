@@ -413,3 +413,11 @@ def test_initialize_advertises_resources_and_prompts_capabilities(client: TestCl
     assert "tools" in caps
     assert "resources" in caps
     assert "prompts" in caps
+
+
+def test_shell_execute_schema_exposes_approval_wait_s(client: TestClient) -> None:
+    resp = _post(client, "tools/list", req_id=2)
+    execute_tool = next(t for t in resp["result"]["tools"] if t["name"] == "shell_execute")
+    prop = execute_tool["inputSchema"]["properties"]["approval_wait_s"]
+    assert prop["type"] == ["number", "null"]
+    assert "approval_wait_s" in execute_tool["description"]

@@ -1557,6 +1557,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
                 "Stop if state is 'denied' or 'expired'." + detach_rerun
             ),
             detach=req.detach,
+            reattached=reattached,
         ),
     )
 
