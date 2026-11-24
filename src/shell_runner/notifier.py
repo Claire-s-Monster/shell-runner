@@ -8,9 +8,12 @@ anything: ``/pending`` returns no tokens and popups only inform.
 from __future__ import annotations
 
 import html
+import json
 import re
 import sys
 import unicodedata
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -21,6 +24,7 @@ CMD_LIMIT = 120
 REMIND_BEFORE_S = 60
 MAX_BACKOFF_S = 60.0
 DEFAULT_INTERVAL_S = 3.0
+MAX_RESPONSE_BYTES = 1_048_576
 TRUNCATED = "… (truncated)"
 _WHITESPACE_CTRL = re.compile(r"[\n\r\t\x85]")
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
@@ -175,3 +179,32 @@ class Notifier:
         urgency = "critical" if tier == 4 else "normal"
         title = f"shell-runner: T{tier} {what}"
         self.notify(title, build_body(prompt, remaining, self.home), urgency)
+
+
+def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
+    """POST `{}` to /pending and return the prompt list.
+
+    Raises OSError (incl. URLError/HTTPError/timeout, or a non-200 status) when
+    unreachable and ValueError on a non-http(s) URL, an oversized or malformed
+    response; `Notifier.tick` treats both as "server unreachable".
+    """
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {url!r}")
+    request = urllib.request.Request(
+        url,
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # B310 suppressed below: the scheme was restricted to http/https above.
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+        if response.status != 200:
+            raise OSError(f"unexpected HTTP status {response.status}")
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ValueError("/pending response too large")
+    data = json.loads(raw)
+    prompts = data.get("prompts") if isinstance(data, dict) else None
+    if not isinstance(prompts, list):
+        raise ValueError("unexpected /pending response")
+    return prompts

@@ -6,11 +6,23 @@ network, the desktop or real time.
 
 from __future__ import annotations
 
+import json
+import threading
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 
 import pytest
 
-from shell_runner.notifier import Notifier, build_body, clean, format_remaining, shorten_home
+from shell_runner.notifier import (
+    MAX_RESPONSE_BYTES,
+    Notifier,
+    build_body,
+    clean,
+    format_remaining,
+    http_fetch,
+    shorten_home,
+)
 
 
 def test_clean_escapes_markup() -> None:
@@ -496,3 +508,135 @@ def test_failed_unreachable_popup_is_not_retried_every_tick() -> None:
     notifier.tick()  # still failing: back-off state was recorded before the popup
     assert len(calls) == 1
     assert feed.calls == 2
+
+
+def _serve(payload: bytes, status: int = 200) -> tuple[HTTPServer, dict[str, Any]]:
+    seen: dict[str, Any] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 (http.server handler naming)
+            seen["path"] = self.path
+            seen["method"] = self.command
+            seen["body"] = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, seen
+
+
+def _url(server: HTTPServer) -> str:
+    return f"http://127.0.0.1:{server.server_port}/pending"
+
+
+def test_http_fetch_posts_empty_json_and_returns_prompts() -> None:
+    server, seen = _serve(json.dumps({"prompts": [{"id": "p1"}]}).encode())
+    try:
+        assert http_fetch(_url(server)) == [{"id": "p1"}]
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/pending"
+    assert json.loads(seen["body"]) == {}
+
+
+def test_http_fetch_rejects_unexpected_payload_as_value_error() -> None:
+    server, _seen = _serve(b'{"nope": 1}')
+    try:
+        with pytest.raises(ValueError, match="unexpected"):
+            http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_fetch_connection_refused_is_oserror() -> None:
+    server, _seen = _serve(b"{}")
+    port = server.server_port
+    server.shutdown()
+    server.server_close()
+    with pytest.raises(OSError):  # noqa: PT011
+        http_fetch(f"http://127.0.0.1:{port}/pending", timeout=1)
+
+
+def test_http_fetch_malformed_json_is_value_error() -> None:
+    server, _seen = _serve(b"not json")
+    try:
+        with pytest.raises(ValueError):  # noqa: PT011
+            http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_fetch_non_200_is_oserror() -> None:
+    server, _seen = _serve(b'{"prompts": []}', status=500)
+    try:
+        with pytest.raises(OSError):  # noqa: PT011
+            http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_fetch_non_200_success_status_is_oserror() -> None:
+    server, _seen = _serve(b'{"prompts": []}', status=202)
+    try:
+        with pytest.raises(OSError, match="202"):
+            http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_fetch_oversized_response_is_value_error() -> None:
+    server, _seen = _serve(b" " * (MAX_RESPONSE_BYTES + 1))
+    try:
+        with pytest.raises(ValueError, match="too large"):
+            http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://127.0.0.1/pending", "/pending"])
+def test_http_fetch_rejects_non_http_schemes(url: str) -> None:
+    with pytest.raises(ValueError, match="scheme"):
+        http_fetch(url)
+
+
+def test_http_fetch_sends_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(_request: object, timeout: float | None = None) -> None:
+        captured["timeout"] = timeout
+        raise OSError("stop")
+
+    monkeypatch.setattr("shell_runner.notifier.urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(OSError, match="stop"):
+        http_fetch("http://127.0.0.1:1/pending", timeout=2.5)
+    assert captured["timeout"] == 2.5
+
+
+def test_http_fetch_failures_are_what_tick_treats_as_unreachable() -> None:
+    server, _seen = _serve(b"not json")
+    popups: list[str] = []
+    try:
+        notifier = Notifier(
+            fetch=lambda: http_fetch(_url(server)),
+            notify=lambda title, _body, _urgency: popups.append(title),
+            home="/home/me",
+        )
+        notifier.tick()
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert popups == ["shell-runner-notify: server unreachable"]
