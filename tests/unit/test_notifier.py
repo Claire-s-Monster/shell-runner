@@ -260,6 +260,29 @@ def test_malformed_prompt_does_not_kill_the_poll_loop() -> None:
     notifier.tick()  # must not raise
     assert len(popups) == 1
     assert "agent: agent-1" in popups[0][1]
+    notifier.tick()  # the bad id is not retried
+    assert len(popups) == 1
+
+
+def test_non_dict_entry_is_skipped_not_fatal() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.prompts = ["oops", None, make_prompt("p2")]  # type: ignore[list-item]
+    notifier.tick()  # must not raise
+    assert len(popups) == 1
+
+
+def test_seen_is_pruned_when_prompt_disappears() -> None:
+    notifier, feed, clock, _popups = make_notifier()
+    feed.prompts = [make_prompt("p1"), make_prompt("p2")]
+    notifier.tick()
+    assert notifier.seen == {"p1", "p2"}
+    feed.prompts = [make_prompt("p1"), make_prompt("p2", approve_decision="approve_once")]
+    clock.advance(3)
+    notifier.tick()
+    assert notifier.seen == {"p1"}
+    feed.prompts = []
+    notifier.tick()
+    assert notifier.seen == set()
 
 
 def test_prompt_missing_raw_cmd_still_gets_a_popup() -> None:

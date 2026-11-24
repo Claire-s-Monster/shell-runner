@@ -94,7 +94,7 @@ class Notifier:
     """Polling core. `fetch()` returns prompt dicts or raises OSError/ValueError;
     `notify(title, body, urgency)` raises one popup; `clock()` returns aware UTC."""
 
-    fetch: Callable[[], list[dict]]
+    fetch: Callable[[], list[dict[str, Any]]]
     notify: Callable[[str, str, str], None]
     clock: Callable[[], datetime] = _utcnow
     home: str = field(default_factory=lambda: str(Path.home()))
@@ -104,16 +104,21 @@ class Notifier:
         now = self.clock()
         self._handle(self.fetch(), now)
 
-    def _handle(self, prompts: list[dict], now: datetime) -> None:
+    def _handle(self, prompts: list[Any], now: datetime) -> None:
         live: set[str] = set()
         for prompt in prompts:
+            if not isinstance(prompt, dict):
+                _log(f"skipping non-object prompt entry: {repr(prompt)[:80]}")
+                continue
+            # notify() failures (notify-send/xdg-open OSError) are handled inside
+            # DesktopNotifier (Task 6), so they are deliberately not caught here.
             try:
                 self._handle_one(prompt, now, live)
             except (KeyError, TypeError, ValueError) as exc:
                 _log(f"skipping malformed prompt {prompt.get('id')}: {exc!r}")
         self.seen &= live
 
-    def _handle_one(self, prompt: dict, now: datetime, live: set[str]) -> None:
+    def _handle_one(self, prompt: dict[str, Any], now: datetime, live: set[str]) -> None:
         expiry = parse_expiry(prompt.get("expires_at"))
         if expiry is None:
             _log(f"skipping prompt {prompt.get('id')}: bad expires_at")
@@ -126,7 +131,7 @@ class Notifier:
             self.seen.add(prompt["id"])
             self._popup(prompt, remaining, "approval needed")
 
-    def _popup(self, prompt: dict, remaining: float, what: str) -> None:
+    def _popup(self, prompt: dict[str, Any], remaining: float, what: str) -> None:
         tier = int(prompt["command_tier"])
         urgency = "critical" if tier == 4 else "normal"
         title = f"shell-runner: T{tier} {what}"
