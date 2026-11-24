@@ -2131,6 +2131,27 @@ _EXECUTE_PROMPT_STATES: dict[str, ExecutePromptState] = {
 }
 
 
+# next_steps after an approval wait. A wait never yields an approve_token and does not
+# need shell_wait: the caller re-issues the identical call.
+_WAIT_NEXT_STEPS: dict[ExecutePromptState, str] = {
+    "approved": (
+        "Prompt {id} was approved. Re-issue the identical shell_execute call (same command, "
+        "cwd, agent_id, detach and approval_wait_s) once to run it."
+    ),
+    "denied": "Prompt {id} was denied. Stop: do not re-issue this command.",
+    "expired": "Prompt {id} expired before a decision. Stop.",
+    "consumed": (
+        "This approval was already used by an earlier identical call; re-issue to request "
+        "a new approval."
+    ),
+    "waiting": (
+        "No decision yet on prompt {id}. Re-issue the identical call (same command, cwd, "
+        "agent_id, detach, approval_wait_s) to keep waiting; it re-attaches to prompt {id}. "
+        "Stop if state is 'denied' or 'expired'."
+    ),
+}
+
+
 def _approval_wait_budget(requested_s: float, elapsed_s: float) -> float:
     """max(0, min(requested, MAX_WAIT_S, APPROVAL_WAIT_DEADLINE_S - elapsed)); 0 = one check."""
     return max(0.0, min(requested_s, float(MAX_WAIT_S), APPROVAL_WAIT_DEADLINE_S - elapsed_s))
@@ -2164,7 +2185,13 @@ async def _wait_on_prompt(
         )
         return resp
     state = _execute_prompt_state(row)
-    waited = prompt.model_copy(update={"state": state, "waited_s": time.monotonic() - started})
+    waited = prompt.model_copy(
+        update={
+            "state": state,
+            "waited_s": time.monotonic() - started,
+            "next_steps": _WAIT_NEXT_STEPS[state].format(id=prompt.id),
+        }
+    )
     decision = "denied" if state == "denied" else "prompt_required"
     return resp.model_copy(update={"decision": decision, "prompt": waited})
 

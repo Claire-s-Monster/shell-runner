@@ -443,6 +443,73 @@ def test_db_error_during_wait_still_returns_the_prompt(
     assert any(pid in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
 
 
+_DECIDE: dict[str, Callable[[str], object]] = {
+    "approved": lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="approve_once"),
+    "denied": lambda pid: srv.db.approve_prompt(prompt_id=pid, decision="deny"),
+    "expired": _expire,
+}
+
+
+@pytest.mark.parametrize(
+    ("state", "needle"),
+    [
+        ("approved", "Re-issue the identical shell_execute call"),
+        ("denied", "Stop: do not re-issue"),
+        ("expired", "expired before a decision. Stop"),
+    ],
+)
+def test_next_steps_for_decided_states(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    needle: str,
+) -> None:
+    _on_poll(monkeypatch, _DECIDE[state])
+    prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
+    assert prompt["state"] == state
+    assert needle in prompt["next_steps"]
+    assert "shell_wait" not in prompt["next_steps"]
+    assert "approve_token" not in prompt["next_steps"]
+    if state == "approved":
+        assert "detach and approval_wait_s" in prompt["next_steps"]
+
+
+def test_next_steps_when_still_waiting(client: TestClient, tmp_path: Path) -> None:
+    prompt = _execute(client, tmp_path, approval_wait_s=0.05)["prompt"]
+    assert prompt["state"] == "waiting"
+    assert f"re-attaches to prompt {prompt['id']}" in prompt["next_steps"]
+    assert "approval_wait_s" in prompt["next_steps"]
+    assert "shell_wait" not in prompt["next_steps"]
+
+
+def test_next_steps_when_consumed(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def approve_and_consume(pid: str) -> None:
+        srv.db.approve_prompt(prompt_id=pid, decision="approve_once")
+        srv.db.consume_approval_by_command(raw_cmd=COMMAND, cwd=str(tmp_path), agent_id=AGENT)
+
+    _on_poll(monkeypatch, approve_and_consume)
+    prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
+    assert prompt["state"] == "consumed"
+    assert prompt["next_steps"] == (
+        "This approval was already used by an earlier identical call; re-issue to request "
+        "a new approval."
+    )
+
+
+def test_db_error_keeps_unwaited_next_steps(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(_prompt_id: str) -> dict | None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(srv.db, "get_pending_prompt", broken)
+    prompt = _execute(client, tmp_path, approval_wait_s=5)["prompt"]
+    assert "shell_wait(prompt_id=" in prompt["next_steps"]
+
+
 @pytest.mark.parametrize("action", [_expire, _sweep])
 def test_wait_reports_expired_and_swept_as_expired(
     client: TestClient,
