@@ -13,12 +13,14 @@ import sys
 import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 CMD_LIMIT = 120
 REMIND_BEFORE_S = 60
+MAX_BACKOFF_S = 60.0
+DEFAULT_INTERVAL_S = 3.0
 TRUNCATED = "… (truncated)"
 _WHITESPACE_CTRL = re.compile(r"[\n\r\t\x85]")
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
@@ -101,10 +103,39 @@ class Notifier:
     home: str = field(default_factory=lambda: str(Path.home()))
     seen: set[str] = field(default_factory=set)
     reminded: set[str] = field(default_factory=set)
+    interval_s: float = DEFAULT_INTERVAL_S
+    _failures: int = field(default=0, init=False)
+    _next_poll: datetime | None = field(default=None, init=False)
 
     def tick(self) -> None:
         now = self.clock()
-        self._handle(self.fetch(), now)
+        if self._next_poll is not None and now < self._next_poll:
+            return
+        try:
+            prompts = self.fetch()
+        except (OSError, ValueError) as exc:
+            # A failed fetch deliberately leaves seen/reminded untouched: an
+            # outage must neither prune state nor cause re-popups on recovery.
+            self._on_unreachable(now, exc)
+            return
+        self._failures = 0
+        self._next_poll = None
+        self._handle(prompts, now)
+
+    def _on_unreachable(self, now: datetime, exc: Exception) -> None:
+        first = self._failures == 0
+        # Record back-off state BEFORE the popup so a failing notify is never
+        # retried on every tick.
+        # Capped counter: 2**n must stay float-convertible on very long outages.
+        self._failures = min(self._failures + 1, 30)
+        delay = min(self.interval_s * 2**self._failures, MAX_BACKOFF_S)
+        self._next_poll = now + timedelta(seconds=delay)
+        if first:
+            self.notify(
+                "shell-runner-notify: server unreachable",
+                f"POST /pending failed: {clean(str(exc), CMD_LIMIT)}",
+                "normal",
+            )
 
     def _handle(self, prompts: list[Any], now: datetime) -> None:
         live: set[str] = set()

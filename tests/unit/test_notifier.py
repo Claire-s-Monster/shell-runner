@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from shell_runner.notifier import Notifier, build_body, clean, format_remaining, shorten_home
 
 
@@ -380,3 +382,117 @@ def test_prompt_missing_raw_cmd_still_gets_a_popup() -> None:
     notifier.tick()
     assert len(popups) == 2
     assert "cmd: ?" in popups[0][1].splitlines()
+
+
+def test_unreachable_gives_one_popup_then_backs_off() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.error = ConnectionRefusedError("down")
+    notifier.tick()
+    assert len(popups) == 1
+    assert popups[0][0] == "shell-runner-notify: server unreachable"
+    assert feed.calls == 1
+    clock.advance(3)
+    notifier.tick()  # inside the 6s back-off window: no fetch
+    assert feed.calls == 1
+    clock.advance(3)
+    notifier.tick()  # window over: retries quietly
+    assert feed.calls == 2
+    assert len(popups) == 1
+
+
+def test_backoff_grows_and_is_capped() -> None:
+    notifier, feed, clock, _popups = make_notifier()
+    feed.error = OSError("down")
+    for _ in range(12):
+        notifier.tick()
+        clock.advance(61)
+    clock.advance(0)
+    calls = feed.calls
+    notifier.tick()
+    clock.advance(59)
+    notifier.tick()
+    assert feed.calls == calls + 1  # cap is 60s
+
+
+def test_very_long_outage_does_not_overflow() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.error = OSError("down")
+    for _ in range(1200):
+        notifier.tick()
+        clock.advance(61)
+    assert feed.calls == 1200
+    assert len(popups) == 1
+
+
+def test_recovery_resets_and_a_new_outage_notifies_again() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.error = OSError("down")
+    notifier.tick()
+    feed.error = None
+    clock.advance(10)
+    notifier.tick()  # recovered: quiet (no "reconnected" popup)
+    assert len(popups) == 1
+    feed.error = OSError("down again")
+    clock.advance(3)
+    notifier.tick()
+    assert len(popups) == 2
+
+
+def test_prompts_are_not_lost_across_an_outage() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.error = OSError("down")
+    notifier.tick()
+    feed.error = None
+    feed.prompts = [make_prompt()]
+    clock.advance(10)
+    notifier.tick()
+    assert [p[0] for p in popups] == [
+        "shell-runner-notify: server unreachable",
+        "shell-runner: T3 approval needed",
+    ]
+
+
+def test_value_error_from_bad_response_counts_as_unreachable() -> None:
+    notifier, feed, _clock, popups = make_notifier()
+    feed.error = ValueError("not json")
+    notifier.tick()
+    assert len(popups) == 1
+
+
+def test_outage_keeps_seen_and_reminded_and_does_not_repopup_after_recovery() -> None:
+    notifier, feed, clock, popups = make_notifier()
+    feed.prompts = [make_prompt("p1", expires_in=300), make_prompt("p2", expires_in=50)]
+    notifier.tick()
+    assert notifier.seen == {"p1", "p2"}
+    assert notifier.reminded == {"p2"}
+    assert len(popups) == 2
+    feed.error = OSError("down")
+    clock.advance(3)
+    notifier.tick()
+    assert notifier.seen == {"p1", "p2"}  # a failed fetch must not prune
+    assert notifier.reminded == {"p2"}
+    feed.error = None
+    clock.advance(10)
+    notifier.tick()  # recovered with the same prompts: no re-popups
+    assert [p[0] for p in popups].count("shell-runner: T3 approval needed") == 2
+    assert len(popups) == 3  # 2 prompts + 1 unreachable, nothing repeated
+    assert notifier.seen == {"p1", "p2"}
+    assert notifier.reminded == {"p2"}
+
+
+def test_failed_unreachable_popup_is_not_retried_every_tick() -> None:
+    feed, clock = Feed(), Clock()
+    calls: list[str] = []
+
+    def boom(title: str, _body: str, _urgency: str) -> None:
+        calls.append(title)
+        raise OSError("notify-send missing")
+
+    notifier = Notifier(fetch=feed, notify=boom, clock=clock, home="/home/me")
+    feed.error = OSError("down")
+    with pytest.raises(OSError, match="notify-send missing"):
+        notifier.tick()
+    clock.advance(6)
+    notifier.tick()  # still failing: back-off state was recorded before the popup
+    assert len(calls) == 1
+    assert feed.calls == 2
