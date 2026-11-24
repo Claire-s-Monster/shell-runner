@@ -694,7 +694,10 @@ async def _reprompt_script_changed(
         normalized_template=cls.template,
         command_tier=int(cls.command_tier),
         matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-        decision_path=[*cls.decision_path, "script_changed_since_approval"],
+        # Stored unmarked (the audit row below carries the marker): an ordinary retry of
+        # the identical command re-attaches to this open prompt (issue #119) instead of
+        # inserting a duplicate, since re-attach matches on decision_path.
+        decision_path=list(cls.decision_path),
         detach=req.detach,
         script_sha256=pin.storage_sha if pin else None,
         script_paths=pin.paths_json if pin else None,
@@ -725,7 +728,7 @@ async def _reprompt_script_changed(
         protected_path_match=cls.protected_path_json,
         flagged=int(cls.flagged),
     )
-    return ExecuteResponse(
+    resp = ExecuteResponse(
         decision="prompt_required",
         tier=int(cls.tier),
         matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
@@ -760,6 +763,10 @@ async def _reprompt_script_changed(
             detach=req.detach,
         ),
     )
+    # issue #119: a caller that opted into the wait gets it on the replacement prompt too.
+    if not req.approval_wait_s or resp.prompt is None:
+        return resp
+    return await _wait_on_prompt(resp, resp.prompt, req.approval_wait_s, t0)
 
 
 async def _execute_approved_command(
@@ -2207,7 +2214,7 @@ async def _wait_for_prompt(
         return _wait_error(
             None, "agent_id is required with prompt_id", started, prompt_id=prompt_id
         )
-    row = db.get_pending_prompt(prompt_id)
+    row = await asyncio.to_thread(db.get_pending_prompt, prompt_id)
     if row is None or row["agent_id"] != agent_id:
         return _wait_error(None, not_yours, started, prompt_id=prompt_id)
 

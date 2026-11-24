@@ -207,6 +207,35 @@ def test_rewritten_script_tokenless_retry_reprompts_and_burns(
     assert calls == []
 
 
+def test_retry_after_script_change_reattaches_to_replacement_prompt(
+    client: TestClient, db: Persistence, calls: list[Any], script: Path, tmp_path: Path
+) -> None:
+    prompt = _execute(client, SCRIPT_CMD, tmp_path)["prompt"]
+    _approve(client, prompt["id"])
+    script.write_text("echo rewritten\n")
+
+    first = _execute(client, SCRIPT_CMD, tmp_path)["prompt"]
+    retry = _execute(client, SCRIPT_CMD, tmp_path)["prompt"]
+    assert retry["id"] == first["id"]
+    assert retry["reattached"] is True
+    assert _count(db, "pending_prompts") == 2  # original + one replacement, no duplicate
+    assert calls == []
+
+
+def test_replacement_prompt_honours_approval_wait(
+    client: TestClient, script: Path, tmp_path: Path
+) -> None:
+    prompt = _execute(client, SCRIPT_CMD, tmp_path)["prompt"]
+    _approve(client, prompt["id"])
+    script.write_text("echo rewritten\n")
+
+    data = _execute(client, SCRIPT_CMD, tmp_path, approval_wait_s=0.05)
+    assert data["decision"] == "prompt_required"
+    assert data["prompt"]["id"] != prompt["id"]
+    assert data["prompt"]["state"] == "waiting"
+    assert data["prompt"]["waited_s"] is not None
+
+
 def test_rewritten_script_with_token_reprompts_and_burns(
     client: TestClient, calls: list[Any], script: Path, tmp_path: Path
 ) -> None:
