@@ -1469,6 +1469,9 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
     prompt_id = prompt_row["id"]
     duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
+    # issue #119: tag the audit row of a re-attached call. The prompt row keeps the
+    # untagged path, so later identical calls still match it.
+    call_path = [*cls.decision_path, "reattached"] if reattached else list(cls.decision_path)
     if telemetry_writer is not None:
         await telemetry_writer.submit(
             call_id=telemetry_id,
@@ -1485,7 +1488,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             stdout_bytes=0,
             stderr_bytes=0,
             duration_ms=duration_ms,
-            decision_path=list(cls.decision_path),
+            decision_path=call_path,
             normalizer_warnings=list(cls.normalizer_warnings),
             protected_path_match=cls.protected_path_json,
             flagged=int(cls.flagged),
@@ -1508,7 +1511,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             stdout_bytes=0,
             stderr_bytes=0,
             duration_ms=duration_ms,
-            decision_path=list(cls.decision_path),
+            decision_path=call_path,
             normalizer_warnings=list(cls.normalizer_warnings),
             protected_path_match=cls.protected_path_json,
             flagged=int(cls.flagged),

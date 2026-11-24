@@ -7,6 +7,7 @@ matching test_approve_guard.py.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -217,3 +218,21 @@ def test_identical_calls_share_one_open_prompt(client: TestClient, tmp_path: Pat
     second = _request_prompt(client, tmp_path)
     assert second == first
     assert [r["id"] for r in srv.db.list_pending_prompts()] == [first]
+
+
+def test_reattached_call_is_tagged_in_shell_calls(client: TestClient, tmp_path: Path) -> None:
+    pid = _request_prompt(client, tmp_path)
+    _request_prompt(client, tmp_path)
+    rows = srv.db.telemetry_query(agent_id=AGENT, decision="prompt_required")
+    paths = [json.loads(r["decision_path_json"]) for r in rows]
+    tagged = [p for p in paths if "reattached" in p]
+    assert len(paths) == 2
+    assert len(tagged) == 1
+    assert tagged[0][-1] == "reattached"
+    # the prompt row keeps the untagged path, so it stays the match key
+    with srv.db._conn() as conn:
+        stored = conn.execute(
+            "SELECT decision_path_json FROM pending_prompts WHERE id = ?", (pid,)
+        ).fetchone()[0]
+    assert "reattached" not in json.loads(stored)
+    assert _request_prompt(client, tmp_path) == pid
