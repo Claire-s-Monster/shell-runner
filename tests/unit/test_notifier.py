@@ -18,11 +18,16 @@ def test_clean_strips_control_characters() -> None:
 
 
 def test_clean_drops_bidi_and_line_separator_characters() -> None:
-    assert clean("a‮b c d") == "abcd"
+    text = "a\N{RIGHT-TO-LEFT OVERRIDE}b\N{LINE SEPARATOR}c\N{PARAGRAPH SEPARATOR}d"
+    assert clean(text) == "abcd"
 
 
 def test_clean_turns_newlines_and_tabs_into_spaces() -> None:
     assert clean("a\nb\tc\r") == "a b c "
+
+
+def test_clean_turns_nel_into_space() -> None:
+    assert clean("a\x85b") == "a b"
 
 
 def test_clean_truncates_long_text_with_marker() -> None:
@@ -42,6 +47,11 @@ def test_shorten_home() -> None:
     assert shorten_home("/home/me", "/home/me") == "~"
     assert shorten_home("/home/mex/proj", "/home/me") == "/home/mex/proj"
     assert shorten_home("/srv/x", "/home/me") == "/srv/x"
+
+
+def test_shorten_home_with_empty_or_root_home_leaves_cwd_unchanged() -> None:
+    assert shorten_home("/home/me/proj", "") == "/home/me/proj"
+    assert shorten_home("/home/me/proj", "/") == "/home/me/proj"
 
 
 def test_format_remaining() -> None:
@@ -73,6 +83,11 @@ def test_build_body_without_scope_warning_starts_with_agent() -> None:
     assert build_body(prompt, 10, "/home/me").splitlines()[0] == "agent: a1"
 
 
+def test_build_body_without_scope_warning_key_starts_with_agent() -> None:
+    prompt = {"agent_id": "a1", "cwd": "/x", "raw_cmd": "ls"}
+    assert build_body(prompt, 10, "/home/me").splitlines()[0] == "agent: a1"
+
+
 def test_build_body_sanitises_every_untrusted_field() -> None:
     prompt = {
         "agent_id": "<b>a</b>\x1b",
@@ -95,3 +110,22 @@ def test_build_body_marks_truncation_only_when_cut() -> None:
     short_cmd = {"agent_id": "a", "cwd": "/x", "raw_cmd": "y" * 20}
     assert "… (truncated)" in build_body(long_cmd, 10, "/h")
     assert "… (truncated)" not in build_body(short_cmd, 10, "/h")
+
+
+def test_build_body_tolerates_missing_fields() -> None:
+    body = build_body({}, 10, "/home/me")
+    assert body.splitlines() == [
+        "agent: ?",
+        "cwd: ?",
+        "cmd: ?",
+        "expires in 0m 10s",
+        "decide on the Pending Prompts page",
+    ]
+
+
+def test_build_body_tolerates_none_fields() -> None:
+    prompt = {"agent_id": None, "cwd": None, "raw_cmd": None, "scope_warning": None}
+    body = build_body(prompt, 10, "/home/me")
+    assert "agent: ?" in body.splitlines()
+    assert "cwd: ?" in body.splitlines()
+    assert "cmd: ?" in body.splitlines()
