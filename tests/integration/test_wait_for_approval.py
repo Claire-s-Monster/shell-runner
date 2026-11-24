@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -42,12 +43,19 @@ def _request_prompt(client: TestClient, cwd: Path, agent_id: str = AGENT) -> str
     return data["prompt"]["id"]
 
 
-def _decide(client: TestClient, prompt_id: str, decision: str = "approve_once") -> dict:
+def _decide(
+    client: TestClient, prompt_id: str, decision: str = "approve_once", **extra: object
+) -> dict:
     resp = client.post(
         "/approve_pending",
-        json={"prompt_id": prompt_id, "decision": decision, "approver_agent_id": "primary"},
+        json={
+            "prompt_id": prompt_id,
+            "decision": decision,
+            "approver_agent_id": "primary",
+            **extra,
+        },
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     return resp.json()
 
 
@@ -521,3 +529,63 @@ def test_wait_reports_expired_and_swept_as_expired(
     data = _execute(client, tmp_path, approval_wait_s=5)
     assert data["decision"] == "prompt_required"
     assert data["prompt"]["state"] == "expired"
+
+
+TEMPLATE_AGENT = "focused-ghc-ci-analyzer"  # ALWAYS_APPROVE cap: a T2 template rule auto-runs
+
+
+def _execute_in_thread(
+    client: TestClient, cwd: Path, **extra: object
+) -> tuple[threading.Thread, dict]:
+    out: dict = {}
+    body = {"command": COMMAND, "cwd": str(cwd), "agent_id": AGENT, **extra}
+
+    def run() -> None:
+        resp = client.post("/execute", json=body)
+        out["status"], out["body"] = resp.status_code, resp.json()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, out
+
+
+def _join(handle: tuple[threading.Thread, dict]) -> dict:
+    thread, out = handle
+    thread.join(timeout=30)
+    assert out.get("status") == 200, out
+    return out["body"]
+
+
+def _gate_waiters(monkeypatch: pytest.MonkeyPatch, n: int) -> list[threading.Event]:
+    """One Event per waiter, set when that call enters the shared wait helper."""
+    entered = [threading.Event() for _ in range(n)]
+    pending = list(entered)
+    original = srv._bounded_prompt_wait
+
+    async def _gated(prompt_id: str, wait_s: float) -> dict | None:
+        pending.pop(0).set()
+        return await original(prompt_id, wait_s)
+
+    monkeypatch.setattr(srv, "_bounded_prompt_wait", _gated)
+    return entered
+
+
+def _open_prompt_after(entered: list[threading.Event]) -> str:
+    assert all(e.wait(timeout=10) for e in entered), "waiter(s) never entered the wait"
+    return srv.db.list_pending_prompts()[0]["id"]
+
+
+def test_template_approval_during_wait_keeps_running(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = _gate_waiters(monkeypatch, 1)
+    waiter = _execute_in_thread(client, tmp_path, agent_id=TEMPLATE_AGENT, approval_wait_s=5)
+    approved = _decide(client, _open_prompt_after(entered), "approve_template", promote_to_tier=2)
+    assert approved["template_promoted"] is True
+    assert approved["approve_token"]
+    assert _join(waiter)["prompt"]["state"] == "approved"
+
+    for _ in range(2):  # nothing is consumed: later identical calls keep running
+        ran = _execute(client, tmp_path, agent_id=TEMPLATE_AGENT)
+        assert ran["decision"] == "executed"
+        assert ran["stdout"].strip() == "42"
