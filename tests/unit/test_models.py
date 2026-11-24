@@ -88,3 +88,26 @@ def test_execute_request_accepts_max_timeout(
 
     req = ExecuteRequest(command="echo hello", cwd="/tmp", agent_id="test-agent", timeout_s=120)
     assert req.timeout_s == 120
+
+
+def test_execute_request_approval_wait_s_is_optional() -> None:
+    from shell_runner.models import ExecuteRequest
+
+    assert ExecuteRequest(command="ls", cwd="/tmp", agent_id="a").approval_wait_s is None
+    req = ExecuteRequest(command="ls", cwd="/tmp", agent_id="a", approval_wait_s=5)
+    assert req.approval_wait_s == 5
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_execute_request_rejects_non_finite_approval_wait_s(bad: float) -> None:
+    from shell_runner.models import ExecuteRequest
+
+    with pytest.raises(ValidationError):
+        ExecuteRequest(command="ls", cwd="/tmp", agent_id="a", approval_wait_s=bad)
+
+
+def test_prompt_info_wait_fields_default_to_unset() -> None:
+    from shell_runner.models import ExecutePromptInfo
+
+    info = ExecutePromptInfo(id="p", raw_cmd="x", template="x", category=None, tier=3, why="w")
+    assert (info.reattached, info.state, info.waited_s) == (False, None, None)

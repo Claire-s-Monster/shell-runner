@@ -26,6 +26,7 @@ WRITE_METHODS = frozenset(
         "finalize_call",
         "upsert_template",
         "create_pending_prompt",
+        "create_or_reattach_prompt",
         "approve_prompt",
         "consume_approve_token",
         "consume_approval_by_command",
@@ -73,6 +74,40 @@ def _violations(path: Path) -> list[str]:
 def test_no_direct_persistence_writes_in_async_functions(module: str) -> None:
     violations = _violations(SRC / module)
     assert not violations, "sync DB writes on the event loop:\n" + "\n".join(violations)
+
+
+# The prompt-wait path polls get_pending_prompt every WAIT_POLL_INTERVAL_S for up to
+# MAX_WAIT_S, for up to MAX_CONCURRENT_WAITS waiters, so its reads must be offloaded
+# too. Deliberately narrow: other sync reads in async handlers are tracked in #133.
+WAIT_PATH_FUNCTIONS = frozenset(
+    {"_wait_for_prompt_decision", "_bounded_prompt_wait", "_wait_on_prompt"}
+)
+
+
+def _sync_reads_in(path: Path, functions: frozenset[str], method: str) -> list[str]:
+    found: list[str] = []
+    for fn in ast.walk(ast.parse(path.read_text())):
+        if not (isinstance(fn, ast.AsyncFunctionDef) and fn.name in functions):
+            continue
+        for node in ast.walk(fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == method
+            ):
+                found.append(f"{path.name}:{node.lineno} {fn.name} -> {method}")
+    return found
+
+
+def test_wait_path_functions_still_exist() -> None:
+    tree = ast.parse((SRC / "server.py").read_text())
+    names = {n.name for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)}
+    assert names >= WAIT_PATH_FUNCTIONS
+
+
+def test_no_sync_get_pending_prompt_in_wait_path() -> None:
+    violations = _sync_reads_in(SRC / "server.py", WAIT_PATH_FUNCTIONS, "get_pending_prompt")
+    assert not violations, "sync prompt reads on the event loop:\n" + "\n".join(violations)
 
 
 @pytest.mark.asyncio

@@ -63,6 +63,7 @@ from .models import (
     ClassifyRequest,
     ClassifyResponse,
     ExecutePromptInfo,
+    ExecutePromptState,
     ExecuteRequest,
     ExecuteResponse,
     GetPendingRequest,
@@ -693,7 +694,10 @@ async def _reprompt_script_changed(
         normalized_template=cls.template,
         command_tier=int(cls.command_tier),
         matched_rule_category=cls.matched_rule.category if cls.matched_rule else None,
-        decision_path=[*cls.decision_path, "script_changed_since_approval"],
+        # Stored unmarked (the audit row below carries the marker): an ordinary retry of
+        # the identical command re-attaches to this open prompt (issue #119) instead of
+        # inserting a duplicate, since re-attach matches on decision_path.
+        decision_path=list(cls.decision_path),
         detach=req.detach,
         script_sha256=pin.storage_sha if pin else None,
         script_paths=pin.paths_json if pin else None,
@@ -724,7 +728,7 @@ async def _reprompt_script_changed(
         protected_path_match=cls.protected_path_json,
         flagged=int(cls.flagged),
     )
-    return ExecuteResponse(
+    resp = ExecuteResponse(
         decision="prompt_required",
         tier=int(cls.tier),
         matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
@@ -759,6 +763,10 @@ async def _reprompt_script_changed(
             detach=req.detach,
         ),
     )
+    # issue #119: a caller that opted into the wait gets it on the replacement prompt too.
+    if not req.approval_wait_s or resp.prompt is None:
+        return resp
+    return await _wait_on_prompt(resp, resp.prompt, req.approval_wait_s, t0)
 
 
 async def _execute_approved_command(
@@ -1450,10 +1458,11 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             telemetry_id=telemetry_id,
         )
 
-    # T3/T4 — create pending prompt, return prompt_required
+    # T3/T4 — re-attach to an identical open prompt or create one (issue #119); the pin
+    # is computed before the transaction, compared inside it.
     pin = await asyncio.to_thread(script_pin.compute_pin, req.command, req.cwd)
-    prompt_id = await asyncio.to_thread(
-        db.create_pending_prompt,
+    prompt_row, reattached = await asyncio.to_thread(
+        db.create_or_reattach_prompt,
         agent_id=req.agent_id,
         cwd=req.cwd,
         raw_cmd=req.command,
@@ -1465,8 +1474,12 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         script_sha256=pin.storage_sha if pin else None,
         script_paths=pin.paths_json if pin else None,
     )
+    prompt_id = prompt_row["id"]
     duration_ms = int((time.monotonic() - t0) * 1000)
     telemetry_id = str(uuid.uuid4())
+    # issue #119: tag the audit row of a re-attached call. The prompt row keeps the
+    # untagged path, so later identical calls still match it.
+    call_path = [*cls.decision_path, "reattached"] if reattached else list(cls.decision_path)
     if telemetry_writer is not None:
         await telemetry_writer.submit(
             call_id=telemetry_id,
@@ -1483,7 +1496,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             stdout_bytes=0,
             stderr_bytes=0,
             duration_ms=duration_ms,
-            decision_path=list(cls.decision_path),
+            decision_path=call_path,
             normalizer_warnings=list(cls.normalizer_warnings),
             protected_path_match=cls.protected_path_json,
             flagged=int(cls.flagged),
@@ -1506,7 +1519,7 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             stdout_bytes=0,
             stderr_bytes=0,
             duration_ms=duration_ms,
-            decision_path=list(cls.decision_path),
+            decision_path=call_path,
             normalizer_warnings=list(cls.normalizer_warnings),
             protected_path_match=cls.protected_path_json,
             flagged=int(cls.flagged),
@@ -1526,7 +1539,24 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
             "(template/verb approvals never apply to detached runs)"
         )
         detach_rerun = " Re-run with detach=true; the token is refused for any other detach value."
-    return ExecuteResponse(
+    prompt_info = ExecutePromptInfo(
+        id=prompt_id,
+        raw_cmd=req.command,
+        template=cls.template,
+        category=cls.matched_rule.category if cls.matched_rule else None,
+        tier=int(cls.tier),
+        why=why,
+        next_steps=(
+            f"A primary session must approve prompt {prompt_id} via shell_approve_pending. "
+            f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
+            "repeatedly until state is 'approved', then re-run shell_execute with the "
+            "identical command, cwd and agent_id plus approve_token. "
+            "Stop if state is 'denied' or 'expired'." + detach_rerun
+        ),
+        detach=req.detach,
+        reattached=reattached,
+    )
+    resp = ExecuteResponse(
         decision="prompt_required",
         tier=int(cls.tier),
         matched_rule=cls.matched_rule.pattern if cls.matched_rule else None,
@@ -1537,23 +1567,13 @@ async def execute_route(request: Request, req: ExecuteRequest) -> ExecuteRespons
         stderr_full_path=None,
         duration_ms=duration_ms,
         telemetry_id=telemetry_id,
-        prompt=ExecutePromptInfo(
-            id=prompt_id,
-            raw_cmd=req.command,
-            template=cls.template,
-            category=cls.matched_rule.category if cls.matched_rule else None,
-            tier=int(cls.tier),
-            why=why,
-            next_steps=(
-                f"A primary session must approve prompt {prompt_id} via shell_approve_pending. "
-                f"Meanwhile call shell_wait(prompt_id='{prompt_id}', agent_id='<your agent_id>') "
-                "repeatedly until state is 'approved', then re-run shell_execute with the "
-                "identical command, cwd and agent_id plus approve_token. "
-                "Stop if state is 'denied' or 'expired'." + detach_rerun
-            ),
-            detach=req.detach,
-        ),
+        prompt=prompt_info,
     )
+    # issue #119: the shell_calls row above stays decision="prompt_required"; the wait
+    # does not update it (#119 plan, "Spec deviations" item 5).
+    if not req.approval_wait_s:  # None or 0: return at once, as before #119
+        return resp
+    return await _wait_on_prompt(resp, prompt_info, req.approval_wait_s, t0)
 
 
 @app.post("/classify", response_model=ClassifyResponse)
@@ -2086,13 +2106,101 @@ async def _wait_for_prompt_decision(prompt_id: str, wait_s: float) -> dict | Non
     """Poll the prompt row until it leaves "waiting" or *wait_s* elapses; return the last row."""
     deadline = time.monotonic() + wait_s
     while True:
-        row = db.get_pending_prompt(prompt_id)
+        row = await asyncio.to_thread(db.get_pending_prompt, prompt_id)
         if row is None or _prompt_wait_state(row) != "waiting":
             return row
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return row
         await asyncio.sleep(min(WAIT_POLL_INTERVAL_S, remaining))
+
+
+async def _bounded_prompt_wait(prompt_id: str, wait_s: float) -> dict | None:
+    """Wait for a prompt decision under the shared wait semaphore (shell_wait and
+    shell_execute). Saturated: a single check rather than queueing behind other waiters."""
+    if _wait_semaphore.locked():
+        return await _wait_for_prompt_decision(prompt_id, 0.0)
+    async with _wait_semaphore:
+        return await _wait_for_prompt_decision(prompt_id, wait_s)
+
+
+# issue #119 — shell_execute(approval_wait_s). The wait must fit the ~20s MCP transport
+# cutoff (#46) with a 2s margin; the inline budget setting is deliberately not used.
+APPROVAL_WAIT_DEADLINE_S = 18
+
+# _prompt_wait_state reports a spent approval as "error"; shell_execute calls it "consumed".
+_EXECUTE_PROMPT_STATES: dict[str, ExecutePromptState] = {
+    "approved": "approved",
+    "denied": "denied",
+    "expired": "expired",
+    "waiting": "waiting",
+    "error": "consumed",
+}
+
+
+# next_steps after an approval wait. A wait never yields an approve_token and does not
+# need shell_wait: the caller re-issues the identical call.
+_WAIT_NEXT_STEPS: dict[ExecutePromptState, str] = {
+    "approved": (
+        "Prompt {id} was approved. Re-issue the identical shell_execute call (same command, "
+        "cwd, agent_id, detach and approval_wait_s) once to run it."
+    ),
+    "denied": "Prompt {id} was denied. Stop: do not re-issue this command.",
+    "expired": "Prompt {id} expired before a decision. Stop.",
+    "consumed": (
+        "This approval was already used by an earlier identical call; re-issue to request "
+        "a new approval."
+    ),
+    "waiting": (
+        "No decision yet on prompt {id}. Re-issue the identical call (same command, cwd, "
+        "agent_id, detach, approval_wait_s) to keep waiting; it re-attaches to prompt {id}. "
+        "Stop if state is 'denied' or 'expired'."
+    ),
+}
+
+
+def _approval_wait_budget(requested_s: float, elapsed_s: float) -> float:
+    """max(0, min(requested, MAX_WAIT_S, APPROVAL_WAIT_DEADLINE_S - elapsed)); 0 = one check."""
+    return max(0.0, min(requested_s, float(MAX_WAIT_S), APPROVAL_WAIT_DEADLINE_S - elapsed_s))
+
+
+def _execute_prompt_state(row: dict | None) -> ExecutePromptState:
+    """shell_execute's view of its prompt after the wait; a swept row (None) is expired."""
+    return "expired" if row is None else _EXECUTE_PROMPT_STATES[_prompt_wait_state(row)]
+
+
+async def _wait_on_prompt(
+    resp: ExecuteResponse, prompt: ExecutePromptInfo, requested_s: float, t0: float
+) -> ExecuteResponse:
+    """Opt-in bounded wait for the decision on resp's prompt (issue #119).
+
+    *t0* is execute_route's entry time, so the budget includes classify queueing and
+    the prompt create/re-attach. Read-only: it never consumes an approval or hands out
+    a token, and never executes; an approved command runs when the caller re-issues
+    the identical call, so wait plus execution never share one call's ~20s budget.
+
+    A failed read returns *resp* unwaited (state/waited_s unset): the prompt and its
+    shell_calls row already exist, so the caller must still get the prompt id.
+    """
+    wait_s = _approval_wait_budget(requested_s, time.monotonic() - t0)
+    started = time.monotonic()
+    try:
+        row = await _bounded_prompt_wait(prompt.id, wait_s)
+    except Exception:  # not BaseException: cancellation still propagates
+        logger.warning(
+            "approval wait on prompt %s failed; returning unwaited", prompt.id, exc_info=True
+        )
+        return resp
+    state = _execute_prompt_state(row)
+    waited = prompt.model_copy(
+        update={
+            "state": state,
+            "waited_s": time.monotonic() - started,
+            "next_steps": _WAIT_NEXT_STEPS[state].format(id=prompt.id),
+        }
+    )
+    decision = "denied" if state == "denied" else "prompt_required"
+    return resp.model_copy(update={"decision": decision, "prompt": waited})
 
 
 async def _wait_for_prompt(
@@ -2106,16 +2214,11 @@ async def _wait_for_prompt(
         return _wait_error(
             None, "agent_id is required with prompt_id", started, prompt_id=prompt_id
         )
-    row = db.get_pending_prompt(prompt_id)
+    row = await asyncio.to_thread(db.get_pending_prompt, prompt_id)
     if row is None or row["agent_id"] != agent_id:
         return _wait_error(None, not_yours, started, prompt_id=prompt_id)
 
-    # Saturated: do a single check rather than queueing behind other waiters.
-    if _wait_semaphore.locked():
-        row = await _wait_for_prompt_decision(prompt_id, 0.0)
-    else:
-        async with _wait_semaphore:
-            row = await _wait_for_prompt_decision(prompt_id, wait_s)
+    row = await _bounded_prompt_wait(prompt_id, wait_s)
     if row is None:  # expired and swept by cleanup while we waited
         return ShellWaitResponse(
             prompt_id=prompt_id, state="expired", elapsed_s=time.monotonic() - started

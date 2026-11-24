@@ -8,6 +8,8 @@ swap executor._unit_backend for a fake.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -291,3 +293,43 @@ def test_detach_approved_token_dispatches_once(
     resp = _post(client, T3_CMD, tmp_path, detach=True, approve_token=token)
     assert resp.json()["decision"] == "running"
     assert len(backend.started) == 1
+
+
+# --- issue #119: approval_wait_s with detach --------------------------------------
+
+
+def _await_open_prompt() -> str:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        rows = srv.db.list_pending_prompts()
+        if rows:
+            return rows[0]["id"]
+        time.sleep(0.01)
+    raise AssertionError("no pending prompt appeared")
+
+
+def test_detach_wait_template_approval_is_single_use(
+    client: TestClient,
+    calls: list[dict[str, Any]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(srv, "WAIT_POLL_INTERVAL_S", 0.01)
+    out: dict[str, Any] = {}
+
+    def wait_call() -> None:
+        out["resp"] = _post(client, T3_CMD, tmp_path, detach=True, approval_wait_s=5)
+
+    waiter = threading.Thread(target=wait_call)
+    waiter.start()
+    # through the approve endpoint: the downgrade lives in the handler, not decide_prompt
+    approved = _approve(client, _await_open_prompt(), "approve_template")
+    waiter.join(timeout=30)
+
+    assert approved["template_promoted"] is False
+    assert "downgraded to a one-shot approval" in (approved["scope_warning"] or "")
+    assert out["resp"].json()["prompt"]["state"] == "approved"
+    assert _post(client, T3_CMD, tmp_path, detach=True).json()["decision"] == "executed"
+    assert len(calls) == 1
+    assert _post(client, T3_CMD, tmp_path, detach=True).json()["decision"] == "prompt_required"
+    assert len(calls) == 1

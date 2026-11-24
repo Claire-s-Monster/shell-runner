@@ -142,6 +142,42 @@ self-approval (approver == the prompt's executing agent) and non-primary
 Full authenticated-identity enforcement of "primary session only" is a known
 limitation tracked in [#29](https://github.com/Claire-s-Monster/shell-runner/issues/29).
 
+## Waiting for approval inside `shell_execute` (`approval_wait_s`, #119)
+
+A T3/T4 command returns `decision=prompt_required`. Agents without `shell_wait`
+can instead pass `approval_wait_s` to `shell_execute`:
+
+- `None`/`0` (default): return at once, as before.
+- Otherwise the call waits up to `max(0, min(approval_wait_s, 15, 18 - elapsed))`
+  seconds for the decision. 18s (`APPROVAL_WAIT_DEADLINE_S`) is the ~20s MCP
+  transport cutoff (#46) minus a 2s margin; 0 means a single check. If 8 waits
+  are already running (shared with `shell_wait`), it checks once and returns.
+- The command never runs inside the waiting call, and the wait never returns an
+  `approve_token`. The agent re-issues the identical call (same command, cwd,
+  agent_id, detach and approval_wait_s), and the classifier (template/verb rule)
+  or the token-less one-shot approval runs it.
+
+**Re-attach (always on).** An identical call re-uses the open prompt instead of
+creating a new one (`prompt.reattached=true`, same id, expiry unchanged). It must
+match on agent_id, command, cwd, detach, script pin (`script_sha256` and
+`script_paths`, NULL-safe), template, tier, matched rule category and the full
+decision path. Decided (approved or denied), consumed or expired prompts are
+never re-used. The audit row of a re-attached call carries a `reattached` tag in
+`decision_path`.
+
+| `prompt.state` | `decision` | what to do |
+|---|---|---|
+| `approved` | `prompt_required` | re-issue the identical call once to run it |
+| `denied` | `denied` | stop (a later identical call opens a fresh prompt) |
+| `expired` | `prompt_required` | stop (also reported for a prompt swept by cleanup) |
+| `consumed` | `prompt_required` | an earlier identical call used the approval; re-issue to request a new one |
+| `waiting` | `prompt_required` | re-issue the identical call to keep waiting (re-attaches) |
+
+`approve_once` (and every `detach=true` approval, since template/verb approvals
+are downgraded for detached runs) is single-use: one re-call runs, the next
+prompts again. `approve_template`, `approve_template_global` and `approve_verb`
+keep later identical calls running.
+
 ## What auto-executes (no prompt)
 
 Beyond the per-tier seed rules in `catalog.py`, the categories below run without a

@@ -163,3 +163,31 @@ def test_concurrent_template_upserts(client: TestClient, tmp_path: Path, db_path
         f"observed_count={row['observed_count']} < 15 (template={row['template']!r})"
     )
     assert len(set(agents)) == 15, f"expected 15 distinct agents, got {len(set(agents))}: {agents}"
+
+
+def test_concurrent_identical_prompts_share_one_row(client: TestClient, tmp_path: Path) -> None:
+    """issue #119: identical concurrent T3/T4 calls re-attach to one pending prompt."""
+    ids: list[str] = []
+    lock = threading.Lock()
+
+    def call() -> None:
+        r = client.post(
+            "/execute",
+            json={
+                "command": "pip install requests",
+                "cwd": str(tmp_path),
+                "agent_id": "focused-ghc-ci-analyzer",
+            },
+        )
+        with lock:
+            ids.append(r.json()["prompt"]["id"])
+
+    threads = [threading.Thread(target=call) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(ids) == 5
+    assert len(set(ids)) == 1, ids
+    assert len(srv.db.list_pending_prompts()) == 1

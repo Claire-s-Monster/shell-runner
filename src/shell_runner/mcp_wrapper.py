@@ -24,6 +24,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             "shell_wait(prompt_id, agent_id) repeatedly until state is 'approved' (it returns the "
             "approve_token), then re-call shell_execute with the identical command, cwd and "
             "agent_id plus approve_token. Stop if state is 'denied' or 'expired'. "
+            "Alternatively pass approval_wait_s (max 15) to wait inside shell_execute: the "
+            "response's prompt.state is approved|denied|expired|consumed|waiting and "
+            "prompt.next_steps says what to do; identical calls re-attach to the same open "
+            "prompt. "
             "Set run_in_background=true to spawn asynchronously and get a job_id. "
             "Output is only returned inline if the command finishes within the inline budget "
             "(default 20s, configurable via SHELL_RUNNER_INLINE_BUDGET_S) — a command that is "
@@ -91,6 +95,17 @@ TOOLS: dict[str, dict[str, Any]] = {
                         "value, and template/verb approvals never auto-approve a detach "
                         "(approve_template/approve_verb become one-shot). Number of "
                         "concurrent detached jobs is capped (SHELL_RUNNER_MAX_DETACHED)."
+                    ),
+                },
+                "approval_wait_s": {
+                    "type": ["number", "null"],
+                    "description": (
+                        "Opt-in: if the command needs approval, wait up to this many seconds "
+                        "for the decision (clamped to [0, 15] and to an 18s per-call "
+                        "deadline). Omit or 0 to return at once. On state 'approved' "
+                        "re-issue the identical call once to run it; on 'waiting' re-issue "
+                        "it to keep waiting (it re-attaches to the same prompt); stop on "
+                        "'denied' or 'expired'."
                     ),
                 },
             },
