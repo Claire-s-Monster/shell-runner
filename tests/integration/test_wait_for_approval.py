@@ -589,3 +589,60 @@ def test_template_approval_during_wait_keeps_running(
         ran = _execute(client, tmp_path, agent_id=TEMPLATE_AGENT)
         assert ran["decision"] == "executed"
         assert ran["stdout"].strip() == "42"
+
+
+def test_approve_once_wait_then_recall_runs_once(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # at=2: the first poll sees "waiting", the decision lands before the second
+    _on_poll(monkeypatch, _DECIDE["approved"], at=2)
+    waited = _execute(client, tmp_path, approval_wait_s=5)
+    assert waited["decision"] == "prompt_required"
+    assert waited["prompt"]["state"] == "approved"
+
+    ran = _execute(client, tmp_path, approval_wait_s=5)  # identical re-call: consumes it
+    assert ran["decision"] == "executed"
+    assert ran["stdout"].strip() == "42"
+
+    again = _execute(client, tmp_path)  # single use: a new prompt
+    assert again["decision"] == "prompt_required"
+    assert again["prompt"]["id"] != waited["prompt"]["id"]
+    assert again["prompt"]["reattached"] is False
+
+
+def test_deny_then_identical_recall_creates_fresh_prompt(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _on_poll(monkeypatch, _DECIDE["denied"])
+    denied = _execute(client, tmp_path, approval_wait_s=5)
+    assert denied["decision"] == "denied"
+    assert denied["prompt"]["state"] == "denied"
+
+    again = _execute(client, tmp_path)  # no suppression window: the human may change their mind
+    assert again["decision"] == "prompt_required"
+    assert again["prompt"]["id"] != denied["prompt"]["id"]
+    assert again["prompt"]["reattached"] is False
+    assert [r["id"] for r in srv.db.list_pending_prompts()] == [again["prompt"]["id"]]
+
+
+def test_two_waiters_one_approve_once_exactly_one_runs(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deterministic: approve only after BOTH calls are inside the shared wait helper.
+    entered = _gate_waiters(monkeypatch, 2)
+    first = _execute_in_thread(client, tmp_path, approval_wait_s=5)
+    second = _execute_in_thread(client, tmp_path, approval_wait_s=5)
+    pid = _open_prompt_after(entered)
+    _decide(client, pid)  # approve_once
+    waited = [_join(first), _join(second)]
+    assert [w["prompt"]["id"] for w in waited] == [pid, pid]
+    assert sorted(w["prompt"]["reattached"] for w in waited) == [False, True]
+    assert {w["prompt"]["state"] for w in waited} <= {"approved", "consumed"}
+
+    reruns = [_execute_in_thread(client, tmp_path) for _ in waited]  # concurrent, no wait
+    results = [_join(r) for r in reruns]
+    executed = [r for r in results if r["decision"] == "executed"]
+    assert len(executed) == 1
+    other = next(r for r in results if r["decision"] != "executed")
+    assert other["decision"] == "prompt_required"
+    assert other["prompt"]["id"] != pid  # a consumed prompt is never re-attached
