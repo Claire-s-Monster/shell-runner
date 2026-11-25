@@ -11,7 +11,9 @@ import html
 import http.client
 import json
 import re
+import subprocess  # nosec B404
 import sys
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -239,3 +241,76 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     if not isinstance(prompts, list):
         raise ValueError("unexpected /pending response")
     return prompts
+
+
+Runner = Callable[[list[str]], tuple[int, str]]
+
+
+def run_argv(argv: list[str]) -> tuple[int, str]:
+    """Run an argv list (never a shell); return (exit code, stdout + stderr)."""
+    proc = subprocess.run(argv, capture_output=True, text=True, check=False)  # nosec B603
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def spawn_daemon(fn: Callable[[], None]) -> None:
+    threading.Thread(target=fn, daemon=True).start()
+
+
+def open_detached(argv: list[str]) -> None:
+    subprocess.Popen(  # nosec B603
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+@dataclass
+class DesktopNotifier:
+    """`notify(title, body, urgency)` implemented with notify-send / xdg-open.
+
+    With `--action` support each popup waits for a click in its own daemon
+    thread and opens `ui_url`; otherwise the URL is appended to the body.
+    """
+
+    ui_url: str
+    run: Runner = run_argv
+    spawn: Callable[[Callable[[], None]], None] = spawn_daemon
+    opener: Callable[[list[str]], None] = open_detached
+    _action_ok: bool | None = field(default=None, init=False)
+
+    def __call__(self, title: str, body: str, urgency: str) -> None:
+        base = ["notify-send", "--app-name=shell-runner", f"--urgency={urgency}"]
+        if self._supports_action():
+            argv = [*base, "--wait", "--action=open=Open", "--", title, body]
+            self.spawn(lambda: self._wait_and_open(argv, base, title, body))
+        else:
+            self._plain(base, title, body)
+
+    def _supports_action(self) -> bool:
+        if self._action_ok is None:
+            _code, out = self._run(["notify-send", "--help"])
+            self._action_ok = "--action" in out
+        return self._action_ok
+
+    def _wait_and_open(self, argv: list[str], base: list[str], title: str, body: str) -> None:
+        code, out = self._run(argv)
+        if code != 0:
+            self._action_ok = False
+            self._plain(base, title, body)
+        elif out.strip() == "open":
+            try:
+                self.opener(["xdg-open", self.ui_url])
+            except OSError as exc:
+                _log(f"xdg-open failed: {exc}")
+
+    def _plain(self, base: list[str], title: str, body: str) -> None:
+        self._run([*base, "--", title, f"{body}\n{clean(self.ui_url)}"])
+
+    def _run(self, argv: list[str]) -> tuple[int, str]:
+        try:
+            return self.run(argv)
+        except OSError as exc:
+            _log(f"{argv[0]} failed: {exc}")
+            return 127, ""

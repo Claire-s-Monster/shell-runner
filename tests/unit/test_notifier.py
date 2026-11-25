@@ -18,12 +18,14 @@ import pytest
 
 from shell_runner.notifier import (
     MAX_RESPONSE_BYTES,
+    DesktopNotifier,
     Notifier,
     build_body,
     clean,
     format_remaining,
     http_fetch,
     shorten_home,
+    spawn_daemon,
 )
 
 
@@ -743,3 +745,124 @@ def test_http_fetch_failures_are_what_tick_treats_as_unreachable() -> None:
         server.shutdown()
         server.server_close()
     assert popups == ["shell-runner-notify: server unreachable"]
+
+
+UI_URL = "http://127.0.0.1:8511/Pending_Prompts"
+HELP_WITH_ACTION = "Usage:\n  -A, --action=[NAME=]Text  Specify action\n  -w, --wait\n"
+HELP_WITHOUT_ACTION = "Usage:\n  -u, --urgency=LEVEL\n"
+
+
+class FakeRun:
+    def __init__(self, help_text: str = HELP_WITH_ACTION, code: int = 0, out: str = "") -> None:
+        self.help_text, self.code, self.out = help_text, code, out
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> tuple[int, str]:
+        self.calls.append(argv)
+        if argv[1:] == ["--help"]:
+            return 0, self.help_text
+        return self.code, self.out
+
+
+def make_desktop(run, opened: list[list[str]] | None = None, spawned: list | None = None):
+    def spawn(fn) -> None:
+        if spawned is not None:
+            spawned.append(fn)
+        fn()
+
+    return DesktopNotifier(
+        ui_url=UI_URL,
+        run=run,
+        spawn=spawn,
+        opener=(opened if opened is not None else []).append,
+    )
+
+
+def test_action_popup_argv_and_click_opens_url() -> None:
+    run, opened = FakeRun(out="open\n"), []
+    make_desktop(run, opened)("shell-runner: T4 approval needed", "body", "critical")
+    assert run.calls[-1] == [
+        "notify-send",
+        "--app-name=shell-runner",
+        "--urgency=critical",
+        "--wait",
+        "--action=open=Open",
+        "--",
+        "shell-runner: T4 approval needed",
+        "body",
+    ]
+    assert opened == [["xdg-open", UI_URL]]
+
+
+def test_dismissed_popup_does_not_open_anything() -> None:
+    run, opened = FakeRun(out=""), []
+    make_desktop(run, opened)("t", "b", "normal")
+    assert opened == []
+
+
+def test_each_popup_gets_its_own_daemon_thread_spawn() -> None:
+    spawned: list = []
+    desktop = make_desktop(FakeRun(), spawned=spawned)
+    desktop("t1", "b", "normal")
+    desktop("t2", "b", "normal")
+    assert len(spawned) == 2
+
+
+def test_spawn_daemon_runs_function_in_a_daemon_thread() -> None:
+    seen: dict = {}
+    done = threading.Event()
+
+    def work() -> None:
+        seen["daemon"] = threading.current_thread().daemon
+        seen["main"] = threading.current_thread() is threading.main_thread()
+        done.set()
+
+    spawn_daemon(work)
+    assert done.wait(2)
+    assert seen == {"daemon": True, "main": False}
+
+
+def test_without_action_support_url_goes_in_body_and_no_thread() -> None:
+    run, opened, spawned = FakeRun(help_text=HELP_WITHOUT_ACTION), [], []
+    make_desktop(run, opened, spawned)("t", "line1", "normal")
+    argv = run.calls[-1]
+    assert "--wait" not in argv
+    assert not any(a.startswith("--action") for a in argv)
+    assert argv[-2:] == ["t", f"line1\n{UI_URL}"]
+    assert spawned == []
+    assert opened == []
+
+
+def test_action_failure_at_runtime_falls_back_to_plain_popup() -> None:
+    run = FakeRun(code=1)  # help advertises --action, but the call fails
+    desktop = make_desktop(run)
+    desktop("t", "b", "normal")
+    assert "--wait" in run.calls[1]
+    assert "--wait" not in run.calls[2]
+    assert run.calls[2][-1] == f"b\n{UI_URL}"
+    desktop("t2", "b", "normal")  # remembered: plain from now on
+    assert "--wait" not in run.calls[3]
+
+
+def test_help_probe_runs_once() -> None:
+    run = FakeRun()
+    desktop = make_desktop(run)
+    desktop("t", "b", "normal")
+    desktop("t", "b", "normal")
+    assert [c for c in run.calls if c[1:] == ["--help"]] == [["notify-send", "--help"]]
+
+
+def test_all_invocations_are_argv_lists_of_strings() -> None:
+    run, opened = FakeRun(out="open"), []
+    make_desktop(run, opened)("t", "b", "normal")
+    make_desktop(FakeRun(help_text=HELP_WITHOUT_ACTION))("t", "b", "normal")
+    for argv in [*run.calls, *opened]:
+        assert isinstance(argv, list)
+        assert all(isinstance(a, str) for a in argv)
+
+
+def test_missing_notify_send_does_not_crash() -> None:
+    def broken(argv: list[str]) -> tuple[int, str]:
+        raise FileNotFoundError(argv[0])
+
+    make_desktop(broken)("t", "b", "normal")  # must not raise
