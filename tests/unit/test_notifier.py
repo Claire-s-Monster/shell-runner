@@ -1023,6 +1023,28 @@ def test_parse_args_rejects_non_http_urls(flag: str) -> None:
         parse_args([flag, "file:///etc/passwd"])
 
 
+@pytest.mark.parametrize("flag", ["--url", "--ui-url"])
+@pytest.mark.parametrize("bad", ["http://", "https:///x"])
+def test_parse_args_rejects_hostless_urls(flag: str, bad: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args([flag, bad])
+
+
+def test_parse_args_accepts_uppercase_scheme() -> None:
+    args = parse_args(["--url", "HTTP://127.0.0.1:4111/pending"])
+    assert args.url == "HTTP://127.0.0.1:4111/pending"
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "abc"])
+def test_parse_args_rejects_bad_interval(bad: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--interval", bad])
+
+
+def test_parse_args_accepts_fractional_interval() -> None:
+    assert parse_args(["--interval", "0.5"]).interval == 0.5
+
+
 def test_main_loops_until_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     fetched: list[str] = []
     monkeypatch.setattr(notifier, "http_fetch", lambda url, timeout=5.0: fetched.append(url) or [])
@@ -1041,7 +1063,9 @@ def test_notifier_module_is_stdlib_only() -> None:
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             roots |= {a.name.split(".")[0] for a in node.names}
-        elif isinstance(node, ast.ImportFrom) and node.module:
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0
+            assert node.module
             roots.add(node.module.split(".")[0])
     assert roots <= set(sys.stdlib_module_names)
 

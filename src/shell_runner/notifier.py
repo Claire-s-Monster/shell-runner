@@ -11,6 +11,7 @@ import argparse
 import html
 import http.client
 import json
+import math
 import re
 import subprocess  # nosec B404
 import sys
@@ -342,9 +343,25 @@ class DesktopNotifier:
 
 
 def _http_url(value: str) -> str:
-    if not value.startswith(("http://", "https://")):
-        raise argparse.ArgumentTypeError(f"not an http(s) URL: {value!r}")
+    try:
+        parts = urllib.parse.urlsplit(value)
+        host = parts.hostname
+    except ValueError:
+        host = None
+        parts = None
+    if parts is None or parts.scheme.lower() not in {"http", "https"} or not host:
+        raise argparse.ArgumentTypeError("not an http(s) URL with a host")
     return value
+
+
+def _positive_interval(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("interval must be a number") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("interval must be a finite number > 0")
+    return seconds
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -352,7 +369,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="shell-runner-notify",
         description="Desktop popups for pending shell-runner approval prompts (read-only).",
     )
-    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S, help="poll seconds")
+    parser.add_argument(
+        "--interval", type=_positive_interval, default=DEFAULT_INTERVAL_S, help="poll seconds"
+    )
     parser.add_argument("--url", type=_http_url, default=DEFAULT_PENDING_URL, help="/pending URL")
     parser.add_argument(
         "--ui-url", type=_http_url, default=DEFAULT_UI_URL, help="opened by the Open action"
