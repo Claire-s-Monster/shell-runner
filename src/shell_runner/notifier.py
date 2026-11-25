@@ -7,6 +7,7 @@ anything: ``/pending`` returns no tokens and popups only inform.
 
 from __future__ import annotations
 
+import argparse
 import html
 import http.client
 import json
@@ -28,6 +29,8 @@ CMD_LIMIT = 120
 REMIND_BEFORE_S = 60
 MAX_BACKOFF_S = 60.0
 DEFAULT_INTERVAL_S = 3.0
+DEFAULT_PENDING_URL = "http://127.0.0.1:4111/pending"
+DEFAULT_UI_URL = "http://127.0.0.1:8511/Pending_Prompts"
 MAX_RESPONSE_BYTES = 1_048_576
 READ_CHUNK_BYTES = 8192
 TRUNCATED = "… (truncated)"
@@ -336,3 +339,41 @@ class DesktopNotifier:
         except OSError as exc:
             _log(f"{argv[0]} failed: {exc}")
             return 127, ""
+
+
+def _http_url(value: str) -> str:
+    if not value.startswith(("http://", "https://")):
+        raise argparse.ArgumentTypeError(f"not an http(s) URL: {value!r}")
+    return value
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="shell-runner-notify",
+        description="Desktop popups for pending shell-runner approval prompts (read-only).",
+    )
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S, help="poll seconds")
+    parser.add_argument("--url", type=_http_url, default=DEFAULT_PENDING_URL, help="/pending URL")
+    parser.add_argument(
+        "--ui-url", type=_http_url, default=DEFAULT_UI_URL, help="opened by the Open action"
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    notifier = Notifier(
+        fetch=lambda: http_fetch(args.url),
+        notify=DesktopNotifier(ui_url=args.ui_url),
+        interval_s=args.interval,
+    )
+    try:
+        while True:
+            notifier.tick()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -81,6 +81,7 @@ check-scripts = { cmd = "bash -n scripts/shell-runner-daemon.sh && bash -n scrip
 dead-code = "vulture src/ --min-confidence 80"
 verify-mcp-mount = "python scripts/verify_mcp_mount.py"
 approval-tripwire = "python scripts/approval_tripwire.py"
+notify = { cmd = "python -m shell_runner.notifier", env = { PYTHONPATH = "src" } }
 
 [tool.pixi.feature.quality.dependencies]
 pytest = ">=8.0.0"

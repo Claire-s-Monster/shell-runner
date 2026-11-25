@@ -6,6 +6,7 @@ network, the desktop or real time.
 
 from __future__ import annotations
 
+import ast
 import json
 import socket
 import subprocess
@@ -14,12 +15,15 @@ import threading
 import types
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from shell_runner import notifier
 from shell_runner.notifier import (
+    DEFAULT_PENDING_URL,
+    DEFAULT_UI_URL,
     MAX_RESPONSE_BYTES,
     RUN_TIMEOUT_S,
     DesktopNotifier,
@@ -28,7 +32,9 @@ from shell_runner.notifier import (
     clean,
     format_remaining,
     http_fetch,
+    main,
     open_detached,
+    parse_args,
     run_argv,
     shorten_home,
     spawn_daemon,
@@ -997,3 +1003,51 @@ def test_opener_failure_in_worker_does_not_propagate() -> None:
         ui_url=UI_URL, run=FakeRun(out="open\n"), spawn=lambda fn: fn(), opener=failing_opener
     )
     desktop("t", "b", "normal")  # must not raise
+
+
+def test_parse_args_defaults() -> None:
+    args = parse_args([])
+    assert args.interval == 3.0
+    assert args.url == "http://127.0.0.1:4111/pending" == DEFAULT_PENDING_URL
+    assert args.ui_url == "http://127.0.0.1:8511/Pending_Prompts" == DEFAULT_UI_URL
+
+
+def test_parse_args_overrides() -> None:
+    args = parse_args(["--interval", "5", "--url", "http://h:1/pending", "--ui-url", "https://u/x"])
+    assert (args.interval, args.url, args.ui_url) == (5.0, "http://h:1/pending", "https://u/x")
+
+
+@pytest.mark.parametrize("flag", ["--url", "--ui-url"])
+def test_parse_args_rejects_non_http_urls(flag: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args([flag, "file:///etc/passwd"])
+
+
+def test_main_loops_until_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+    fetched: list[str] = []
+    monkeypatch.setattr(notifier, "http_fetch", lambda url, timeout=5.0: fetched.append(url) or [])
+
+    def stop(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(notifier.time, "sleep", stop)
+    assert main(["--url", "http://127.0.0.1:1/pending"]) == 0
+    assert fetched == ["http://127.0.0.1:1/pending"]
+
+
+def test_notifier_module_is_stdlib_only() -> None:
+    source = Path(notifier.__file__).read_text()
+    roots = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            roots |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            roots.add(node.module.split(".")[0])
+    assert roots <= set(sys.stdlib_module_names)
+
+
+def test_notifier_module_is_read_only() -> None:
+    source = Path(notifier.__file__).read_text()
+    assert "approve_pending" not in source
+    assert "/approve" not in source
+    assert "shell=True" not in source
