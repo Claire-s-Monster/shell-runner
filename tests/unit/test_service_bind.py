@@ -1,0 +1,46 @@
+"""Static guard: shell-runner must only bind to loopback (issue #136).
+
+POST /pending is unauthenticated, so a non-loopback bind would expose
+approval-prompt details. Port 4111 serves both the HTTP API and /mcp.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+LOOPBACK_HOST = re.compile(r"--host 127\.0\.0\.1(\s|$)")
+
+
+def _execstart_lines(name: str) -> list[str]:
+    text = (SCRIPTS / name).read_text()
+    return [line for line in text.splitlines() if line.startswith("ExecStart=")]
+
+
+@pytest.mark.parametrize("name", ["shell-runner.service", "shell-runner.service.example"])
+def test_unit_execstart_binds_loopback_only(name: str) -> None:
+    lines = _execstart_lines(name)
+    assert len(lines) == 1, f"{name}: expected exactly one ExecStart"
+    assert LOOPBACK_HOST.search(lines[0]), f"{name}: ExecStart lacks --host 127.0.0.1"
+    assert "0.0.0.0" not in lines[0]
+
+
+def test_daemon_script_default_host_is_loopback() -> None:
+    text = (SCRIPTS / "shell-runner-daemon.sh").read_text()
+    assert re.search(r'^DEFAULT_HOST="127\.0\.0\.1"$', text, re.MULTILINE)
+
+
+def test_daemon_script_fallback_still_uses_default_host() -> None:
+    text = (SCRIPTS / "shell-runner-daemon.sh").read_text()
+    assert re.search(
+        r'^SHELL_RUNNER_HOST="\$\{SHELL_RUNNER_HOST:-\$DEFAULT_HOST\}"$', text, re.MULTILINE
+    )
+
+
+def test_loopback_pattern_rejects_other_hosts() -> None:
+    assert not LOOPBACK_HOST.search("uvicorn app --host 0.0.0.0 --port 4111")
+    assert not LOOPBACK_HOST.search("uvicorn app --host 127.0.0.10 --port 4111")
+    assert not LOOPBACK_HOST.search("uvicorn app --port 4111")
