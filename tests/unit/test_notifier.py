@@ -7,6 +7,7 @@ network, the desktop or real time.
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import types
 from datetime import UTC, datetime, timedelta
@@ -560,12 +561,13 @@ def test_http_fetch_rejects_unexpected_payload_as_value_error() -> None:
 
 
 def test_http_fetch_connection_refused_is_oserror() -> None:
-    server, _seen = _serve(b"{}")
-    port = server.server_port
-    server.shutdown()
-    server.server_close()
-    with pytest.raises(OSError):  # noqa: PT011
-        http_fetch(f"http://127.0.0.1:{port}/pending", timeout=1)
+    # Bound but never listening: the port stays reserved for the whole call,
+    # and Linux answers connect() with ECONNREFUSED.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        with pytest.raises(OSError):  # noqa: PT011
+            http_fetch(f"http://127.0.0.1:{port}/pending", timeout=1)
 
 
 def test_http_fetch_malformed_json_is_value_error() -> None:
