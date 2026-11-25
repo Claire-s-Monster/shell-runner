@@ -709,11 +709,24 @@ def test_http_fetch_enforces_overall_read_deadline(monkeypatch: pytest.MonkeyPat
         server.server_close()
 
 
-def test_http_fetch_scheme_error_does_not_leak_credentials() -> None:
+@pytest.mark.parametrize("url", ["ftp://user:pw@host/x", "user:pw@host/x"])
+def test_http_fetch_scheme_error_does_not_leak_credentials(url: str) -> None:
     with pytest.raises(ValueError, match="scheme") as excinfo:
-        http_fetch("ftp://user:pw@host/x")
-    assert "pw" not in str(excinfo.value)
-    assert "ftp" in str(excinfo.value)
+        http_fetch(url)
+    message = str(excinfo.value)
+    assert "pw" not in message
+    assert "user" not in message
+    assert "host" not in message
+
+
+def test_http_fetch_deeply_nested_json_is_value_error() -> None:
+    server, _seen = _serve(b"[" * 100_000)
+    try:
+        with pytest.raises(ValueError, match="too deeply nested"):
+            http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_http_fetch_failures_are_what_tick_treats_as_unreachable() -> None:

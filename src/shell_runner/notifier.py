@@ -210,8 +210,9 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     """
     scheme = urllib.parse.urlsplit(url).scheme
     if scheme not in ("http", "https"):
-        # Scheme only: the URL may embed credentials that would reach the popup.
-        raise ValueError(f"unsupported URL scheme: {scheme!r}")
+        # Fixed text only: a scheme-less URL such as "user:pw@host" parses its
+        # username as the scheme, and any part of the URL could reach the popup.
+        raise ValueError("unsupported URL scheme (only http and https are allowed)")
     request = urllib.request.Request(
         url,
         data=b"{}",
@@ -230,7 +231,10 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
         raise OSError(f"HTTP protocol error: {exc!r}") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("/pending response too large")
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except RecursionError as exc:
+        raise ValueError("response JSON too deeply nested") from exc
     prompts = data.get("prompts") if isinstance(data, dict) else None
     if not isinstance(prompts, list):
         raise ValueError("unexpected /pending response")
