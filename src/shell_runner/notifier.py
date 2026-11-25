@@ -228,7 +228,9 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     # urlopen's timeout applies per socket operation, so bound the whole read too.
     deadline = time.monotonic() + timeout
     try:
-        # B310 suppressed below: the scheme was restricted to http/https above.
+        # B310 and the Semgrep dynamic-urllib rule are suppressed below: the
+        # scheme was restricted to http/https above, so file:// etc. is rejected.
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
             if response.status != 200:
                 raise OSError(f"unexpected HTTP status {response.status}")
