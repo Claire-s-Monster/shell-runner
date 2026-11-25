@@ -134,6 +134,7 @@ def test_build_body_sanitises_every_untrusted_field() -> None:
     assert "\x07" not in body
     assert "agent: &lt;b&gt;a&lt;/b&gt;" in body
     assert "cmd: echo &lt;i&gt;&amp;" in body
+    assert "cwd: /tmp/&amp;x" in body
     assert body.splitlines()[0] == "&lt;u&gt;w&lt;/u&gt;"
 
 

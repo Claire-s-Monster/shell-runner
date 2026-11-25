@@ -31,6 +31,15 @@ def test_unit_execstart_binds_loopback_only(name: str) -> None:
     assert "0.0.0.0" not in lines[0]
 
 
+@pytest.mark.parametrize("name", ["shell-runner.service", "shell-runner.service.example"])
+def test_units_listen_on_4111_only(name: str) -> None:
+    lines = _execstart_lines(name)
+    assert len(lines) == 1, f"{name}: expected exactly one ExecStart"
+    assert "--port 4111" in lines[0], f"{name}: ExecStart lacks --port 4111"
+    text = (SCRIPTS / name).read_text()
+    assert "4112" not in text, f"{name}: unexpected port 4112"
+
+
 def test_daemon_script_default_host_is_loopback() -> None:
     text = (SCRIPTS / "shell-runner-daemon.sh").read_text()
     assert re.search(r'^DEFAULT_HOST="127\.0\.0\.1"$', text, re.MULTILINE)
