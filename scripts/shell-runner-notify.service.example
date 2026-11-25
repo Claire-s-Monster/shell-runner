@@ -1,0 +1,34 @@
+[Unit]
+Description=Shell Runner desktop approval notifier
+Documentation=https://github.com/Claire-s-Monster/shell-runner
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ClaudeCode/Servers/shell-runner/development
+Environment=PYTHONPATH=%h/ClaudeCode/Servers/shell-runner/development/src
+ExecStart=%h/.pixi/bin/pixi run --frozen --manifest-path %h/ClaudeCode/Servers/shell-runner/development/pyproject.toml notify
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
+
+# --frozen: never re-solve or rewrite pixi.lock (a newer local pixi would upgrade it to v7).
+# NOTE: this unit points at the development/ tree, where the `notify` pixi task only
+# exists after this branch is merged. Before then, point the paths at the worktree.
+#
+# Installation (systemd USER unit; needs notify-send and xdg-open installed):
+#   cp shell-runner-notify.service.example ~/.config/systemd/user/shell-runner-notify.service
+#   # Edit paths as needed
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now shell-runner-notify
+#
+# If popups do not appear, the unit lacks your desktop session variables:
+#   systemctl --user import-environment DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
+#   systemctl --user restart shell-runner-notify
+#
+# Logs: journalctl --user -u shell-runner-notify -f
