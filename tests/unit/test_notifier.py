@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import threading
+import types
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -624,6 +625,93 @@ def test_http_fetch_sends_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(OSError, match="stop"):
         http_fetch("http://127.0.0.1:1/pending", timeout=2.5)
     assert captured["timeout"] == 2.5
+
+
+def _serve_truncated() -> HTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 (http.server handler naming)
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b'{"prompts"')
+            self.wfile.flush()
+            self.close_connection = True
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_http_fetch_truncated_body_is_oserror() -> None:
+    server = _serve_truncated()
+    try:
+        with pytest.raises(OSError, match="protocol error"):
+            http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_tick_takes_unreachable_path_on_truncated_body() -> None:
+    server = _serve_truncated()
+    popups: list[str] = []
+    try:
+        notifier = Notifier(
+            fetch=lambda: http_fetch(_url(server)),
+            notify=lambda title, _body, _urgency: popups.append(title),
+            home="/home/me",
+        )
+        notifier.tick()
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert popups == ["shell-runner-notify: server unreachable"]
+
+
+def test_http_fetch_enforces_overall_read_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 (http.server handler naming)
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            try:
+                self.wfile.write(b"x")
+                self.wfile.flush()
+                release.wait(2)
+            except OSError:
+                pass
+            self.close_connection = True
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    clock = iter([0.0, 100.0])  # deadline computed at 0.0; first chunk lands at 100.0
+    monkeypatch.setattr(
+        "shell_runner.notifier.time", types.SimpleNamespace(monotonic=lambda: next(clock))
+    )
+    try:
+        with pytest.raises(OSError, match="read deadline exceeded"):
+            http_fetch(_url(server), timeout=1)
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_fetch_scheme_error_does_not_leak_credentials() -> None:
+    with pytest.raises(ValueError, match="scheme") as excinfo:
+        http_fetch("ftp://user:pw@host/x")
+    assert "pw" not in str(excinfo.value)
+    assert "ftp" in str(excinfo.value)
 
 
 def test_http_fetch_failures_are_what_tick_treats_as_unreachable() -> None:

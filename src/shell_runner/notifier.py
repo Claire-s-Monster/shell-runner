@@ -8,9 +8,11 @@ anything: ``/pending`` returns no tokens and popups only inform.
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import re
 import sys
+import time
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -25,6 +27,7 @@ REMIND_BEFORE_S = 60
 MAX_BACKOFF_S = 60.0
 DEFAULT_INTERVAL_S = 3.0
 MAX_RESPONSE_BYTES = 1_048_576
+READ_CHUNK_BYTES = 8192
 TRUNCATED = "… (truncated)"
 _WHITESPACE_CTRL = re.compile(r"[\n\r\t\x85]")
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
@@ -181,6 +184,23 @@ class Notifier:
         self.notify(title, build_body(prompt, remaining, self.home), urgency)
 
 
+def _read_bounded(response: http.client.HTTPResponse, deadline: float) -> bytes:
+    """Read up to MAX_RESPONSE_BYTES + 1 bytes in chunks before `deadline`."""
+    chunks: list[bytes] = []
+    total = 0
+    while total <= MAX_RESPONSE_BYTES:
+        chunk = response.read1(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - total))
+        if not chunk:
+            if response.length:  # EOF before Content-Length bytes arrived
+                raise http.client.IncompleteRead(b"".join(chunks), response.length)
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if time.monotonic() > deadline:
+            raise OSError("/pending read deadline exceeded")
+    return b"".join(chunks)
+
+
 def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     """POST `{}` to /pending and return the prompt list.
 
@@ -188,19 +208,26 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     unreachable and ValueError on a non-http(s) URL, an oversized or malformed
     response; `Notifier.tick` treats both as "server unreachable".
     """
-    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
-        raise ValueError(f"unsupported URL scheme: {url!r}")
+    scheme = urllib.parse.urlsplit(url).scheme
+    if scheme not in ("http", "https"):
+        # Scheme only: the URL may embed credentials that would reach the popup.
+        raise ValueError(f"unsupported URL scheme: {scheme!r}")
     request = urllib.request.Request(
         url,
         data=b"{}",
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    # B310 suppressed below: the scheme was restricted to http/https above.
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
-        if response.status != 200:
-            raise OSError(f"unexpected HTTP status {response.status}")
-        raw = response.read(MAX_RESPONSE_BYTES + 1)
+    # urlopen's timeout applies per socket operation, so bound the whole read too.
+    deadline = time.monotonic() + timeout
+    try:
+        # B310 suppressed below: the scheme was restricted to http/https above.
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+            if response.status != 200:
+                raise OSError(f"unexpected HTTP status {response.status}")
+            raw = _read_bounded(response, deadline)
+    except http.client.HTTPException as exc:
+        raise OSError(f"HTTP protocol error: {exc!r}") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("/pending response too large")
     data = json.loads(raw)
