@@ -757,6 +757,22 @@ def test_http_fetch_deeply_nested_json_is_value_error() -> None:
         server.server_close()
 
 
+def test_json_depth_exceeds_boundary() -> None:
+    limit = 5
+    assert notifier._json_depth_exceeds(b"[" * limit + b"]" * limit, limit) is False
+    assert notifier._json_depth_exceeds(b"[" * (limit + 1) + b"]" * (limit + 1), limit) is True
+
+
+def test_json_depth_exceeds_ignores_brackets_in_strings() -> None:
+    raw = b'{"a": "[[[[[[[[", "b": "x\\"[[[[[[[["}'
+    assert notifier._json_depth_exceeds(raw, 1) is False
+
+
+def test_json_depth_exceeds_normal_pending_payload() -> None:
+    raw = b'{"prompts": [{"id": 1, "command": "ls [a]", "cwd": "/tmp"}]}'
+    assert notifier._json_depth_exceeds(raw, notifier.MAX_JSON_DEPTH) is False
+
+
 def test_http_fetch_failures_are_what_tick_treats_as_unreachable() -> None:
     server, _seen = _serve(b"not json")
     popups: list[str] = []

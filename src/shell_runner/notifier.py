@@ -38,6 +38,8 @@ DEFAULT_UI_URL = "http://127.0.0.1:8511/Pending_Prompts"
 MAX_RESPONSE_BYTES = 1_048_576
 READ_CHUNK_BYTES = 8192
 TRUNCATED = "… (truncated)"
+MAX_JSON_DEPTH = 64
+_JSON_TOKEN = re.compile(rb'"(?:[^"\\]|\\.)*"|[\[{]|[\]}]')
 _WHITESPACE_CTRL = re.compile(r"[\n\r\t\x85]")
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _MISSING = "?"
@@ -214,6 +216,19 @@ def _read_bounded(response: http.client.HTTPResponse, deadline: float) -> bytes:
     return b"".join(chunks)
 
 
+def _json_depth_exceeds(raw: bytes, limit: int) -> bool:
+    """Return True if bracket nesting in ``raw`` goes deeper than ``limit``, ignoring strings."""
+    depth = 0
+    for match in _JSON_TOKEN.finditer(raw):
+        token = match.group()
+        if token.startswith(b'"'):
+            continue
+        depth += 1 if token in (b"[", b"{") else -1
+        if depth > limit:
+            return True
+    return False
+
+
 def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     """POST `{}` to /pending and return the prompt list.
 
@@ -246,6 +261,8 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
         raise OSError(f"HTTP protocol error: {exc!r}") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("/pending response too large")
+    if _json_depth_exceeds(raw, MAX_JSON_DEPTH):
+        raise ValueError("response JSON too deeply nested")
     try:
         data = json.loads(raw)
     except RecursionError as exc:
