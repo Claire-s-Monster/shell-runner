@@ -443,6 +443,19 @@ def test_backoff_grows_and_is_capped() -> None:
     assert feed.calls == calls + 1  # cap is 60s
 
 
+def test_backoff_doubles_before_the_cap() -> None:
+    notifier, feed, clock, _popups = make_notifier()  # interval 3s: delays 6, 12, 24
+    feed.error = OSError("down")
+    for delay in (6, 12, 24):
+        before = feed.calls
+        notifier.tick()
+        assert feed.calls == before + 1
+        clock.advance(delay - 1)
+        notifier.tick()
+        assert feed.calls == before + 1  # still backing off
+        clock.advance(1)
+
+
 def test_very_long_outage_does_not_overflow() -> None:
     notifier, feed, clock, popups = make_notifier()
     feed.error = OSError("down")
@@ -1036,7 +1049,7 @@ def test_parse_args_accepts_uppercase_scheme() -> None:
     assert args.url == "HTTP://127.0.0.1:4111/pending"
 
 
-@pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "abc"])
+@pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "abc", "0.05", "3601", "1e999", "1e308"])
 def test_parse_args_rejects_bad_interval(bad: str) -> None:
     with pytest.raises(SystemExit):
         parse_args(["--interval", bad])
@@ -1046,16 +1059,53 @@ def test_parse_args_accepts_fractional_interval() -> None:
     assert parse_args(["--interval", "0.5"]).interval == 0.5
 
 
+def test_parse_args_accepts_interval_bounds() -> None:
+    assert parse_args(["--interval", "0.1"]).interval == 0.1
+    assert parse_args(["--interval", "3600"]).interval == 3600.0
+
+
 def test_main_loops_until_keyboard_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     fetched: list[str] = []
     monkeypatch.setattr(notifier, "http_fetch", lambda url, timeout=5.0: fetched.append(url) or [])
+    sleeps: list[float] = []
 
-    def stop(_seconds: float) -> None:
-        raise KeyboardInterrupt
+    def stop_on_third(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 3:
+            raise KeyboardInterrupt
 
-    monkeypatch.setattr(notifier.time, "sleep", stop)
-    assert main(["--url", "http://127.0.0.1:1/pending"]) == 0
-    assert fetched == ["http://127.0.0.1:1/pending"]
+    monkeypatch.setattr(notifier.time, "sleep", stop_on_third)
+    assert main(["--url", "http://127.0.0.1:1/pending", "--interval", "2"]) == 0
+    assert fetched == ["http://127.0.0.1:1/pending"] * 3  # keeps polling between sleeps
+    assert sleeps == [2.0, 2.0, 2.0]
+
+
+def test_slow_fetch_does_not_popup_for_prompt_that_expired_meanwhile() -> None:
+    clock = Clock()
+    popups: list[tuple[str, str, str]] = []
+
+    def slow_fetch() -> list[dict]:
+        clock.advance(400)  # prompt (300s left) expires while the request is in flight
+        return [make_prompt(expires_in=300)]
+
+    notifier_ = Notifier(
+        fetch=slow_fetch,
+        notify=lambda title, body, urgency: popups.append((title, body, urgency)),
+        clock=clock,
+        home="/home/me",
+    )
+    notifier_.tick()
+    assert popups == []
+
+
+def test_log_escapes_newlines_in_prompt_id(capsys: pytest.CaptureFixture[str]) -> None:
+    notifier_, feed, _clock, popups = make_notifier()
+    feed.prompts = [make_prompt(pid="x\nshell-runner-notify: forged", expires_at="bad")]
+    notifier_.tick()
+    err = capsys.readouterr().err
+    assert popups == []
+    assert err.count("\n") == 1
+    assert "x\\nshell-runner-notify: forged" in err
 
 
 def test_notifier_module_is_stdlib_only() -> None:

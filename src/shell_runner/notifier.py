@@ -30,6 +30,9 @@ CMD_LIMIT = 120
 REMIND_BEFORE_S = 60
 MAX_BACKOFF_S = 60.0
 DEFAULT_INTERVAL_S = 3.0
+# Bounds keep time.sleep from overflowing and back-off from collapsing to zero.
+MIN_INTERVAL_S = 0.1
+MAX_INTERVAL_S = 3600.0
 DEFAULT_PENDING_URL = "http://127.0.0.1:4111/pending"
 DEFAULT_UI_URL = "http://127.0.0.1:8511/Pending_Prompts"
 MAX_RESPONSE_BYTES = 1_048_576
@@ -92,7 +95,10 @@ def _utcnow() -> datetime:
 
 
 def _log(message: str) -> None:
-    print(f"shell-runner-notify: {message}", file=sys.stderr)
+    # Escape non-printable characters (newlines etc.) so a hostile prompt id or
+    # field cannot forge extra journal lines.
+    safe = "".join(c if c.isprintable() else c.encode("unicode_escape").decode() for c in message)
+    print(f"shell-runner-notify: {safe}", file=sys.stderr)
 
 
 def parse_expiry(value: str | None) -> datetime | None:
@@ -133,7 +139,8 @@ class Notifier:
             return
         self._failures = 0
         self._next_poll = None
-        self._handle(prompts, now)
+        # Re-read the clock: a slow fetch must not leave an expired prompt looking live.
+        self._handle(prompts, self.clock())
 
     def _on_unreachable(self, now: datetime, exc: Exception) -> None:
         first = self._failures == 0
@@ -361,8 +368,10 @@ def _positive_interval(value: str) -> float:
         seconds = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError("interval must be a number") from None
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise argparse.ArgumentTypeError("interval must be a finite number > 0")
+    if not math.isfinite(seconds) or not MIN_INTERVAL_S <= seconds <= MAX_INTERVAL_S:
+        raise argparse.ArgumentTypeError(
+            f"interval must be between {MIN_INTERVAL_S} and {MAX_INTERVAL_S} seconds"
+        )
     return seconds
 
 
