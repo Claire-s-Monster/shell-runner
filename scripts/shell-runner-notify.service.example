@@ -7,8 +7,8 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=%h/ClaudeCode/Servers/shell-runner/development
-Environment=PYTHONPATH=%h/ClaudeCode/Servers/shell-runner/development/src
-ExecStart=%h/.pixi/bin/pixi run --frozen --manifest-path %h/ClaudeCode/Servers/shell-runner/development/pyproject.toml notify
+Environment=PYTHONPATH=src
+ExecStart=%h/.pixi/bin/pixi run --frozen -e dev --manifest-path %h/ClaudeCode/Servers/shell-runner/development/pyproject.toml python -m shell_runner.notifier
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -18,8 +18,8 @@ StandardError=journal
 WantedBy=graphical-session.target
 
 # --frozen: never re-solve or rewrite pixi.lock (a newer local pixi would upgrade it to v7).
-# NOTE: this unit points at the development/ tree, where the `notify` pixi task only
-# exists after this branch is merged. Before then, point the paths at the worktree.
+# The notifier runs as a module (there is no pixi task for it): PYTHONPATH=src is
+# relative to WorkingDirectory. Add flags (--interval, --url, --ui-url) after the module name.
 #
 # Installation (systemd USER unit; needs notify-send and xdg-open installed):
 #   cp shell-runner-notify.service.example ~/.config/systemd/user/shell-runner-notify.service

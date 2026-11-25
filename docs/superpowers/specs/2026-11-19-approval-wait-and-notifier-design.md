@@ -110,7 +110,7 @@ Base: development a3506b7. Rebase after PR #118 (#117 TKSENTINEL guard) merges.
 
 ### Process
 
-- A separate process in `src/shell_runner/notifier.py`, run with `pixi run notify` or a systemd *user* unit (example unit file under `docs/` or `deploy/`).
+- A separate process in `src/shell_runner/notifier.py`, run with `pixi run -e dev python -m shell_runner.notifier` (PYTHONPATH=src) or a systemd *user* unit (example unit file under `docs/` or `deploy/`).
 - Stdlib only (`urllib`) plus the system `notify-send`.
 - Every `notify-send` and `xdg-open` call uses an argv list (no shell).
 

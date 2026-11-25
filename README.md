@@ -99,14 +99,14 @@ reads the telemetry DB read-only and talks to the server at
 `shell-runner-notify` pops up a desktop notification for each new T3/T4 approval prompt so you do not have to keep the UI page open. It is read-only (it polls `POST /pending`, never approves), uses only the standard library plus the system `notify-send` / `xdg-open`, and is separate from the server.
 
 ```bash
-pixi run notify                       # defaults: poll every 3s
-pixi run notify --interval 5 --url http://127.0.0.1:4111/pending \
-  --ui-url http://127.0.0.1:8511/Pending_Prompts
+PYTHONPATH=src pixi run -e dev python -m shell_runner.notifier      # defaults: poll every 3s
+PYTHONPATH=src pixi run -e dev python -m shell_runner.notifier --interval 5 \
+  --url http://127.0.0.1:4111/pending --ui-url http://127.0.0.1:8511/Pending_Prompts
 ```
 
-`--interval` must be a finite number greater than 0. `--url` and `--ui-url` must be http or https URLs with a host.
+`--interval` must be between 0.1 and 3600 seconds. `--url` and `--ui-url` must be http or https URLs with a host.
 
-Without the pixi task: `PYTHONPATH=src python -m shell_runner.notifier`. To run it as a systemd user service, copy `scripts/shell-runner-notify.service.example` (installation steps are in the file).
+There is no pixi task for it; it runs as a module from the repo root. To run it as a systemd user service, copy `scripts/shell-runner-notify.service.example` (installation steps are in the file).
 
 - One popup per new prompt (T4 is critical urgency), plus one reminder about 60 seconds before it expires if still undecided.
 - Popups show agent, cwd, the command (cut at 120 characters), time left and any scope warning. Decide on the Pending Prompts page; the popup's "Open" button opens it. If your `notify-send` has no `--action` support, the URL is appended to the popup body instead.
