@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import threading
 import types
 from datetime import UTC, datetime, timedelta
@@ -16,14 +18,18 @@ from typing import Any
 
 import pytest
 
+from shell_runner import notifier
 from shell_runner.notifier import (
     MAX_RESPONSE_BYTES,
+    RUN_TIMEOUT_S,
     DesktopNotifier,
     Notifier,
     build_body,
     clean,
     format_remaining,
     http_fetch,
+    open_detached,
+    run_argv,
     shorten_home,
     spawn_daemon,
 )
@@ -756,9 +762,11 @@ class FakeRun:
     def __init__(self, help_text: str = HELP_WITH_ACTION, code: int = 0, out: str = "") -> None:
         self.help_text, self.code, self.out = help_text, code, out
         self.calls: list[list[str]] = []
+        self.timeouts: list[float | None] = []
 
-    def __call__(self, argv: list[str]) -> tuple[int, str]:
+    def __call__(self, argv: list[str], timeout: float | None = 10.0) -> tuple[int, str]:
         self.calls.append(argv)
+        self.timeouts.append(timeout)
         if argv[1:] == ["--help"]:
             return 0, self.help_text
         return self.code, self.out
@@ -862,7 +870,130 @@ def test_all_invocations_are_argv_lists_of_strings() -> None:
 
 
 def test_missing_notify_send_does_not_crash() -> None:
-    def broken(argv: list[str]) -> tuple[int, str]:
+    calls: list[list[str]] = []
+
+    def broken(argv: list[str], timeout: float | None = None) -> tuple[int, str]:
+        calls.append(argv)
         raise FileNotFoundError(argv[0])
 
-    make_desktop(broken)("t", "b", "normal")  # must not raise
+    opened: list[list[str]] = []
+    make_desktop(broken, opened)("t", "b", "normal")  # must not raise
+    assert opened == []
+    assert calls == [
+        ["notify-send", "--help"],
+        ["notify-send", "--app-name=shell-runner", "--urgency=normal", "--", "t", f"b\n{UI_URL}"],
+    ]
+
+
+def test_probe_and_plain_calls_get_a_finite_timeout_but_wait_call_does_not() -> None:
+    run = FakeRun()
+    make_desktop(run)("t", "b", "normal")
+    assert run.calls[0] == ["notify-send", "--help"]
+    assert run.timeouts[0] == RUN_TIMEOUT_S
+    assert "--wait" in run.calls[1]
+    assert run.timeouts[1] is None
+
+    plain = FakeRun(help_text=HELP_WITHOUT_ACTION)
+    make_desktop(plain)("t", "b", "normal")
+    assert plain.timeouts == [RUN_TIMEOUT_S, RUN_TIMEOUT_S]
+
+
+def test_run_argv_timeout_becomes_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> None:
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(OSError, match="timed out") as info:
+        run_argv(["notify-send", "--help"])
+    assert isinstance(info.value.__cause__, subprocess.TimeoutExpired)
+    assert seen["timeout"] == RUN_TIMEOUT_S
+
+
+def test_hung_plain_popup_is_handled_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(argv: list[str], **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    desktop = DesktopNotifier(ui_url=UI_URL, spawn=lambda fn: fn(), opener=lambda argv: None)
+    desktop("t", "b", "normal")  # probe times out -> plain popup times out; no exception
+
+
+def test_run_argv_decodes_leniently_and_drops_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout="x", stderr=None)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert run_argv(["x"]) == (0, "x")
+    assert seen["errors"] == "replace"
+    assert seen["stderr"] == subprocess.DEVNULL
+
+
+def test_run_argv_survives_non_utf8_output() -> None:
+    code, out = run_argv([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'a\\xffb')"])
+    assert code == 0
+    assert out == "a�b"
+
+
+def test_stderr_noise_does_not_hide_the_open_click() -> None:
+    script = "import sys; sys.stderr.write('warning\\n'); print('open')"
+
+    def noisy(argv: list[str], timeout: float | None = None) -> tuple[int, str]:
+        if argv[1:] == ["--help"]:
+            return 0, HELP_WITH_ACTION
+        return run_argv([sys.executable, "-c", script], timeout=timeout)
+
+    opened: list[list[str]] = []
+    make_desktop(noisy, opened)("t", "b", "normal")
+    assert opened == [["xdg-open", UI_URL]]
+
+
+def test_open_detached_starts_a_reaper(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProc:
+        waited = False
+
+        def wait(self) -> int:
+            FakeProc.waited = True
+            return 0
+
+    popen_args: list[Any] = []
+    reapers: list[Any] = []
+
+    def fake_popen(argv: list[str], **kwargs: Any) -> FakeProc:
+        popen_args.append(argv)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(notifier, "spawn_daemon", reapers.append)
+    open_detached(["xdg-open", UI_URL])
+    assert popen_args == [["xdg-open", UI_URL]]
+    assert len(reapers) == 1
+    reapers[0]()
+    assert FakeProc.waited
+
+
+def test_dash_leading_title_and_body_come_after_double_dash() -> None:
+    run = FakeRun(out="")
+    make_desktop(run)("-t", "-b", "normal")
+    argv = run.calls[-1]
+    assert argv[-3:] == ["--", "-t", "-b"]
+
+    plain = FakeRun(help_text=HELP_WITHOUT_ACTION)
+    make_desktop(plain)("-t", "-b", "normal")
+    assert plain.calls[-1][-3:-1] == ["--", "-t"]
+    assert plain.calls[-1][-1].startswith("-b")
+
+
+def test_opener_failure_in_worker_does_not_propagate() -> None:
+    def failing_opener(argv: list[str]) -> None:
+        raise FileNotFoundError(argv[0])
+
+    desktop = DesktopNotifier(
+        ui_url=UI_URL, run=FakeRun(out="open\n"), spawn=lambda fn: fn(), opener=failing_opener
+    )
+    desktop("t", "b", "normal")  # must not raise

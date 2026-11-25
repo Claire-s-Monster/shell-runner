@@ -243,13 +243,30 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     return prompts
 
 
-Runner = Callable[[list[str]], tuple[int, str]]
+RUN_TIMEOUT_S = 10.0
+
+# Called as run(argv) or run(argv, timeout=<seconds or None>).
+Runner = Callable[..., tuple[int, str]]
 
 
-def run_argv(argv: list[str]) -> tuple[int, str]:
-    """Run an argv list (never a shell); return (exit code, stdout + stderr)."""
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False)  # nosec B603
-    return proc.returncode, proc.stdout + proc.stderr
+def run_argv(argv: list[str], timeout: float | None = RUN_TIMEOUT_S) -> tuple[int, str]:
+    """Run an argv list (never a shell); return (exit code, stdout).
+
+    stderr is discarded. A timeout (None = wait forever) raises OSError.
+    """
+    try:
+        proc = subprocess.run(  # nosec B603
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OSError(f"{argv[0]} timed out after {timeout}s") from exc
+    return proc.returncode, proc.stdout
 
 
 def spawn_daemon(fn: Callable[[], None]) -> None:
@@ -257,13 +274,18 @@ def spawn_daemon(fn: Callable[[], None]) -> None:
 
 
 def open_detached(argv: list[str]) -> None:
-    subprocess.Popen(  # nosec B603
+    proc = subprocess.Popen(  # nosec B603
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+    def reap() -> None:
+        proc.wait()
+
+    spawn_daemon(reap)  # reap the child so it does not linger as a zombie
 
 
 @dataclass
@@ -295,7 +317,7 @@ class DesktopNotifier:
         return self._action_ok
 
     def _wait_and_open(self, argv: list[str], base: list[str], title: str, body: str) -> None:
-        code, out = self._run(argv)
+        code, out = self._run(argv, timeout=None)  # --wait blocks until clicked
         if code != 0:
             self._action_ok = False
             self._plain(base, title, body)
@@ -308,9 +330,9 @@ class DesktopNotifier:
     def _plain(self, base: list[str], title: str, body: str) -> None:
         self._run([*base, "--", title, f"{body}\n{clean(self.ui_url)}"])
 
-    def _run(self, argv: list[str]) -> tuple[int, str]:
+    def _run(self, argv: list[str], timeout: float | None = RUN_TIMEOUT_S) -> tuple[int, str]:
         try:
-            return self.run(argv)
+            return self.run(argv, timeout=timeout)
         except OSError as exc:
             _log(f"{argv[0]} failed: {exc}")
             return 127, ""
