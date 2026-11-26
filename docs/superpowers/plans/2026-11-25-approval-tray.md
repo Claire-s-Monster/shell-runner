@@ -5,6 +5,7 @@
 **Goal:** Replace the noisy `notify-send` popups of #136/#137 with a silent Cinnamon panel icon that shows how many approval prompts are pending (issue #138, spec `docs/superpowers/specs/2026-11-25-approval-tray-design.md`).
 **Architecture:** `src/shell_runner/notifier.py` stays a stdlib-only, read-only polling core that hands every fetch result to an `on_update(Snapshot)` callback and offers `run_loop(notifier, stop, interval)`. New `src/shell_runner/tray.py` is the only `gi` consumer: a pure, CI-tested layer (`render`, `plan_update`, `menu_entries`, `substitute_home`, `open_ui`) plus a thin, CI-uncovered GTK/XApp applier with a worker thread and `main(argv)`. A rewritten systemd user unit runs it with `/usr/bin/python3 -m shell_runner.tray`.
 **Tech Stack:** Python 3.11 (pixi `dev` env for tests; system `/usr/bin/python3` 3.11 at runtime), stdlib (`urllib`, `threading`, `argparse`, `dataclasses`, `re`, `configparser` in tests), PyGObject from Debian `python3-gi` + `gir1.2-xapp-1.0` (Gtk 3.0, XApp 1.0, GLib), `xdg-open`, pytest, ruff, mypy, systemd user units.
+
 ---
 
 ## Constraints (read first, HARD)
@@ -612,6 +613,8 @@ def test_parse_args_help_uses_tray_wording(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("COLUMNS", "200")  # keep the description on one line
+    monkeypatch.setenv("NO_COLOR", "1")  # Python 3.14 argparse can colour its help
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
     with pytest.raises(SystemExit):
         parse_args(["--help"])
     out = capsys.readouterr().out
@@ -1196,6 +1199,13 @@ def test_unreachable_stale_rows_are_refiltered_against_now() -> None:
     assert row_ids(view) == ["p2"]
 
 
+def test_unreachable_with_every_stale_prompt_expired_shows_the_empty_header() -> None:
+    view = view_of(down(make_prompt("a", expires_in=-1), make_prompt("b", expires_in=0)))
+    assert view.header == "Server unreachable"
+    assert view.rows == ()
+    assert menu_entries(view) == [("header", "Server unreachable"), *TAIL]
+
+
 def test_rows_that_expired_since_the_poll_are_dropped() -> None:
     snapshot = ok(make_prompt("p1", expires_in=300), make_prompt("p2", expires_in=600))
     later = view_of(snapshot, now=NOW + timedelta(seconds=300))  # p1 expires exactly now
@@ -1264,6 +1274,10 @@ def test_bad_command_tier_shows_t_question_and_is_not_counted_as_t4(tier: Any) -
 def test_bad_agent_id_shows_question_mark(agent: Any) -> None:
     view = view_of(ok(make_prompt("p1", agent_id=agent)))
     assert view.rows[0].text_without_left == "T3 · ? · ls ~/proj"
+
+
+def test_long_agent_id_is_cut_to_the_menu_limit() -> None:
+    assert view_of(ok(make_prompt(agent_id="a" * 80))).rows[0].identity[2] == "a" * 50 + "…"
 
 
 @pytest.mark.parametrize("cmd", [MISSING, ["ls"], None])
@@ -1369,8 +1383,11 @@ STRUCTURAL_CHANGES = [
 
 
 @pytest.mark.parametrize("menu_open", [False, True])
-def test_plan_first_update_always_rebuilds(menu_open: bool) -> None:
-    assert plan_update(None, BASE, menu_open) == {
+@pytest.mark.parametrize("applied_chrome", [None, tray.STARTING_CHROME])
+def test_plan_first_update_always_rebuilds(
+    menu_open: bool, applied_chrome: tuple[str, str, str] | None
+) -> None:
+    assert plan_update(None, BASE, menu_open, applied_chrome) == {
         "set_chrome": True,
         "relabel": False,
         "rebuild": True,
@@ -1378,18 +1395,35 @@ def test_plan_first_update_always_rebuilds(menu_open: bool) -> None:
 
 
 def test_plan_no_change_does_nothing() -> None:
-    assert plan_update(BASE, BASE, False) == {"set_chrome": False, "relabel": False, "rebuild": False}
+    assert plan_update(BASE, BASE, False, BASE.chrome) == {
+        "set_chrome": False,
+        "relabel": False,
+        "rebuild": False,
+    }
 
 
 def test_plan_chrome_only() -> None:
     new = dataclasses.replace(BASE, label="2", tooltip="shell-runner: 2 pending")
-    assert plan_update(BASE, new, False) == {"set_chrome": True, "relabel": False, "rebuild": False}
+    assert plan_update(BASE, new, False, BASE.chrome) == {
+        "set_chrome": True,
+        "relabel": False,
+        "rebuild": False,
+    }
+
+
+def test_plan_chrome_is_compared_with_the_applied_chrome_not_the_applied_view() -> None:
+    # Regression: the structure stayed at BASE (a deferred rebuild), but chrome B
+    # was already applied. Going back to BASE's chrome must set it again, and
+    # staying at B must not.
+    chrome_b = dataclasses.replace(BASE, label="2", tooltip="shell-runner: 2 pending")
+    assert plan_update(BASE, BASE, False, chrome_b.chrome)["set_chrome"] is True
+    assert plan_update(BASE, chrome_b, False, chrome_b.chrome)["set_chrome"] is False
 
 
 @pytest.mark.parametrize("menu_open", [False, True])
 def test_plan_relabel_only_even_while_open(menu_open: bool) -> None:
     new = dataclasses.replace(BASE, rows=(ROW._replace(left_text="3m left"),))
-    assert plan_update(BASE, new, menu_open) == {
+    assert plan_update(BASE, new, menu_open, BASE.chrome) == {
         "set_chrome": False,
         "relabel": True,
         "rebuild": False,
@@ -1398,12 +1432,16 @@ def test_plan_relabel_only_even_while_open(menu_open: bool) -> None:
 
 @pytest.mark.parametrize("new", STRUCTURAL_CHANGES)
 def test_plan_rebuild_on_each_structural_component(new: View) -> None:
-    assert plan_update(BASE, new, False) == {"set_chrome": False, "relabel": False, "rebuild": True}
+    assert plan_update(BASE, new, False, BASE.chrome) == {
+        "set_chrome": False,
+        "relabel": False,
+        "rebuild": True,
+    }
 
 
 @pytest.mark.parametrize("new", STRUCTURAL_CHANGES)
 def test_plan_rebuild_is_deferred_while_the_menu_is_open(new: View) -> None:
-    assert plan_update(BASE, new, True) == {
+    assert plan_update(BASE, new, True, BASE.chrome) == {
         "set_chrome": False,
         "relabel": False,
         "rebuild": "deferred",
@@ -1412,7 +1450,11 @@ def test_plan_rebuild_is_deferred_while_the_menu_is_open(new: View) -> None:
 
 def test_plan_structural_and_chrome_change_together() -> None:
     new = dataclasses.replace(BASE, overflow=1, label="11")
-    assert plan_update(BASE, new, False) == {"set_chrome": True, "relabel": False, "rebuild": True}
+    assert plan_update(BASE, new, False, BASE.chrome) == {
+        "set_chrome": True,
+        "relabel": False,
+        "rebuild": True,
+    }
 
 
 # --- opener -----------------------------------------------------------------------
@@ -1482,6 +1524,9 @@ TOOLTIP_OFFLINE = "shell-runner unreachable — retrying (back-off up to 60s)"
 HEADER_STALE = "Server unreachable — showing last known"
 HEADER_EMPTY = "Server unreachable"
 OPEN_LABEL = "Open Pending Prompts"
+TOOLTIP_STARTING = "shell-runner: starting…"
+# (icon_name, label, tooltip) applied before the first poll; same order as View.chrome.
+STARTING_CHROME = (ICON_IDLE, "", TOOLTIP_STARTING)
 
 # (id, tier text, agent text, command text)
 Identity = tuple[str, str, str, str]
@@ -1543,7 +1588,7 @@ def _row(prompt: dict[str, Any], left_s: float, home: str) -> tuple[Row, bool]:
     tier_ok = isinstance(tier, int) and not isinstance(tier, bool)
     tier_text = f"T{tier}" if tier_ok else "T?"
     agent = prompt.get("agent_id")
-    agent_text = clean(agent) if isinstance(agent, str) else "?"
+    agent_text = clean(agent, MENU_CMD_LIMIT) if isinstance(agent, str) else "?"
     cmd = prompt.get("raw_cmd")
     cmd_text = clean(substitute_home(clean(cmd), home), MENU_CMD_LIMIT) if isinstance(cmd, str) else ""
     identity = (str(prompt.get("id")), tier_text, agent_text, cmd_text)
@@ -1587,7 +1632,9 @@ def render(snapshot: Snapshot, now: datetime, max_items: int, home: str) -> View
     icon_name, label, tooltip = _chrome(snapshot.status, len(built), t4_count)
     header: str | None = None
     if snapshot.status == "unreachable":
-        header = HEADER_STALE if snapshot.prompts else HEADER_EMPTY
+        # Chosen from the rows that survive the re-filter: if no last-known
+        # prompt is still live, there is nothing "last known" to show.
+        header = HEADER_STALE if built else HEADER_EMPTY
     return View(
         icon_name=icon_name,
         label=label,
@@ -1612,14 +1659,23 @@ def menu_entries(view: View) -> list[tuple[MenuKind, str]]:
     return entries
 
 
-def plan_update(old_view: View | None, new_view: View, menu_open: bool) -> Plan:
-    """Pure: decide how to apply `new_view` given the last APPLIED view.
+def plan_update(
+    old_view: View | None,
+    new_view: View,
+    menu_open: bool,
+    applied_chrome: tuple[str, str, str] | None,
+) -> Plan:
+    """Pure: decide how to apply `new_view`.
 
-    `old_view` is None on the first update, which always means a full rebuild.
+    `old_view` is the view whose STRUCTURE was last applied to the menu
+    (`applied_view`); it is None on the first update, which always means a full
+    rebuild. `applied_chrome` is the chrome last applied to the icon, tracked
+    independently of the structure: a deferred rebuild leaves `old_view` behind
+    while the chrome keeps moving, so chrome is never compared with `old_view`.
     """
     if old_view is None:
         return {"set_chrome": True, "relabel": False, "rebuild": True}
-    set_chrome = old_view.chrome != new_view.chrome
+    set_chrome = applied_chrome != new_view.chrome
     if old_view.structure == new_view.structure:
         old_lefts = [row.left_text for row in old_view.rows]
         new_lefts = [row.left_text for row in new_view.rows]
@@ -1659,7 +1715,7 @@ git commit -m "feat(tray): pure render, plan_update and menu layer (#138)"
 - Modify: `src/shell_runner/tray.py`
 - Modify: `tests/unit/test_tray.py`
 
-The `_Tray` applier below is NOT covered by CI (CI has no gi). Keep it a thin shim: every decision lives in `render` / `plan_update` / `menu_entries` (Task 3). It is covered only by the gi smoke test (skipped in CI) and the manual checklist in Task 7. Do not add an icon adapter protocol or a fake GTK.
+Keep the `_Tray` applier a thin shim: every decision lives in `render` / `plan_update` / `menu_entries` (Task 3). CI has no gi, so it is tested with `unittest.mock.MagicMock` stand-ins for GLib, Gtk and XApp (starting state, worker crash, chrome tracking, deferred rebuild). Real GTK behaviour (widget rendering, the hide→activate→idle ordering, `main()`'s run path, signals) is NOT covered by CI; it is covered only by the gi smoke test (skipped in CI) and the manual checklist in Task 7. Do not add an icon adapter protocol or a hand-written fake GTK.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1675,11 +1731,12 @@ import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from shell_runner import tray
-from shell_runner.notifier import Snapshot
+from shell_runner.notifier import Snapshot, parse_args
 from shell_runner.tray import (
     Row,
     View,
@@ -1800,12 +1857,102 @@ def test_gi_smoke_status_icon_has_the_methods_the_applier_calls() -> None:
         "set_secondary_menu",
     ):
         assert callable(getattr(icon, name)), name
+
+
+# --- applier logic with MagicMock stand-ins for GLib/Gtk/XApp (runs in CI) ----------
+
+
+def make_tray(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, MagicMock, MagicMock, MagicMock]:
+    """A _Tray over MagicMocks; render() sees the fixed NOW. Returns (tray, glib, icon, menu)."""
+    monkeypatch.setattr(tray, "_utcnow", lambda: NOW)
+    glib, gtk, xapp = MagicMock(), MagicMock(), MagicMock()
+    instance = tray._Tray(glib, gtk, xapp, parse_args([]))
+    return instance, glib, xapp.StatusIcon.return_value, gtk.Menu.return_value
+
+
+def test_starting_state_is_applied_before_the_first_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    instance, glib, icon, menu = make_tray(monkeypatch)
+    icon.set_icon_name.assert_called_once_with("security-high-symbolic")
+    icon.set_tooltip_text.assert_called_once_with("shell-runner: starting…")
+    icon.set_label.assert_called_once_with("")
+    icon.set_primary_menu.assert_called_once_with(menu)
+    icon.set_secondary_menu.assert_called_once_with(menu)
+    instance.gtk.MenuItem.assert_called_once_with(label="Open Pending Prompts")
+    assert menu.append.call_count == 1  # only the Open item
+    menu.show_all.assert_called_once()
+    assert instance.applied_chrome == tray.STARTING_CHROME
+    assert instance.applied_view is None
+    glib.idle_add.assert_not_called()  # the worker has not started
+
+
+def test_worker_crash_schedules_quit_with_code_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance, glib, _icon, _menu = make_tray(monkeypatch)
+
+    def crash(*_args: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(tray, "run_loop", crash)
+    instance._work()  # must not raise
+    glib.idle_add.assert_called_once_with(instance._quit, 1)
+    assert "worker crashed" in capsys.readouterr().err
+    assert instance._quit(1) is False
+    assert instance.code == 1
+    instance.loop.quit.assert_called_once()
+
+
+def test_chrome_follows_the_applied_chrome_while_a_rebuild_is_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: chrome A -> B while the rebuild is deferred, then back to A,
+    # must leave the icon showing A.
+    instance, _glib, icon, menu = make_tray(monkeypatch)
+    instance._apply(ok(make_prompt("p1")))  # A: closed menu, full rebuild
+    instance._on_show(menu)
+    instance._apply(ok(make_prompt("p1"), make_prompt("p2")))  # B: structure change, deferred
+    assert instance.rebuild_pending is True
+    assert icon.set_label.call_args.args == ("2",)
+    instance._apply(ok(make_prompt("p1")))  # back to A's structure and chrome
+    assert icon.set_label.call_args.args == ("1",)
+    assert icon.set_tooltip_text.call_args.args == ("shell-runner: 1 pending",)
+    assert instance.applied_chrome == instance.latest_view.chrome
+
+
+def test_deferred_rebuild_runs_from_idle_after_hide_with_the_latest_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, glib, _icon, menu = make_tray(monkeypatch)
+    instance._apply(ok(make_prompt("p1")))
+    first = instance.applied_view
+    instance._on_show(menu)
+    instance._apply(ok(make_prompt("p1"), make_prompt("p2")))
+    assert plan_update(first, instance.latest_view, True, None)["rebuild"] == "deferred"
+    instance._apply(ok(make_prompt("p1"), make_prompt("p2"), make_prompt("p3")))
+    assert instance.applied_view is first  # nothing rebuilt while open
+    shows_before = menu.show_all.call_count
+    instance._on_hide(menu)
+    glib.idle_add.assert_called_once_with(instance._rebuild)  # no view argument
+    assert menu.show_all.call_count == shows_before  # not rebuilt inside the hide handler
+    assert instance._rebuild() is False
+    assert instance.applied_view is instance.latest_view
+    assert row_ids(instance.applied_view) == ["p1", "p2", "p3"]
+    assert instance.rebuild_pending is False
+    assert menu.show_all.call_count == shows_before + 1
+
+
+def test_hide_without_a_pending_rebuild_schedules_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    instance, glib, _icon, menu = make_tray(monkeypatch)
+    instance._apply(ok(make_prompt("p1")))
+    instance._on_show(menu)
+    instance._on_hide(menu)
+    glib.idle_add.assert_not_called()
 ```
 
 - [ ] **Step 2: Run, expect failure**
 
 Run: `pixi run -e dev pytest tests/unit/test_tray.py -q`
-Expected: FAIL in `test_tray_imports_gi_only_inside_functions` (`AssertionError: main() must import gi`) and `AttributeError: ... has no attribute 'main'` in the four `main` tests. `test_tray_module_is_read_only` already passes (it is a guard); the smoke test is SKIPPED.
+Expected: FAIL in `test_tray_imports_gi_only_inside_functions` (`AssertionError: main() must import gi`), `AttributeError: ... has no attribute 'main'` in the four `main` tests, and `AttributeError: module 'shell_runner.tray' has no attribute '_Tray'` in the five MagicMock applier tests. `test_tray_module_is_read_only` already passes (it is a guard); the smoke test is SKIPPED.
 
 - [ ] **Step 3: Implement**
 
@@ -1840,10 +1987,12 @@ from shell_runner.notifier import (
 
 ```python
 # --- GTK/XApp layer -------------------------------------------------------------
-# NOT covered by CI (no gi there): a deliberately thin shim over render(),
-# plan_update() and menu_entries(). Covered by the gi smoke test and the manual
-# desktop checklist. Every GLib.idle_add callback takes positional arguments
-# and returns False.
+# A deliberately thin shim over render(), plan_update() and menu_entries().
+# CI (no gi) covers its logic with MagicMock stand-ins for GLib/Gtk/XApp: the
+# starting state, the worker-crash path, chrome tracking and the deferred
+# rebuild. Real GTK behaviour (widgets, signal ordering, main()'s run path) is
+# covered only by the gi smoke test and the manual desktop checklist.
+# Every GLib.idle_add callback takes positional arguments and returns False.
 
 
 class _Tray:
@@ -1858,7 +2007,8 @@ class _Tray:
         self.code = 0
         # Main-thread-only state.
         self.latest_view: View | None = None
-        self.applied_view: View | None = None
+        self.applied_view: View | None = None  # whose STRUCTURE the menu shows
+        self.applied_chrome: tuple[str, str, str] | None = None  # what the icon shows
         self.menu_open = False
         self.rebuild_pending = False
         self.row_items: list[Any] = []
@@ -1871,6 +2021,17 @@ class _Tray:
         self.icon = xapp.StatusIcon()
         self.icon.set_primary_menu(self.menu)
         self.icon.set_secondary_menu(self.menu)
+        # "starting" state until the first poll: idle icon, empty label, Open only.
+        self._set_chrome(STARTING_CHROME)
+        self.menu.append(self._item("open", OPEN_LABEL))
+        self.menu.show_all()
+
+    def _set_chrome(self, chrome: tuple[str, str, str]) -> None:
+        icon_name, label, tooltip = chrome
+        self.icon.set_icon_name(icon_name)
+        self.icon.set_tooltip_text(tooltip)
+        self.icon.set_label(label)
+        self.applied_chrome = chrome
 
     def run(self) -> int:
         for signum in (signal.SIGTERM, signal.SIGINT):
@@ -1902,11 +2063,9 @@ class _Tray:
     def _apply(self, snapshot: Snapshot) -> bool:
         view = render(snapshot, _utcnow(), self.args.max_items, self.home)
         self.latest_view = view
-        plan = plan_update(self.applied_view, view, self.menu_open)
+        plan = plan_update(self.applied_view, view, self.menu_open, self.applied_chrome)
         if plan["set_chrome"]:
-            self.icon.set_icon_name(view.icon_name)
-            self.icon.set_tooltip_text(view.tooltip)
-            self.icon.set_label(view.label)
+            self._set_chrome(view.chrome)  # also while a rebuild is deferred
         if plan["rebuild"] == "deferred":
             self.rebuild_pending = True
             return False
@@ -2215,11 +2374,12 @@ In `README.md`, replace everything from the line `## Desktop approval notifier` 
 
 | State | Icon | Label | Tooltip |
 |---|---|---|---|
+| Starting (before the first poll; menu holds only Open) | `security-high-symbolic` | empty | `shell-runner: starting…` |
 | 0 pending | `security-high-symbolic` | empty | `shell-runner: no pending prompts` |
 | N pending | `dialog-warning-symbolic` | `N` (`99+` above 99) | `shell-runner: N pending`, plus ` (k × T4)` when k > 0 |
 | Unreachable | `network-offline-symbolic` | `?` | `shell-runner unreachable — retrying (back-off up to 60s)` |
 
-Left or right click opens the menu: up to `--max-items` rows such as `T4 · agent-1 · curl -sI https://example.com · 4m left` (the command is cut at 50 characters and your home directory is shown as `~`), a `… and N more` row when there are more, then `Open Pending Prompts`. Clicking a row or Open runs `xdg-open` on the Pending Prompts page; there are no approve or deny actions in the panel. The time left refreshes on every poll. While the server is unreachable the menu keeps the last known rows under a `Server unreachable — showing last known` header.
+Left or right click opens the menu: up to `--max-items` rows such as `T4 · agent-1 · curl -sI https://example.com · 4m left` (the command is cut at 50 characters and your home directory is shown as `~`), a `… and N more` row when there are more, then `Open Pending Prompts`. Clicking a row or Open runs `xdg-open` on the Pending Prompts page; there are no approve or deny actions in the panel. The time left refreshes on every poll. While the server is unreachable the menu keeps the last known rows that are still live under a `Server unreachable — showing last known` header (just `Server unreachable` when none is still live).
 
 It runs with the system Python 3 (not the project environment) and needs two Debian packages:
 
@@ -2309,7 +2469,9 @@ These steps need a real desktop and cannot run in CI. Report results back on iss
    - No popup and no sound at any point.
 8. Verify the menu: left click and right click both open the same menu; each row reads `T3 · <agent> · <command> · Nm left` with `~` for your home; the time left changes while the menu stays open (every ~3s); with more than 10 prompts there is a `… and N more` row; there are no approve or deny entries.
 9. Click a prompt row, then `Open Pending Prompts`: each opens the Pending Prompts page in the browser (`http://127.0.0.1:8511/Pending_Prompts`).
-10. Stop the unit: `systemctl --user stop shell-runner-notify`, then `systemctl --user show shell-runner-notify -p ExecMainStatus` → `ExecMainStatus=0`. Logs: `journalctl --user -u shell-runner-notify -n 50` show no tracebacks.
+10. Deferred-rebuild ordering (the one hide→activate→idle-rebuild sequence CI cannot check): open the menu and keep it open, let the prompt set change (create a new prompt, or deny one in the UI) and wait for one poll (~3s), then click a prompt row. Confirm the Pending Prompts page opens, and that on reopening the menu it shows the new prompt set.
+11. Starting state: right after `systemctl --user restart shell-runner-notify` (or with the server stopped, before the first poll returns) the icon is the shield with tooltip `shell-runner: starting…`, no label, and the menu holds only `Open Pending Prompts`.
+12. Stop the unit: `systemctl --user stop shell-runner-notify`, then `systemctl --user show shell-runner-notify -p ExecMainStatus` → `ExecMainStatus=0`. Logs: `journalctl --user -u shell-runner-notify -n 50` show no tracebacks.
 
 ---
 
@@ -2334,7 +2496,8 @@ These steps need a real desktop and cannot run in CI. Report results back on iss
 | Opener (`xdg-open` argv via `open_detached`, failures logged) | T3 |
 | `MENU_CMD_LIMIT = 50` | T3 |
 | Single `Gtk.Menu`, rebuild = destroy children + `show_all`, relabel, deferral via hide + `idle_add`, `latest_view` / `applied_view` / `menu_open` | T4 |
-| Worker thread, `idle_add` pattern, `_utcnow` in the idle callback, signals, exit codes 2/3/1/0, join timeout | T4 |
+| `applied_chrome` tracked independently of `applied_view`; starting state (shield, `shell-runner: starting…`, Open only) | T3 (`plan_update`, `STARTING_CHROME`), T4 (applier + MagicMock tests) |
+| Worker thread, `idle_add` pattern, `_utcnow` in the idle callback, signals, exit codes 2/3/1/0, join timeout; worker crash → `idle_add(_quit, 1)` tested with MagicMock | T4 |
 | gi imported only inside functions; read-only; `main([])` → 2 without gi; smoke test | T4 |
 | systemd unit rewrite and unit-file test | T5 |
 | README, superseded notes | T6 |

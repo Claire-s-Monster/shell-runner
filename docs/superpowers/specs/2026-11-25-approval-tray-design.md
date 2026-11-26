@@ -67,20 +67,21 @@ New `src/shell_runner/tray.py`:
   - `raw_cmd` missing or not a str: `""`.
 - Home shortening: a new helper in `tray.py` replaces every occurrence of the home path in `raw_cmd` with `~`, when the occurrence is followed by `/`, the end of the string, or whitespace. An empty home is a no-op; a trailing `/` on home is stripped first.
 - Structural identity of the menu is `(tuple of row identities, stale_header_present: bool, overflow_count: int)`. Any change to it means a rebuild. The Open row and the separator are constant and not part of it.
-- Pure `plan_update(old_view, new_view, menu_open) -> {set_chrome: bool, relabel: bool, rebuild: bool | "deferred"}`:
+- Pure `plan_update(old_view, new_view, menu_open, applied_chrome) -> {set_chrome: bool, relabel: bool, rebuild: bool | "deferred"}`:
   - `old_view` is the view last APPLIED to the menu structure (`applied_view`), not the last one received. It is `None` on the first update, which always means a full rebuild.
-  - `set_chrome`: chrome differs.
+  - `set_chrome`: `new_view`'s chrome differs from `applied_chrome`, the chrome last APPLIED to the icon. Chrome is tracked independently of the structure: a deferred rebuild leaves `applied_view` behind while chrome keeps being applied, so chrome is never compared with `old_view`.
   - Structural identity unchanged: `relabel` is true if any `left_text` differs, `rebuild` is false.
   - Structural identity changed: `rebuild` is `"deferred"` if `menu_open`, else true.
-- Main-thread-only state: `latest_view` (the newest received), `applied_view` (the structure last applied) and `menu_open`.
+- Main-thread-only state: `latest_view` (the newest received), `applied_view` (the structure last applied), `applied_chrome` (the icon/label/tooltip last applied, updated every time chrome is set, including while a rebuild is deferred) and `menu_open`.
+- Before the worker starts, the applier applies the "starting" state (see Display) and sets `applied_chrome` to it; the menu holds only the Open item until the first update rebuilds it.
 - Deferred rebuild mechanics:
   - `menu_open` is tracked with the menu's `show`/`hide` signals.
   - On `hide` with a pending rebuild, the handler schedules `GLib.idle_add(self._rebuild)` with NO view argument (the callback returns False), never rebuilding directly in the handler, so a clicked item's `activate` still fires.
   - `_rebuild` reads `latest_view`. If its structural identity equals `applied_view`'s it does nothing; otherwise it rebuilds and sets `applied_view`. The immediate (menu closed) rebuild path follows the same rule.
   - A rebuild replaces the CHILDREN of the same `Gtk.Menu`, which is created once. That keeps the show/hide handlers and the primary and secondary menu bindings. It never creates a new menu.
-- The gi-side applier is a thin untested shim (no icon adapter protocol or fake); the smoke test covers it.
+- The gi-side applier is a thin shim (no icon adapter protocol or hand-written fake). Its logic (starting state, worker crash, chrome tracking, deferred rebuild) is tested in CI with `MagicMock` stand-ins for GLib/Gtk/XApp; real GTK behaviour is covered by the smoke test and a manual check.
 - Opener: reuses `notifier.open_detached(["xdg-open", ui_url])`; failures are logged with `_log`.
-- `MENU_CMD_LIMIT = 50` (in `tray.py`) cuts the command shown in a row.
+- `MENU_CMD_LIMIT = 50` (in `tray.py`) cuts the command and the agent id shown in a row.
 - Entry point: `/usr/bin/python3 -m shell_runner.tray`, with an `if __name__ == "__main__": raise SystemExit(main())` block.
 - `main(argv: list[str] | None = None) -> int`, in this order:
   - (a) import `gi` and require XApp 1.0 and Gtk 3.0; return 2 on failure.
@@ -105,13 +106,14 @@ New `src/shell_runner/tray.py`:
 - Icon: `set_icon_name`; tooltip: `set_tooltip_text`; label: `set_label`.
 - Rebuild: remove and destroy every old child of the single `Gtk.Menu`, append the new items (header, rows, overflow, separator, Open), then call `menu.show_all()`. Relabel calls `item.set_label()` on the existing row items in order.
 - The SAME `Gtk.Menu` is passed to `set_primary_menu` and `set_secondary_menu`, so left and right click both open it.
-- The tooltip always contains the count, in case the panel host does not render labels.
+- The tooltip contains the count whenever N > 0, in case the panel host does not render labels.
 - The gi smoke test asserts these methods exist on `XApp.StatusIcon`.
 
 ## Display
 
 | State | Icon | Label | Tooltip |
 |---|---|---|---|
+| Starting (before the first update; menu holds only Open) | `security-high-symbolic` | empty | `shell-runner: starting…` |
 | 0 pending | `security-high-symbolic` | empty | `shell-runner: no pending prompts` |
 | N pending | `dialog-warning-symbolic` | `N`, or `99+` when N > 99 | `shell-runner: N pending`, plus ` (k × T4)` only when k > 0 |
 | Unreachable | `network-offline-symbolic` | `?` | `shell-runner unreachable — retrying (back-off up to 60s)` |
@@ -120,7 +122,7 @@ N counts all tiers; the icon is the same for any N > 0. Icon names can be tuned 
 
 Menu (opens on left or right click):
 
-- Unreachable only: first an insensitive header row `Server unreachable — showing last known`, then the last known rows (stale rows are re-filtered against now). If `last_prompts` is empty (e.g. a failed first poll), the header reads `Server unreachable` instead, with no prompt rows, followed by the separator and Open.
+- Unreachable only: first an insensitive header row `Server unreachable — showing last known`, then the last known rows (stale rows are re-filtered against now). If no last-known prompt is still live after that re-filter (e.g. a failed first poll, or every stale prompt has expired), the header reads `Server unreachable` instead, with no prompt rows, followed by the separator and Open.
 - Up to `--max-items` prompt rows (the header, overflow row, separator and Open do not count), each `T4 · <agent_id> · <raw_cmd cut to MENU_CMD_LIMIT, ~ for home> · 4m left`. Plain text.
 - If there are more prompts, a `… and N more` row.
 - A separator, then `Open Pending Prompts`.
@@ -188,7 +190,7 @@ tray:
 - `render()` for each state, the `--max-items` cap with the `… and N more` row, `99+`, `(k × T4)` only when k > 0, stale header, re-filtering of expired rows, `format_left` boundaries.
 - `render()` fallbacks, one test each: `command_tier` missing / non-int (`T?`, not counted as T4), `agent_id` missing / non-str (`?`), `raw_cmd` missing / non-str (`""`).
 - Home shortening: every occurrence replaced when followed by `/`, end of string or whitespace; not replaced inside a longer name (`/home/me2`).
-- `plan_update()` truth table (first update with `old_view=None`, chrome-only, relabel-only, rebuild on each structural-identity component, deferred while open), no `gi`.
+- `plan_update()` truth table (first update with `old_view=None`, chrome-only, chrome compared with `applied_chrome` not `old_view`, relabel-only, rebuild on each structural-identity component, deferred while open), no `gi`.
 - Opener test: the command is an argv list, no shell.
 - Read-only string check for `tray.py` (no `approve_pending`, `/approve`, `shell=True`).
 - AST test: `tray.py` has no module-level `import gi` (only inside functions).
