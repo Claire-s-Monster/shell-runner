@@ -144,7 +144,7 @@ def test_rows_that_expired_since_the_poll_are_dropped() -> None:
     assert gone.rows == ()
 
 
-@pytest.mark.parametrize("bad", ["garbage", 12345, None, MISSING])
+@pytest.mark.parametrize("bad", ["garbage", "", 12345, None, MISSING])
 def test_row_with_unparseable_expiry_is_dropped(bad: Any) -> None:
     view = view_of(ok(make_prompt("bad", expires_at=bad), make_prompt("p2")))
     assert row_ids(view) == ["p2"]
@@ -205,7 +205,7 @@ def test_row_text_is_plain_not_escaped() -> None:
 @pytest.mark.parametrize("tier", [MISSING, "4", None, 4.0, True])
 def test_bad_command_tier_shows_t_question_and_is_not_counted_as_t4(tier: Any) -> None:
     view = view_of(ok(make_prompt("p1", tier=tier)))
-    assert view.rows[0].text_without_left.startswith("T? · ")
+    assert view.rows[0].text_without_left == "T? · agent-1 · ls ~/proj"
     assert view.tooltip == "shell-runner: 1 pending"
 
 
@@ -260,7 +260,7 @@ def test_header_overflow_separator_and_open_do_not_count_toward_max_items() -> N
 
 def test_view_structure_and_chrome() -> None:
     view = view_of(ok(make_prompt("p1")))
-    assert view.chrome == (view.icon_name, view.label, view.tooltip)
+    assert view.chrome == ("dialog-warning-symbolic", "1", "shell-runner: 1 pending")
     assert view.structure == ((view.rows[0].identity,), False, 0)
     assert view_of(down()).structure == ((), True, 0)
 
@@ -387,13 +387,34 @@ def test_plan_rebuild_is_deferred_while_the_menu_is_open(new: View) -> None:
     }
 
 
-def test_plan_structural_and_chrome_change_together() -> None:
+@pytest.mark.parametrize(("menu_open", "rebuild"), [(False, True), (True, "deferred")])
+def test_plan_structural_and_chrome_change_together(menu_open: bool, rebuild: bool | str) -> None:
     new = dataclasses.replace(BASE, overflow=1, label="11")
-    assert plan_update(BASE, new, False, BASE.chrome) == {
+    assert plan_update(BASE, new, menu_open, BASE.chrome) == {
+        "set_chrome": True,
+        "relabel": False,
+        "rebuild": rebuild,
+    }
+
+
+def test_plan_first_update_sets_chrome_even_if_it_equals_the_applied_chrome() -> None:
+    assert plan_update(None, BASE, False, BASE.chrome) == {
         "set_chrome": True,
         "relabel": False,
         "rebuild": True,
     }
+
+
+def test_starting_chrome_literal() -> None:
+    assert tray.STARTING_CHROME == ("security-high-symbolic", "", "shell-runner: starting…")
+
+
+def test_t4_tooltip_counts_every_live_prompt_not_just_shown_rows() -> None:
+    prompts = [make_prompt("a"), make_prompt("b", tier=4), make_prompt("c", tier=4)]
+    prompts.append(make_prompt("d", tier=4))
+    view = view_of(ok(*prompts), max_items=1)
+    assert row_ids(view) == ["a"]
+    assert view.tooltip == "shell-runner: 4 pending (3 × T4)"
 
 
 # --- opener -----------------------------------------------------------------------
