@@ -1,8 +1,8 @@
 """Silent Cinnamon tray indicator for pending shell-runner approvals (issue #138).
 
 The pure layer (render, plan_update, menu_entries, substitute_home, open_ui)
-has no gi dependency and is fully unit-tested. This is the only module that
-uses gi, and only inside functions, so importing it never needs gi.
+has no gi dependency and is fully unit-tested. This module will hold the only
+gi code (Task 4), and only inside functions, so importing it never needs gi.
 Read-only: the only action is opening the UI page with an argv-list xdg-open.
 """
 
@@ -80,11 +80,16 @@ class Plan(TypedDict):
 
 
 def substitute_home(text: str, home: str) -> str:
-    """Replace every `home` followed by `/`, whitespace or the end of `text` with `~`."""
+    """Replace `home` with `~` where it is a whole path prefix.
+
+    It must start the text or follow whitespace or one of `=:"'`, and be
+    followed by `/`, whitespace, a quote or the end of the text.
+    """
     home = home.rstrip("/")
     if not home:
         return text
-    return re.sub(re.escape(home) + r"(?=/|\s|\Z)", "~", text)
+    pattern = r"(?<![^\s=:\"'])" + re.escape(home) + r"(?=[/\s\"']|\Z)"
+    return re.sub(pattern, "~", text)
 
 
 def _expiry(prompt: Mapping[str, Any]) -> datetime | None:
@@ -135,11 +140,13 @@ def _chrome(status: str, count: int, t4_count: int) -> tuple[str, str, str]:
 def render(snapshot: Snapshot, now: datetime, max_items: int, home: str) -> View:
     """Pure: turn a Snapshot into the icon chrome and menu rows. Never raises on row data.
 
-    `now` is an aware UTC datetime. Rows are re-filtered against it, so stale
-    (unreachable) rows and rows that expired since the poll drop out.
+    `now` must be a timezone-aware UTC datetime (naive values are not
+    normalised; comparing one raises TypeError). Rows are re-filtered against
+    it, so stale (unreachable) rows and rows that expired since the poll drop
+    out. `max_items` is clamped to >= 0.
     """
     built = _live_rows(snapshot.prompts, now, home)
-    shown = tuple(row for row, _is_t4 in built[:max_items])
+    shown = tuple(row for row, _is_t4 in built[: max(0, max_items)])
     t4_count = sum(1 for _built_row, is_t4 in built if is_t4)
     icon_name, label, tooltip = _chrome(snapshot.status, len(built), t4_count)
     header: str | None = None

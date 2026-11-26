@@ -284,6 +284,48 @@ def test_substitute_home(text: str, expected: str) -> None:
     assert substitute_home(text, HOME) == expected
 
 
+@pytest.mark.parametrize(
+    "text", ["ls /mnt/home/me/x", "ls /srv/home/me/x", "ls foo/home/me", "/mnt/home/me"]
+)
+def test_substitute_home_needs_a_left_boundary(text: str) -> None:
+    assert substitute_home(text, HOME) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("cd /home/me/x", "cd ~/x"),
+        ("/home/me/x", "~/x"),
+        ("--path=/home/me/x", "--path=~/x"),
+        ("PATH=/a:/home/me/bin", "PATH=/a:~/bin"),
+        ('"/home/me"', '"~"'),
+        ("'/home/me/x'", "'~/x'"),
+        ("ls\t/home/me", "ls\t~"),
+    ],
+)
+def test_substitute_home_at_a_boundary(text: str, expected: str) -> None:
+    assert substitute_home(text, HOME) == expected
+
+
+def test_max_items_zero_sends_every_row_to_overflow() -> None:
+    view = view_of(ok(make_prompt("a"), make_prompt("b")), max_items=0)
+    assert view.rows == ()
+    assert view.overflow == 2
+    assert view.label == "2"
+
+
+def test_negative_max_items_is_clamped_to_zero() -> None:
+    view = view_of(ok(make_prompt("a"), make_prompt("b")), max_items=-1)
+    assert view.rows == ()
+    assert view.overflow == 2
+
+
+def test_max_items_far_above_the_row_count_shows_everything() -> None:
+    view = view_of(ok(make_prompt("a"), make_prompt("b")), max_items=10**9)
+    assert row_ids(view) == ["a", "b"]
+    assert view.overflow == 0
+
+
 def test_substitute_home_strips_a_trailing_slash_on_home() -> None:
     assert substitute_home("cat /home/me/x", "/home/me/") == "cat ~/x"
 
