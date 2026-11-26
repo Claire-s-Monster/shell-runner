@@ -1,34 +1,62 @@
+# shell-runner silent tray indicator (issue #138): a Cinnamon panel icon with the
+# number of pending approval prompts. No sounds and no desktop notifications.
+# Read-only: the menu only opens the Pending Prompts page; it never approves.
+#
+# Install note (Debian 12 / Cinnamon; runs with the system /usr/bin/python3):
+#   sudo apt install python3-gi gir1.2-xapp-1.0
+#   xdg-open must be installed too (Debian package xdg-utils).
+#
+# Installation (systemd USER unit):
+#   cp scripts/shell-runner-notify.service.example ~/.config/systemd/user/shell-runner-notify.service
+#   # Edit paths as needed
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now shell-runner-notify
+#
+# Add flags (--interval, --url, --ui-url, --max-items) after the module name in ExecStart.
+#
+# Exit codes: 2 = python3-gi or the XApp typelib is missing, or a bad flag (never
+# restarted: install the packages, then systemctl --user restart shell-runner-notify);
+# 3 = no display yet (restarted); 1 = the poll worker crashed (restarted).
+#
+# After login, check that the session target is active:
+#   systemctl --user is-active graphical-session.target
+#
+# If the tray icon does not appear and that prints "inactive" (some Debian 12
+# Cinnamon 5.6 sessions never activate graphical-session.target), use this variant:
+#   1. Change the [Install] line below to WantedBy=default.target, then run
+#        systemctl --user daemon-reload
+#        systemctl --user reenable shell-runner-notify
+#   2. Export the desktop session variables to the user manager (e.g. from a
+#      Cinnamon startup application):
+#        systemctl --user import-environment DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
+#        systemctl --user restart shell-runner-notify
+# With the limits below the unit does NOT wait forever for a display: after about
+# 100s of failed starts (exit 3) systemd gives up. To retry forever, add a drop-in:
+#   systemctl --user edit shell-runner-notify
+# and enter these two lines:
+#   [Unit]
+#   StartLimitIntervalSec=0
+#
+# Logs: journalctl --user -u shell-runner-notify -f
+
 [Unit]
-Description=Shell Runner desktop approval notifier
+Description=shell-runner silent tray indicator for pending approval prompts
 Documentation=https://github.com/Claire-s-Monster/shell-runner
-After=graphical-session.target
 PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
 WorkingDirectory=%h/ClaudeCode/Servers/shell-runner/development
-Environment=PYTHONPATH=src
-ExecStart=%h/.pixi/bin/pixi run --frozen -e dev --manifest-path %h/ClaudeCode/Servers/shell-runner/development/pyproject.toml python -m shell_runner.notifier
+Environment=PYTHONPATH=%h/ClaudeCode/Servers/shell-runner/development/src
+ExecStart=/usr/bin/python3 -m shell_runner.tray
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+RestartPreventExitStatus=2
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=graphical-session.target
-
-# --frozen: never re-solve or rewrite pixi.lock (a newer local pixi would upgrade it to v7).
-# The notifier runs as a module (there is no pixi task for it): PYTHONPATH=src is
-# relative to WorkingDirectory. Add flags (--interval, --url, --ui-url) after the module name.
-#
-# Installation (systemd USER unit; needs notify-send and xdg-open installed):
-#   cp shell-runner-notify.service.example ~/.config/systemd/user/shell-runner-notify.service
-#   # Edit paths as needed
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now shell-runner-notify
-#
-# If popups do not appear, the unit lacks your desktop session variables:
-#   systemctl --user import-environment DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
-#   systemctl --user restart shell-runner-notify
-#
-# Logs: journalctl --user -u shell-runner-notify -f
