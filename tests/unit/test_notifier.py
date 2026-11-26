@@ -185,7 +185,7 @@ def test_live_prompt_is_published_in_an_ok_snapshot() -> None:
     feed.prompts = [prompt]
     notifier_.tick()
     assert snapshots == [Snapshot(prompts=(prompt,), status="ok")]
-    assert notifier_.last_prompts == [prompt]
+    assert notifier_.last_prompts == (prompt,)
 
 
 def test_snapshot_is_frozen() -> None:
@@ -194,32 +194,50 @@ def test_snapshot_is_frozen() -> None:
         snapshot.status = "unreachable"  # type: ignore[misc]
 
 
-def test_every_fetching_tick_publishes_a_snapshot() -> None:
+def test_every_fetching_tick_publishes_a_snapshot_of_the_current_list() -> None:
     notifier_, feed, clock, snapshots = make_notifier()
-    feed.prompts = [make_prompt()]
-    for _ in range(3):
-        notifier_.tick()
-        clock.advance(3)
-    assert [ids(s) for s in snapshots] == [["p1"], ["p1"], ["p1"]]
-
-
-def test_snapshot_follows_the_current_prompt_list() -> None:
-    notifier_, feed, _clock, snapshots = make_notifier()
     feed.prompts = [make_prompt("p1")]
     notifier_.tick()
+    clock.advance(3)
+    notifier_.tick()  # unchanged list still publishes
     feed.prompts = [make_prompt("p1"), make_prompt("p2")]
     notifier_.tick()
     feed.prompts = []
     notifier_.tick()
-    assert [ids(s) for s in snapshots] == [["p1"], ["p1", "p2"], []]
-    assert notifier_.last_prompts == []
+    assert [ids(s) for s in snapshots] == [["p1"], ["p1"], ["p1", "p2"], []]
+    assert notifier_.last_prompts == ()
+
+
+def test_snapshot_rows_are_read_only() -> None:
+    notifier_, feed, _clock, snapshots = make_notifier()
+    feed.prompts = [make_prompt("p1")]
+    notifier_.tick()
+    row = snapshots[0].prompts[0]
+    with pytest.raises(TypeError):
+        row["id"] = "x"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        notifier_.last_prompts[0]["id"] = "x"  # type: ignore[index]
+    assert row["id"] == "p1"
+    assert row.get("agent_id") == "agent-1"
+
+
+def test_server_dict_mutated_after_tick_does_not_change_last_prompts() -> None:
+    notifier_, feed, _clock, snapshots = make_notifier()
+    server_prompt = make_prompt("p1")
+    feed.prompts = [server_prompt]
+    notifier_.tick()
+    server_prompt["id"] = "mutated"
+    server_prompt["extra"] = 1
+    assert notifier_.last_prompts[0]["id"] == "p1"
+    assert "extra" not in notifier_.last_prompts[0]
+    assert snapshots[0].prompts[0]["id"] == "p1"
 
 
 def test_last_prompts_are_sorted_by_parsed_expiry() -> None:
     plus_two = timezone(timedelta(hours=2))
     # Sorts after "late" as a string, but expires 60s from NOW.
     offset_expiry = (NOW + timedelta(seconds=60)).astimezone(plus_two).isoformat()
-    notifier_, feed, _clock, snapshots = make_notifier()
+    notifier_, feed, _clock, _snapshots = make_notifier()
     feed.prompts = [
         make_prompt("late", expires_in=300),
         make_prompt("soon", expires_in=30),
@@ -228,7 +246,19 @@ def test_last_prompts_are_sorted_by_parsed_expiry() -> None:
     ]
     notifier_.tick()
     assert [p["id"] for p in notifier_.last_prompts] == ["soon", "offset", "mid", "late"]
-    assert ids(snapshots[0]) == ["soon", "offset", "mid", "late"]
+
+
+def test_equal_expiries_keep_server_order() -> None:
+    notifier_, feed, _clock, _snapshots = make_notifier()
+    same = (NOW + timedelta(seconds=90)).isoformat()
+    feed.prompts = [
+        make_prompt("b", expires_at=same),
+        make_prompt("a", expires_at=same),
+        make_prompt("c", expires_at=same),
+        make_prompt("early", expires_in=10),
+    ]
+    notifier_.tick()
+    assert [p["id"] for p in notifier_.last_prompts] == ["early", "b", "a", "c"]
 
 
 def test_expired_prompts_are_skipped() -> None:
@@ -409,6 +439,65 @@ def test_failing_on_update_does_not_bypass_backoff() -> None:
     notifier_.tick()  # back-off state was recorded before on_update raised
     assert feed.calls == 1
     assert [s.status for s in published] == ["unreachable"]
+
+
+def test_failing_on_update_on_ok_path_leaves_consistent_state() -> None:
+    feed, clock = Feed(), Clock()
+    published: list[Snapshot] = []
+    fail = True
+
+    def flaky(snapshot: Snapshot) -> None:
+        published.append(snapshot)
+        if fail:
+            raise RuntimeError("tray gone")
+
+    notifier_ = Notifier(fetch=feed, on_update=flaky, clock=clock)
+    prompt = make_prompt("p1")
+    feed.prompts = [prompt]
+    with pytest.raises(RuntimeError, match="tray gone"):
+        notifier_.tick()
+    assert notifier_.last_prompts == (prompt,)  # updated before on_update raised
+    assert notifier_._next_poll is None
+    fail = False
+    clock.advance(3)
+    notifier_.tick()  # next tick still polls
+    assert feed.calls == 2
+    assert [ids(s) for s in published] == [["p1"], ["p1"]]
+
+
+def test_backoff_is_anchored_after_a_slow_failed_fetch() -> None:
+    clock = Clock()
+    calls = 0
+
+    def slow_failure() -> list[dict]:
+        nonlocal calls
+        calls += 1
+        clock.advance(4)  # the request hangs for 4s, then fails
+        raise OSError("down")
+
+    notifier_ = Notifier(fetch=slow_failure, on_update=lambda _s: None, clock=clock)
+    notifier_.tick()  # fails at NOW+4s; back-off is 6s from there
+    clock.advance(5)  # NOW+9s: inside the window (would be over if anchored at NOW)
+    notifier_.tick()
+    assert calls == 1
+    clock.advance(1)  # NOW+10s: window over
+    notifier_.tick()
+    assert calls == 2
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("nan")])
+def test_notifier_rejects_non_positive_interval(bad: float) -> None:
+    with pytest.raises(ValueError, match="interval"):
+        Notifier(fetch=Feed(), on_update=lambda _s: None, interval_s=bad)
+
+
+@pytest.mark.parametrize("bad", [0, -2.0])
+def test_run_loop_rejects_non_positive_interval(bad: float) -> None:
+    feed = Feed()
+    core = Notifier(fetch=feed, on_update=lambda _s: None)
+    with pytest.raises(ValueError, match="interval"):
+        run_loop(core, threading.Event(), bad)
+    assert feed.calls == 0
 
 
 def _serve(payload: bytes, status: int = 200) -> tuple[HTTPServer, dict[str, Any]]:

@@ -20,9 +20,10 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any, Literal
 
 MAX_BACKOFF_S = 60.0
@@ -101,7 +102,7 @@ class Snapshot:
     An "unreachable" snapshot carries the prompts of the last successful fetch.
     """
 
-    prompts: tuple[dict[str, Any], ...]
+    prompts: tuple[Mapping[str, Any], ...]
     status: Literal["ok", "unreachable"]
 
 
@@ -114,11 +115,23 @@ class Notifier:
     on_update: Callable[[Snapshot], None]
     clock: Callable[[], datetime] = _utcnow
     interval_s: float = DEFAULT_INTERVAL_S
-    last_prompts: list[dict[str, Any]] = field(default_factory=list, init=False)
+    # Read-only shallow copies, so snapshots handed to another thread can neither
+    # be mutated nor change when the server-side dicts do.
+    last_prompts: tuple[Mapping[str, Any], ...] = field(default=(), init=False)
     _failures: int = field(default=0, init=False)
     _next_poll: datetime | None = field(default=None, init=False)
 
+    def __post_init__(self) -> None:
+        if not self.interval_s > 0:  # also rejects NaN
+            raise ValueError(f"interval_s must be > 0, got {self.interval_s}")
+
     def tick(self) -> None:
+        """Fetch once unless backing off, then publish a Snapshot via `on_update`.
+
+        Fetch failures (OSError/ValueError) publish an "unreachable" snapshot with
+        the last known prompts. Exceptions raised by `on_update` propagate; state
+        is updated before the callback runs, so the next tick behaves normally.
+        """
         now = self.clock()
         if self._next_poll is not None and now < self._next_poll:
             return  # skipped by back-off: no fetch and no on_update
@@ -127,14 +140,16 @@ class Notifier:
         except (OSError, ValueError) as exc:
             # A ValueError from http_fetch (bad scheme, oversize, too deep, wrong
             # shape, bad JSON) takes the same path as a network error.
-            self._on_unreachable(now, exc)
-            self.on_update(Snapshot(prompts=tuple(self.last_prompts), status="unreachable"))
+            # Re-read the clock so back-off is anchored after a slow fetch.
+            self._on_unreachable(self.clock(), exc)
+            self.on_update(Snapshot(prompts=self.last_prompts, status="unreachable"))
             return
         self._failures = 0
         self._next_poll = None
         # Re-read the clock: a slow fetch must not leave an expired prompt looking live.
-        self.last_prompts = self._handle(prompts, self.clock())
-        self.on_update(Snapshot(prompts=tuple(self.last_prompts), status="ok"))
+        live = self._handle(prompts, self.clock())
+        self.last_prompts = tuple(MappingProxyType(dict(p)) for p in live)
+        self.on_update(Snapshot(prompts=self.last_prompts, status="ok"))
 
     def _on_unreachable(self, now: datetime, exc: Exception) -> None:
         # Back-off state is recorded before on_update runs, so a failing
@@ -269,7 +284,13 @@ def open_detached(argv: list[str]) -> None:
 
 
 def run_loop(notifier: Notifier, stop: threading.Event, interval: float) -> None:
-    """Tick, then wait `interval` seconds (interruptible); return once `stop` is set."""
+    """Tick, then wait `interval` seconds (interruptible); return once `stop` is set.
+
+    Exceptions from `tick` and `on_update` propagate to the caller by design: the
+    tray's worker turns them into exit 1 so systemd restarts it.
+    """
+    if not interval > 0:
+        raise ValueError(f"interval must be > 0, got {interval}")
     while not stop.is_set():
         notifier.tick()
         stop.wait(interval)
