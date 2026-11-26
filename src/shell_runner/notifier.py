@@ -8,7 +8,6 @@ anything: ``/pending`` returns no tokens and popups only inform.
 from __future__ import annotations
 
 import argparse
-import html
 import http.client
 import json
 import math
@@ -37,7 +36,7 @@ DEFAULT_PENDING_URL = "http://127.0.0.1:4111/pending"
 DEFAULT_UI_URL = "http://127.0.0.1:8511/Pending_Prompts"
 MAX_RESPONSE_BYTES = 1_048_576
 READ_CHUNK_BYTES = 8192
-TRUNCATED = "… (truncated)"
+ELLIPSIS = "…"
 MAX_JSON_DEPTH = 64
 _JSON_TOKEN = re.compile(rb'"(?:[^"\\]|\\.)*"|[\[{]|[\]}]')
 _WHITESPACE_CTRL = re.compile(r"[\n\r\t\x85]")
@@ -46,19 +45,18 @@ _MISSING = "?"
 
 
 def clean(text: str, limit: int | None = None) -> str:
-    """Strip control/format characters, optionally cut to `limit`, escape markup.
+    """Return plain text: control/format characters dropped, optionally cut to `limit`.
 
     Drops Unicode categories Cc, Cf (e.g. U+202E bidi override), Zl and Zp
     (U+2028/2029). Newlines, tabs and NEL (U+0085) become spaces so multi-line
-    commands stay readable. The length limit is applied before markup escaping,
-    so an HTML entity is never cut in half; the escaped text may be longer than
-    `limit` characters.
+    commands stay readable. Nothing is escaped: the tray shows plain text, not
+    Pango markup. When cut, the result is `limit` characters plus a single "…".
     """
     text = _WHITESPACE_CTRL.sub(" ", text)
     text = "".join(c for c in text if unicodedata.category(c) not in _DROPPED_CATEGORIES)
     if limit is not None and len(text) > limit:
-        return html.escape(text[:limit], quote=False) + TRUNCATED
-    return html.escape(text, quote=False)
+        return text[:limit] + ELLIPSIS
+    return text
 
 
 def shorten_home(cwd: str, home: str) -> str:
@@ -73,6 +71,16 @@ def shorten_home(cwd: str, home: str) -> str:
 def format_remaining(seconds: float) -> str:
     total = max(0, int(seconds))
     return f"{total // 60}m {total % 60}s"
+
+
+def format_left(seconds: float) -> str:
+    """Time left for a menu row: `<1m left`, `Nm left` or `Nh Mm left`."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return "<1m left"
+    if total < 3600:
+        return f"{total // 60}m left"
+    return f"{total // 3600}h {total % 3600 // 60}m left"
 
 
 def build_body(prompt: Mapping[str, Any], remaining_s: float, home: str) -> str:

@@ -28,21 +28,23 @@ from shell_runner.notifier import (
     RUN_TIMEOUT_S,
     DesktopNotifier,
     Notifier,
-    build_body,
     clean,
-    format_remaining,
+    format_left,
     http_fetch,
     main,
     open_detached,
     parse_args,
     run_argv,
-    shorten_home,
     spawn_daemon,
 )
 
 
-def test_clean_escapes_markup() -> None:
-    assert clean("<b>x</b> & y") == "&lt;b&gt;x&lt;/b&gt; &amp; y"
+def test_clean_does_not_escape_markup() -> None:
+    assert clean("<b>x</b> & y") == "<b>x</b> & y"
+
+
+def test_clean_still_strips_control_characters_around_markup() -> None:
+    assert clean("<b>\x1bx\x00</b> &\x07 y") == "<b>x</b> & y"
 
 
 def test_clean_strips_control_characters() -> None:
@@ -62,106 +64,32 @@ def test_clean_turns_nel_into_space() -> None:
     assert clean("a\x85b") == "a b"
 
 
-def test_clean_truncates_long_text_with_marker() -> None:
-    assert clean("x" * 121, 120) == "x" * 120 + "… (truncated)"
+def test_clean_cuts_long_text_with_a_single_ellipsis() -> None:
+    assert clean("x" * 121, 120) == "x" * 120 + "…"
+    assert clean("&" * 130, 120) == "&" * 120 + "…"
 
 
 def test_clean_leaves_text_at_limit_unmarked() -> None:
     assert clean("x" * 120, 120) == "x" * 120
+    assert clean("<" * 120, 120) == "<" * 120
 
 
-def test_clean_truncates_before_escaping() -> None:
-    assert clean("&" * 130, 120) == "&amp;" * 120 + "… (truncated)"
-
-
-def test_shorten_home() -> None:
-    assert shorten_home("/home/me/proj", "/home/me") == "~/proj"
-    assert shorten_home("/home/me", "/home/me") == "~"
-    assert shorten_home("/home/mex/proj", "/home/me") == "/home/mex/proj"
-    assert shorten_home("/srv/x", "/home/me") == "/srv/x"
-
-
-def test_shorten_home_with_empty_or_root_home_leaves_cwd_unchanged() -> None:
-    assert shorten_home("/home/me/proj", "") == "/home/me/proj"
-    assert shorten_home("/home/me/proj", "/") == "/home/me/proj"
-
-
-def test_format_remaining() -> None:
-    assert format_remaining(299) == "4m 59s"
-    assert format_remaining(5) == "0m 5s"
-    assert format_remaining(-3) == "0m 0s"
-
-
-def test_build_body_order_and_content() -> None:
-    prompt = {
-        "agent_id": "a1",
-        "cwd": "/home/me/proj",
-        "raw_cmd": "curl -sI https://example.com",
-        "scope_warning": "template is broader than the command",
-    }
-    body = build_body(prompt, 299, "/home/me")
-    assert body.splitlines() == [
-        "template is broader than the command",
-        "agent: a1",
-        "cwd: ~/proj",
-        "cmd: curl -sI https://example.com",
-        "expires in 4m 59s",
-        "decide on the Pending Prompts page",
-    ]
-
-
-def test_build_body_without_scope_warning_starts_with_agent() -> None:
-    prompt = {"agent_id": "a1", "cwd": "/x", "raw_cmd": "ls", "scope_warning": None}
-    assert build_body(prompt, 10, "/home/me").splitlines()[0] == "agent: a1"
-
-
-def test_build_body_without_scope_warning_key_starts_with_agent() -> None:
-    prompt = {"agent_id": "a1", "cwd": "/x", "raw_cmd": "ls"}
-    assert build_body(prompt, 10, "/home/me").splitlines()[0] == "agent: a1"
-
-
-def test_build_body_sanitises_every_untrusted_field() -> None:
-    prompt = {
-        "agent_id": "<b>a</b>\x1b",
-        "cwd": "/tmp/&x\x00",
-        "raw_cmd": "echo <i>&\x07",
-        "scope_warning": "<u>w</u>",
-    }
-    body = build_body(prompt, 10, "/home/me")
-    assert "<" not in body
-    assert "\x1b" not in body
-    assert "\x00" not in body
-    assert "\x07" not in body
-    assert "agent: &lt;b&gt;a&lt;/b&gt;" in body
-    assert "cmd: echo &lt;i&gt;&amp;" in body
-    assert "cwd: /tmp/&amp;x" in body
-    assert body.splitlines()[0] == "&lt;u&gt;w&lt;/u&gt;"
-
-
-def test_build_body_marks_truncation_only_when_cut() -> None:
-    long_cmd = {"agent_id": "a", "cwd": "/x", "raw_cmd": "y" * 200}
-    short_cmd = {"agent_id": "a", "cwd": "/x", "raw_cmd": "y" * 20}
-    assert "… (truncated)" in build_body(long_cmd, 10, "/h")
-    assert "… (truncated)" not in build_body(short_cmd, 10, "/h")
-
-
-def test_build_body_tolerates_missing_fields() -> None:
-    body = build_body({}, 10, "/home/me")
-    assert body.splitlines() == [
-        "agent: ?",
-        "cwd: ?",
-        "cmd: ?",
-        "expires in 0m 10s",
-        "decide on the Pending Prompts page",
-    ]
-
-
-def test_build_body_tolerates_none_fields() -> None:
-    prompt = {"agent_id": None, "cwd": None, "raw_cmd": None, "scope_warning": None}
-    body = build_body(prompt, 10, "/home/me")
-    assert "agent: ?" in body.splitlines()
-    assert "cwd: ?" in body.splitlines()
-    assert "cmd: ?" in body.splitlines()
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (-5, "<1m left"),
+        (0, "<1m left"),
+        (59.9, "<1m left"),
+        (60, "1m left"),
+        (240, "4m left"),
+        (3599, "59m left"),
+        (3600, "1h 0m left"),
+        (3661, "1h 1m left"),
+        (7322, "2h 2m left"),
+    ],
+)
+def test_format_left(seconds: float, expected: str) -> None:
+    assert format_left(seconds) == expected
 
 
 NOW = datetime(2026, 11, 19, 12, 0, 0, tzinfo=UTC)
