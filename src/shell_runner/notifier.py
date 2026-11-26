@@ -106,6 +106,14 @@ class Snapshot:
     status: Literal["ok", "unreachable"]
 
 
+def _check_interval(interval: float) -> None:
+    """Reject NaN, non-positive, infinite and above-platform-limit intervals."""
+    if not 0 < interval <= threading.TIMEOUT_MAX:  # False for NaN; inf exceeds the limit
+        raise ValueError(
+            f"interval must be > 0 and at most {threading.TIMEOUT_MAX}, got {interval}"
+        )
+
+
 @dataclass
 class Notifier:
     """Polling core. `fetch()` returns prompt dicts or raises OSError/ValueError;
@@ -122,8 +130,7 @@ class Notifier:
     _next_poll: datetime | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        if not self.interval_s > 0:  # also rejects NaN
-            raise ValueError(f"interval_s must be > 0, got {self.interval_s}")
+        _check_interval(self.interval_s)
 
     def tick(self) -> None:
         """Fetch once unless backing off, then publish a Snapshot via `on_update`.
@@ -289,8 +296,7 @@ def run_loop(notifier: Notifier, stop: threading.Event, interval: float) -> None
     Exceptions from `tick` and `on_update` propagate to the caller by design: the
     tray's worker turns them into exit 1 so systemd restarts it.
     """
-    if not interval > 0:
-        raise ValueError(f"interval must be > 0, got {interval}")
+    _check_interval(interval)
     while not stop.is_set():
         notifier.tick()
         stop.wait(interval)

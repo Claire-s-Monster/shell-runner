@@ -485,13 +485,13 @@ def test_backoff_is_anchored_after_a_slow_failed_fetch() -> None:
     assert calls == 2
 
 
-@pytest.mark.parametrize("bad", [0, -1.0, float("nan")])
-def test_notifier_rejects_non_positive_interval(bad: float) -> None:
+@pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf"), threading.TIMEOUT_MAX * 2])
+def test_notifier_rejects_unusable_interval(bad: float) -> None:
     with pytest.raises(ValueError, match="interval"):
         Notifier(fetch=Feed(), on_update=lambda _s: None, interval_s=bad)
 
 
-@pytest.mark.parametrize("bad", [0, -2.0])
+@pytest.mark.parametrize("bad", [0, -2.0, float("inf"), threading.TIMEOUT_MAX * 2])
 def test_run_loop_rejects_non_positive_interval(bad: float) -> None:
     feed = Feed()
     core = Notifier(fetch=feed, on_update=lambda _s: None)
