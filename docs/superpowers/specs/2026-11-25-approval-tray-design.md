@@ -57,9 +57,10 @@ The existing tests `test_notifier_module_is_stdlib_only` and `test_notifier_modu
 New `src/shell_runner/tray.py`:
 
 - It is the ONLY module that imports `gi`, and only inside functions (never at module level). Importing `tray.py` therefore works without `gi`.
-- Pure `render(snapshot, now, max_items, home) -> View`. `render` always re-filters prompts against `now`, dropping those with `expires_at <= now`. `View` is a frozen dataclass:
+- Pure `render(snapshot, now, max_items, home) -> View`. `now` is an aware UTC `datetime`. `render` treats `Snapshot.prompts` (a tuple of dicts) as read-only, re-parses each `expires_at` with `notifier.parse_expiry` (aware datetime; a row whose expiry does not parse is dropped), and drops rows with `expires_at <= now`. `tray.main` passes `home = str(Path.home())`. `View` is a frozen dataclass:
   - chrome: `icon_name`, `label`, `tooltip`.
-  - `rows`: a row's identity is `(id, tier, agent, cmd)`; its time-left text is a separate field.
+  - `rows`: each row is `(identity, text_without_left, left_text)`. Identity is `(id, tier, agent, cmd)`. The label is `text_without_left + " · " + left_text`.
+  - `max_items` caps prompt rows only. The stale/unreachable header, the `… and N more` row, the separator and Open are extra.
 - `render` is total and never raises on bad row data:
   - `command_tier` missing or not an int: shown as `T?` and not counted as T4.
   - `agent_id` missing or not a str: `?`.
@@ -67,15 +68,15 @@ New `src/shell_runner/tray.py`:
 - Home shortening: a new helper in `tray.py` replaces every occurrence of the home path in `raw_cmd` with `~`, when the occurrence is followed by `/`, the end of the string, or whitespace. An empty home is a no-op; a trailing `/` on home is stripped first.
 - Structural identity of the menu is `(tuple of row identities, stale_header_present: bool, overflow_count: int)`. Any change to it means a rebuild. The Open row and the separator are constant and not part of it.
 - Pure `plan_update(old_view, new_view, menu_open) -> {set_chrome: bool, relabel: bool, rebuild: bool | "deferred"}`:
-  - `old_view` is the view last APPLIED to the menu structure, not the last one received. It is `None` on the first update, which always means a full rebuild.
+  - `old_view` is the view last APPLIED to the menu structure (`applied_view`), not the last one received. It is `None` on the first update, which always means a full rebuild.
   - `set_chrome`: chrome differs.
-  - Structural identity unchanged: `relabel` is true if any time-left text differs, `rebuild` is false. The applier updates existing `Gtk.MenuItem`s with `set_label`.
+  - Structural identity unchanged: `relabel` is true if any `left_text` differs, `rebuild` is false.
   - Structural identity changed: `rebuild` is `"deferred"` if `menu_open`, else true.
-  - A deferred rebuild always uses the NEWEST received view.
-  - The received view, the applied view and `menu_open` are main-thread-only state.
+- Main-thread-only state: `latest_view` (the newest received), `applied_view` (the structure last applied) and `menu_open`.
 - Deferred rebuild mechanics:
   - `menu_open` is tracked with the menu's `show`/`hide` signals.
-  - On `hide`, the handler schedules the rebuild with `GLib.idle_add(self._rebuild, newest_view)` (returns False), never rebuilding directly in the handler, so a clicked item's `activate` still fires.
+  - On `hide` with a pending rebuild, the handler schedules `GLib.idle_add(self._rebuild)` with NO view argument (the callback returns False), never rebuilding directly in the handler, so a clicked item's `activate` still fires.
+  - `_rebuild` reads `latest_view`. If its structural identity equals `applied_view`'s it does nothing; otherwise it rebuilds and sets `applied_view`. The immediate (menu closed) rebuild path follows the same rule.
   - A rebuild replaces the CHILDREN of the same `Gtk.Menu`, which is created once. That keeps the show/hide handlers and the primary and secondary menu bindings. It never creates a new menu.
 - The gi-side applier is a thin untested shim (no icon adapter protocol or fake); the smoke test covers it.
 - Opener: reuses `notifier.open_detached(["xdg-open", ui_url])`; failures are logged with `_log`.
@@ -94,14 +95,15 @@ New `src/shell_runner/tray.py`:
 - `tray.main()` owns a `threading.Event` called `stop`.
 - The worker is `threading.Thread(daemon=True, target=<run_loop wrapper>)`, since `http_fetch` can block for about 5s.
 - Pattern for every `GLib.idle_add` use: positional arguments, callback returns False.
-- The worker passes only the `Snapshot` through `GLib.idle_add`. `render()` runs inside the idle callback on the GTK thread, with `now = time.time()` at that moment; the icon is touched only there.
-- `GLib.unix_signal_add` for SIGTERM and SIGINT sets `stop` and quits the GLib loop: exit 0.
+- The worker passes only the `Snapshot` through `GLib.idle_add`. `render()` runs inside the idle callback on the GTK thread, with `now = notifier._utcnow()` (aware UTC datetime) at that moment; the icon is touched only there.
+- Signals: `GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, cb)`, and the same for `signal.SIGINT`. `cb` sets `stop`, quits the GLib loop, and returns `GLib.SOURCE_REMOVE`: exit 0.
 - An uncaught worker exception is logged, then `GLib.idle_add(self._quit, 1)` runs (the callback records code 1, quits the loop, and returns False).
 - After `loop.run()` returns: `stop.set()`, `worker.join(timeout=interval + 6)`, then exit with the recorded code.
 
 ### XApp mapping
 
 - Icon: `set_icon_name`; tooltip: `set_tooltip_text`; label: `set_label`.
+- Rebuild: remove and destroy every old child of the single `Gtk.Menu`, append the new items (header, rows, overflow, separator, Open), then call `menu.show_all()`. Relabel calls `item.set_label()` on the existing row items in order.
 - The SAME `Gtk.Menu` is passed to `set_primary_menu` and `set_secondary_menu`, so left and right click both open it.
 - The tooltip always contains the count, in case the panel host does not render labels.
 - The gi smoke test asserts these methods exist on `XApp.StatusIcon`.
@@ -118,8 +120,8 @@ N counts all tiers; the icon is the same for any N > 0. Icon names can be tuned 
 
 Menu (opens on left or right click):
 
-- Unreachable only: first an insensitive header row `Server unreachable — showing last known`, then the last known rows (stale rows are re-filtered against now).
-- Up to `--max-items` rows, each `T4 · <agent_id> · <raw_cmd cut to MENU_CMD_LIMIT, ~ for home> · 4m left`. Plain text.
+- Unreachable only: first an insensitive header row `Server unreachable — showing last known`, then the last known rows (stale rows are re-filtered against now). If `last_prompts` is empty (e.g. a failed first poll), the header reads `Server unreachable` instead, with no prompt rows, followed by the separator and Open.
+- Up to `--max-items` prompt rows (the header, overflow row, separator and Open do not count), each `T4 · <agent_id> · <raw_cmd cut to MENU_CMD_LIMIT, ~ for home> · 4m left`. Plain text.
 - If there are more prompts, a `… and N more` row.
 - A separator, then `Open Pending Prompts`.
 - `Open Pending Prompts` and every prompt row run `xdg-open <ui-url>`. There are NO approve or deny actions in the panel.
@@ -139,14 +141,17 @@ Time left (`format_left`): under 60s `<1m left`; under 1h `Nm left`; otherwise `
 
 ## systemd
 
-`scripts/shell-runner-notify.service.example` becomes:
+`scripts/shell-runner-notify.service.example` is rewritten in full for the tray (not patched):
 
+- `Description=shell-runner silent tray indicator for pending approval prompts`.
+- Install note: `sudo apt install python3-gi gir1.2-xapp-1.0`, plus `xdg-open`.
+- The troubleshooting comment is reworded to start "If the tray icon does not appear".
+- No `notify-send`, no popup wording, no pixi anywhere.
 - `ExecStart=/usr/bin/python3 -m shell_runner.tray`
 - Paths use `%h`, matching the existing example: `Environment=PYTHONPATH=%h/ClaudeCode/Servers/shell-runner/development/src` (the existing file has a relative `PYTHONPATH=src`; it becomes absolute) and `WorkingDirectory=%h/ClaudeCode/Servers/shell-runner/development` (unchanged).
 - `[Unit]`: `PartOf=graphical-session.target`, `After=graphical-session.target`, `StartLimitIntervalSec=300`, `StartLimitBurst=10`.
 - `[Service]`: `Restart=on-failure`, `RestartSec=10`, `RestartPreventExitStatus=2` (missing dependencies are never restarted; no display, exit 3, is). That gives about 100s of retries for exit 3.
 - `[Install]`: `WantedBy=graphical-session.target`.
-- All pixi mentions, comments included, are removed from the file.
 
 Verification after login: `systemctl --user is-active graphical-session.target`.
 
@@ -160,7 +165,23 @@ The unit file name stays `shell-runner-notify.service`, so existing installs upg
 
 All in the pixi suite, no `gi` needed unless stated.
 
-notifier (rework, assert `Snapshot`s instead of popup counts; tests that assert `seen` assert the Snapshot's contents instead; `last_prompts` is sorted by `expires_at`; `on_update` is not called on back-off-skipped ticks): fetch, depth, back-off, filtering, args (incl. `--max-items`), log-escape tests; main-loop tests move onto `run_loop`. `test_notifier_module_is_stdlib_only` and `test_notifier_module_is_read_only` stay unchanged. Delete the popup-only tests: `DesktopNotifier`, reminders, T4 urgency, the `notify-send` probe, `run_argv`. Keep `open_detached` tests.
+notifier (in `tests/unit/test_notifier.py`; assert `Snapshot`s instead of popup counts; `last_prompts` is sorted by `expires_at`; `on_update` is not called on back-off-skipped ticks). Fetch, depth, back-off, filtering, args (incl. `--max-items`) and log-escape tests are kept. `test_notifier_module_is_stdlib_only` and `test_notifier_module_is_read_only` stay unchanged. Keep `open_detached` tests.
+
+Rewrite:
+
+- `test_clean_escapes_markup`: assert there is NO HTML escaping (`<b>x</b> & y` is unchanged) and control characters are still stripped.
+- `test_clean_truncates_long_text_with_marker`, `test_clean_leaves_text_at_limit_unmarked`: new rule, `clean(text, limit)` returns at most `limit` characters plus `…` when cut, no escaping.
+- `test_clean_truncates_before_escaping`: delete if it no longer means anything (expected: delete).
+- Every test that builds `Notifier` with `notify=`, `home=` or `seen=` (the `make_notifier` helper, the `Notifier(...)` calls in `test_tick_takes_unreachable_path_on_truncated_body`, `test_http_fetch_failures_are_what_tick_treats_as_unreachable`, `test_slow_fetch_does_not_popup_for_prompt_that_expired_meanwhile`, and the `notify=boom` test) uses `on_update=` and asserts on the `Snapshot`. The popup-count tests built on `make_notifier` are rewritten the same way: `test_new_prompt_gives_one_popup`, `test_same_id_is_not_repeated`, `test_second_prompt_gets_its_own_popup`, `test_expired_prompts_are_skipped`, `test_decided_prompts_are_skipped`, `test_unparseable_expiry_is_skipped_not_fatal`, `test_malformed_prompt_does_not_kill_the_poll_loop`, `test_non_dict_entry_is_skipped_not_fatal`, `test_prompt_missing_raw_cmd_still_gets_a_popup`, `test_unreachable_gives_one_popup_then_backs_off`, `test_backoff_*`, `test_very_long_outage_does_not_overflow`, `test_recovery_resets_and_a_new_outage_notifies_again`, `test_prompts_are_not_lost_across_an_outage`, `test_value_error_from_bad_response_counts_as_unreachable`.
+- `test_main_loops_until_keyboard_interrupt` moves onto `run_loop` (stop event).
+- `test_parse_args_defaults` / `test_parse_args_overrides`: add `--max-items`.
+- `test_log_escapes_newlines_in_prompt_id`: kept; check it does not use `notify`.
+
+Delete:
+
+- `test_shorten_home`, `test_shorten_home_with_empty_or_root_home_leaves_cwd_unchanged`, `test_format_remaining`, and all `test_build_body_*` tests (replaced by the tray home-substitution and `format_left` tests).
+- Popup-only tests: `test_scope_warning_is_first_line_of_body`, `test_t4_is_critical`, `test_seen_is_pruned_when_prompt_disappears`, `test_outage_keeps_seen_and_reminded_and_does_not_repopup_after_recovery`, `test_failed_unreachable_popup_is_not_retried_every_tick`, all reminder tests (`test_reminder_*`, `test_no_reminder_*`, `test_no_second_reminder_*`, `test_t4_reminder_is_critical`, `test_reminded_is_pruned_*`, `test_failed_reminder_popup_is_not_retried`), and every `DesktopNotifier` / `FakeRun` / `run_argv` / `notify-send` probe test (`test_action_popup_argv_and_click_opens_url` through `test_opener_failure_in_worker_does_not_propagate`, except `test_open_detached_starts_a_reaper`; `test_spawn_daemon_runs_function_in_a_daemon_thread` is kept).
+- Imports of removed names (`DesktopNotifier`, `run_argv`, `shorten_home`, `format_remaining`, `build_body`, `TRUNCATED`, `main`) are dropped from the test module.
 
 tray:
 
@@ -173,7 +194,7 @@ tray:
 - AST test: `tray.py` has no module-level `import gi` (only inside functions).
 - With `monkeypatch.setitem(sys.modules, "gi", None)`, importing `tray.py` works and `main([])` returns 2.
 - gi smoke test: `pytest.importorskip("gi")`, construct an `XApp.StatusIcon` without a main loop and assert `set_icon_name`, `set_tooltip_text`, `set_label`, `set_primary_menu`, `set_secondary_menu` exist. Skipped in CI.
-- Unit-file test: parse `scripts/shell-runner-notify.service.example` with `configparser` (`strict=False`, `interpolation=None`, `optionxform=str`) and assert `ExecStart=/usr/bin/python3 -m shell_runner.tray` with no `pixi` anywhere; `StartLimit*` in `[Unit]`; `Restart`, `RestartSec` and `RestartPreventExitStatus=2` in `[Service]`; `graphical-session.target` in `PartOf`, `After` and `WantedBy`.
+- Unit-file test: parse `scripts/shell-runner-notify.service.example` with `configparser` (`strict=False`, `interpolation=None`, `optionxform=str`) and assert `ExecStart=/usr/bin/python3 -m shell_runner.tray`; the case-insensitive substrings `notify-send`, `popup` and `pixi` appear nowhere in the file; `StartLimit*` in `[Unit]`; `Restart`, `RestartSec` and `RestartPreventExitStatus=2` in `[Service]`; `graphical-session.target` in `PartOf`, `After` and `WantedBy`.
 
 ## Docs
 
