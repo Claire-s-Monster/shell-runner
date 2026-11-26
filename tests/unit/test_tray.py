@@ -6,15 +6,21 @@ needs no gi; nothing here touches the desktop, the network or real time.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import importlib
+import sys
+import types
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from shell_runner import tray
-from shell_runner.notifier import Snapshot
+from shell_runner.notifier import Snapshot, parse_args
 from shell_runner.tray import (
     Row,
     View,
@@ -479,3 +485,201 @@ def test_open_ui_failure_is_logged_not_raised(
     monkeypatch.setattr(tray, "open_detached", failing)
     open_ui(UI_URL)  # must not raise
     assert "xdg-open failed" in capsys.readouterr().err
+
+
+# --- module guards and entry point -------------------------------------------------
+
+
+def _imports_gi(node: ast.AST) -> bool:
+    if isinstance(node, ast.Import):
+        return any(alias.name.split(".")[0] == "gi" for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        return (node.module or "").split(".")[0] == "gi"
+    return False
+
+
+def test_tray_imports_gi_only_inside_functions() -> None:
+    tree = ast.parse(Path(tray.__file__).read_text())
+    in_functions = {
+        id(child)
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef)
+        for child in ast.walk(fn)
+    }
+    gi_imports = [node for node in ast.walk(tree) if _imports_gi(node)]
+    assert gi_imports, "main() must import gi"
+    assert all(id(node) in in_functions for node in gi_imports)
+
+
+def test_tray_module_is_read_only() -> None:
+    source = Path(tray.__file__).read_text()
+    assert "approve_pending" not in source
+    assert "/approve" not in source
+    assert "shell=True" not in source
+
+
+def test_tray_imports_and_main_returns_2_without_gi(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setitem(sys.modules, "gi", None)  # makes `import gi` raise ImportError
+    monkeypatch.delitem(sys.modules, "shell_runner.tray")
+    fresh = importlib.import_module("shell_runner.tray")  # importing needs no gi
+    assert fresh.main([]) == 2
+    err = capsys.readouterr().err
+    assert "python3-gi" in err
+    assert "gir1.2-xapp-1.0" in err
+    assert err.count("\n") == 1
+
+
+def _fake_gi(monkeypatch: pytest.MonkeyPatch, *, display: bool, typelib: bool = True) -> list:
+    required: list[tuple[str, str]] = []
+
+    def require_version(namespace: str, version: str) -> None:
+        if not typelib:
+            raise ValueError(f"Namespace {namespace} not available")
+        required.append((namespace, version))
+
+    def init_check() -> tuple[bool, list[str]]:
+        return display, []
+
+    gi = types.ModuleType("gi")
+    gi.require_version = require_version  # type: ignore[attr-defined]
+    repository = types.ModuleType("gi.repository")
+    repository.GLib = types.SimpleNamespace()  # type: ignore[attr-defined]
+    repository.XApp = types.SimpleNamespace()  # type: ignore[attr-defined]
+    repository.Gtk = types.SimpleNamespace(init_check=init_check)  # type: ignore[attr-defined]
+    gi.repository = repository  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gi", gi)
+    monkeypatch.setitem(sys.modules, "gi.repository", repository)
+    return required
+
+
+def test_main_returns_2_when_a_typelib_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_gi(monkeypatch, display=True, typelib=False)
+    assert tray.main([]) == 2
+
+
+def test_main_requires_gtk3_and_xapp1_and_returns_3_without_a_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = _fake_gi(monkeypatch, display=False)
+    assert tray.main([]) == 3
+    assert set(required) == {("Gtk", "3.0"), ("XApp", "1.0")}
+
+
+def test_main_parses_args_before_the_display_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_gi(monkeypatch, display=False)
+    with pytest.raises(SystemExit) as info:
+        tray.main(["--max-items", "0"])
+    assert info.value.code == 2  # argparse error: also exit 2, so systemd does not restart
+
+
+def test_gi_smoke_status_icon_has_the_methods_the_applier_calls() -> None:
+    gi = pytest.importorskip("gi")  # skipped in CI and in the pixi env
+    try:
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("XApp", "1.0")
+    except ValueError:
+        pytest.skip("Gtk 3.0 or XApp 1.0 typelib not installed")
+    from gi.repository import Gtk, XApp
+
+    assert isinstance(Gtk.init_check(), tuple)  # main() indexes element 0
+    icon = XApp.StatusIcon()  # constructed without a main loop
+    for name in (
+        "set_icon_name",
+        "set_tooltip_text",
+        "set_label",
+        "set_primary_menu",
+        "set_secondary_menu",
+    ):
+        assert callable(getattr(icon, name)), name
+
+
+# --- applier logic with MagicMock stand-ins for GLib/Gtk/XApp (runs in CI) ----------
+
+
+def make_tray(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, MagicMock, MagicMock, MagicMock]:
+    """A _Tray over MagicMocks; render() sees the fixed NOW. Returns (tray, glib, icon, menu)."""
+    monkeypatch.setattr(tray, "_utcnow", lambda: NOW)
+    glib, gtk, xapp = MagicMock(), MagicMock(), MagicMock()
+    instance = tray._Tray(glib, gtk, xapp, parse_args([]))
+    return instance, glib, xapp.StatusIcon.return_value, gtk.Menu.return_value
+
+
+def test_starting_state_is_applied_before_the_first_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    instance, glib, icon, menu = make_tray(monkeypatch)
+    icon.set_icon_name.assert_called_once_with("security-high-symbolic")
+    icon.set_tooltip_text.assert_called_once_with("shell-runner: starting…")
+    icon.set_label.assert_called_once_with("")
+    icon.set_primary_menu.assert_called_once_with(menu)
+    icon.set_secondary_menu.assert_called_once_with(menu)
+    instance.gtk.MenuItem.assert_called_once_with(label="Open Pending Prompts")
+    assert menu.append.call_count == 1  # only the Open item
+    menu.show_all.assert_called_once()
+    assert instance.applied_chrome == tray.STARTING_CHROME
+    assert instance.applied_view is None
+    glib.idle_add.assert_not_called()  # the worker has not started
+
+
+def test_worker_crash_schedules_quit_with_code_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instance, glib, _icon, _menu = make_tray(monkeypatch)
+
+    def crash(*_args: Any) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(tray, "run_loop", crash)
+    instance._work()  # must not raise
+    glib.idle_add.assert_called_once_with(instance._quit, 1)
+    assert "worker crashed" in capsys.readouterr().err
+    assert instance._quit(1) is False
+    assert instance.code == 1
+    instance.loop.quit.assert_called_once()
+
+
+def test_chrome_follows_the_applied_chrome_while_a_rebuild_is_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: chrome A -> B while the rebuild is deferred, then back to A,
+    # must leave the icon showing A.
+    instance, _glib, icon, menu = make_tray(monkeypatch)
+    instance._apply(ok(make_prompt("p1")))  # A: closed menu, full rebuild
+    instance._on_show(menu)
+    instance._apply(ok(make_prompt("p1"), make_prompt("p2")))  # B: structure change, deferred
+    assert instance.rebuild_pending is True
+    assert icon.set_label.call_args.args == ("2",)
+    instance._apply(ok(make_prompt("p1")))  # back to A's structure and chrome
+    assert icon.set_label.call_args.args == ("1",)
+    assert icon.set_tooltip_text.call_args.args == ("shell-runner: 1 pending",)
+    assert instance.applied_chrome == instance.latest_view.chrome
+
+
+def test_deferred_rebuild_runs_from_idle_after_hide_with_the_latest_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance, glib, _icon, menu = make_tray(monkeypatch)
+    instance._apply(ok(make_prompt("p1")))
+    first = instance.applied_view
+    instance._on_show(menu)
+    instance._apply(ok(make_prompt("p1"), make_prompt("p2")))
+    assert plan_update(first, instance.latest_view, True, None)["rebuild"] == "deferred"
+    instance._apply(ok(make_prompt("p1"), make_prompt("p2"), make_prompt("p3")))
+    assert instance.applied_view is first  # nothing rebuilt while open
+    shows_before = menu.show_all.call_count
+    instance._on_hide(menu)
+    glib.idle_add.assert_called_once_with(instance._rebuild)  # no view argument
+    assert menu.show_all.call_count == shows_before  # not rebuilt inside the hide handler
+    assert instance._rebuild() is False
+    assert instance.applied_view is instance.latest_view
+    assert row_ids(instance.applied_view) == ["p1", "p2", "p3"]
+    assert instance.rebuild_pending is False
+    assert menu.show_all.call_count == shows_before + 1
+
+
+def test_hide_without_a_pending_rebuild_schedules_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    instance, glib, _icon, menu = make_tray(monkeypatch)
+    instance._apply(ok(make_prompt("p1")))
+    instance._on_show(menu)
+    instance._on_hide(menu)
+    glib.idle_add.assert_not_called()
