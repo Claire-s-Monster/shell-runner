@@ -108,6 +108,8 @@ Base: development a3506b7. Rebase after PR #118 (#117 TKSENTINEL guard) merges.
 
 ## Part N: shell-runner-notify (desktop notifier)
 
+> **Superseded (2026-11-25):** the popup notifier in this Part is replaced by the silent panel tray in `2026-11-25-approval-tray-design.md` (issue #138). This Part is kept for history only.
+
 ### Process
 
 - A separate process in `src/shell_runner/notifier.py`, run with `pixi run -e dev python -m shell_runner.notifier` (PYTHONPATH=src) or a systemd *user* unit (example unit file under `docs/` or `deploy/`).

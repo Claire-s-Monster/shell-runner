@@ -1,5 +1,7 @@
 # shell-runner-notify Implementation Plan
 
+> **Superseded (2026-11-25):** replaced by `docs/superpowers/plans/2026-11-25-approval-tray.md` (silent tray, issue #138); kept for history.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A standalone desktop notifier that polls shell-runner's `POST /pending` and pops up one `notify-send` notification per new T3/T4 approval prompt (with an "Open" action to the Pending Prompts UI and a single pre-expiry reminder), plus a static test proving the server unit files bind only to 127.0.0.1. Tracking issue: #119 (Part N only; Part B is a separate plan and N must not depend on it).
