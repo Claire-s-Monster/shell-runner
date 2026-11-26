@@ -320,6 +320,18 @@ def test_max_items_zero_sends_every_row_to_overflow() -> None:
     assert view.label == "2"
 
 
+def test_unreachable_with_no_rows_shown_uses_the_empty_header() -> None:
+    # Live prompts exist but max_items=0 shows none, so "showing last known" would be false.
+    view = view_of(down(make_prompt("a"), make_prompt("b")), max_items=0)
+    assert view.rows == ()
+    assert view.overflow == 2
+    assert view.header == "Server unreachable"
+    assert menu_entries(view)[:2] == [
+        ("header", "Server unreachable"),
+        ("overflow", "… and 2 more"),
+    ]
+
+
 def test_negative_max_items_is_clamped_to_zero() -> None:
     view = view_of(ok(make_prompt("a"), make_prompt("b")), max_items=-1)
     assert view.rows == ()
@@ -339,6 +351,26 @@ def test_substitute_home_strips_a_trailing_slash_on_home() -> None:
 @pytest.mark.parametrize("home", ["", "/"])
 def test_substitute_home_with_empty_home_is_a_no_op(home: str) -> None:
     assert substitute_home("cat /home/me/x", home) == "cat /home/me/x"
+
+
+@pytest.mark.parametrize(
+    ("home", "text", "expected"),
+    [
+        ("/home/alice", "cat /home/alice/x", "cat ~/x"),
+        ("/root", "ls /root /tmp", "ls ~ /tmp"),
+        ("/Users/b.c", "cd /Users/b.c/src", "cd ~/src"),
+        ("/home/alice", "cat /home/me/x", "cat /home/me/x"),
+    ],
+)
+def test_substitute_home_uses_the_given_home_not_a_fixed_one(
+    home: str, text: str, expected: str
+) -> None:
+    assert substitute_home(text, home) == expected
+
+
+def test_render_shortens_the_home_it_is_given() -> None:
+    view = render(ok(make_prompt("p1", raw_cmd="cat /srv/u/x")), NOW, 10, "/srv/u")
+    assert view.rows[0].identity[3] == "cat ~/x"
 
 
 def test_substitute_home_treats_home_literally_not_as_a_regex() -> None:

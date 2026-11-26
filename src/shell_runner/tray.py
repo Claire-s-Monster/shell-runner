@@ -161,9 +161,9 @@ def render(snapshot: Snapshot, now: datetime, max_items: int, home: str) -> View
     icon_name, label, tooltip = _chrome(snapshot.status, len(built), t4_count)
     header: str | None = None
     if snapshot.status == "unreachable":
-        # Chosen from the rows that survive the re-filter: if no last-known
-        # prompt is still live, there is nothing "last known" to show.
-        header = HEADER_STALE if built else HEADER_EMPTY
+        # Chosen from the rows actually shown: if no last-known prompt is still
+        # live (or max_items hides them all), there is nothing "last known" to show.
+        header = HEADER_STALE if shown else HEADER_EMPTY
     return View(
         icon_name=icon_name,
         label=label,
