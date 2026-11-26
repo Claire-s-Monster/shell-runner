@@ -51,7 +51,13 @@ def clean(text: str, limit: int | None = None) -> str:
     (U+2028/2029). Newlines, tabs and NEL (U+0085) become spaces so multi-line
     commands stay readable. Nothing is escaped: the tray shows plain text, not
     Pango markup. When cut, the result is `limit` characters plus a single "…".
+    The limit is applied after cleaning. `limit=None` means no cut and "" stays
+    "". `limit=0` gives "" for empty cleaned text, otherwise just "…". A negative
+    `limit` raises ValueError. Dropping format characters also removes ZWJ
+    (U+200D), so emoji sequences can split.
     """
+    if limit is not None and limit < 0:
+        raise ValueError(f"limit must be >= 0, got {limit}")
     text = _WHITESPACE_CTRL.sub(" ", text)
     text = "".join(c for c in text if unicodedata.category(c) not in _DROPPED_CATEGORIES)
     if limit is not None and len(text) > limit:

@@ -64,14 +64,36 @@ def test_clean_turns_nel_into_space() -> None:
     assert clean("a\x85b") == "a b"
 
 
-def test_clean_cuts_long_text_with_a_single_ellipsis() -> None:
-    assert clean("x" * 121, 120) == "x" * 120 + "…"
-    assert clean("&" * 130, 120) == "&" * 120 + "…"
+@pytest.mark.parametrize(
+    ("length", "expected"),
+    [
+        (119, "x" * 119),
+        (120, "x" * 120),
+        (121, "x" * 120 + "…"),
+    ],
+)
+def test_clean_limit_boundaries(length: int, expected: str) -> None:
+    assert clean("x" * length, 120) == expected
 
 
-def test_clean_leaves_text_at_limit_unmarked() -> None:
-    assert clean("x" * 120, 120) == "x" * 120
-    assert clean("<" * 120, 120) == "<" * 120
+def test_clean_negative_limit_raises() -> None:
+    with pytest.raises(ValueError, match="limit"):
+        clean("abc", -1)
+
+
+def test_clean_limit_zero() -> None:
+    assert clean("", 0) == ""
+    assert clean("abc", 0) == "…"
+
+
+def test_clean_applies_limit_after_cleaning() -> None:
+    assert clean("a\x00" + "b" * 5, 6) == "abbbbb"
+    assert clean("a\nbcd", 3) == "a b…"
+
+
+def test_clean_without_limit_and_empty_string() -> None:
+    assert clean("") == ""
+    assert clean("x" * 500) == "x" * 500
 
 
 @pytest.mark.parametrize(
@@ -82,7 +104,9 @@ def test_clean_leaves_text_at_limit_unmarked() -> None:
         (59.9, "<1m left"),
         (60, "1m left"),
         (240, "4m left"),
+        (119, "1m left"),
         (3599, "59m left"),
+        (3599.9, "59m left"),
         (3600, "1h 0m left"),
         (3661, "1h 1m left"),
         (7322, "2h 2m left"),
