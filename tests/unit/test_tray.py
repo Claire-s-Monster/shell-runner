@@ -497,6 +497,49 @@ def test_t4_tooltip_counts_every_live_prompt_not_just_shown_rows() -> None:
     assert view.tooltip == "shell-runner: 4 pending (3 × T4)"
 
 
+# --- server totals (issue #140) -----------------------------------------------------
+
+
+def with_totals(snapshot: Snapshot, total: int | None, total_t4: int | None = None) -> Snapshot:
+    return dataclasses.replace(snapshot, total=total, total_t4=total_t4)
+
+
+def test_server_total_beats_the_capped_row_count() -> None:
+    rows = [make_prompt(f"p{i}") for i in range(100)]
+    view = view_of(with_totals(ok(*rows), total=150), max_items=10)
+    assert view.label == "99+"
+    assert view.tooltip == "shell-runner: 150 pending"
+    assert len(view.rows) == 10
+    assert view.overflow == 140
+    assert menu_entries(view)[10] == ("overflow", "… and 140 more")
+
+
+def test_server_total_t4_shows_in_the_tooltip() -> None:
+    rows = [make_prompt(f"p{i}", tier=4 if i < 3 else 3) for i in range(100)]
+    view = view_of(with_totals(ok(*rows), total=150, total_t4=12))
+    assert view.tooltip == "shell-runner: 150 pending (12 × T4)"
+
+
+def test_smaller_server_totals_never_undercount_the_built_rows() -> None:
+    rows = [make_prompt("a", tier=4), make_prompt("b", tier=4), make_prompt("c")]
+    view = view_of(with_totals(ok(*rows), total=1, total_t4=1))
+    assert view.tooltip == "shell-runner: 3 pending (2 × T4)"
+    assert view.overflow == 0
+
+
+def test_totals_none_keeps_the_row_derived_counts() -> None:
+    rows = [make_prompt(f"p{i}", tier=4) for i in range(100)]
+    view = view_of(with_totals(ok(*rows), total=None, total_t4=None), max_items=10)
+    assert view.label == "99+"
+    assert view.tooltip == "shell-runner: 100 pending (100 × T4)"
+    assert view.overflow == 90
+
+
+def test_server_total_is_ignored_when_unreachable() -> None:
+    view = view_of(with_totals(down(make_prompt("p1")), total=150))
+    assert (view.label, view.tooltip) == ("?", tray.TOOLTIP_OFFLINE)
+
+
 # --- opener -----------------------------------------------------------------------
 
 

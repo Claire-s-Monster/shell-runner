@@ -104,6 +104,19 @@ class Snapshot:
 
     prompts: tuple[Mapping[str, Any], ...]
     status: Literal["ok", "unreachable"]
+    # Server-side counts of live pending prompts (issue #140); None when the
+    # fetch carried none (older server, plain-list fetcher) or was unreachable.
+    total: int | None = None
+    total_t4: int | None = None
+
+
+@dataclass(frozen=True)
+class PendingPage:
+    """One /pending response: the (server-capped) prompt rows plus optional totals."""
+
+    prompts: list[dict[str, Any]]
+    total: int | None = None
+    total_t4: int | None = None
 
 
 def _check_interval(interval: float) -> None:
@@ -116,10 +129,11 @@ def _check_interval(interval: float) -> None:
 
 @dataclass
 class Notifier:
-    """Polling core. `fetch()` returns prompt dicts or raises OSError/ValueError;
-    `on_update(snapshot)` receives every fetch result; `clock()` returns aware UTC."""
+    """Polling core. `fetch()` returns prompt dicts (or a PendingPage) or raises
+    OSError/ValueError; `on_update(snapshot)` receives every fetch result;
+    `clock()` returns aware UTC."""
 
-    fetch: Callable[[], list[dict[str, Any]]]
+    fetch: Callable[[], list[dict[str, Any]] | PendingPage]
     on_update: Callable[[Snapshot], None]
     clock: Callable[[], datetime] = _utcnow
     interval_s: float = DEFAULT_INTERVAL_S
@@ -143,7 +157,7 @@ class Notifier:
         if self._next_poll is not None and now < self._next_poll:
             return  # skipped by back-off: no fetch and no on_update
         try:
-            prompts = self.fetch()
+            fetched = self.fetch()
         except (OSError, ValueError) as exc:
             # A ValueError from http_fetch (bad scheme, oversize, too deep, wrong
             # shape, bad JSON) takes the same path as a network error.
@@ -154,9 +168,17 @@ class Notifier:
         self._failures = 0
         self._next_poll = None
         # Re-read the clock: a slow fetch must not leave an expired prompt looking live.
-        live = self._handle(prompts, self.clock())
+        page = fetched if isinstance(fetched, PendingPage) else PendingPage(prompts=fetched)
+        live = self._handle(page.prompts, self.clock())
         self.last_prompts = tuple(MappingProxyType(dict(p)) for p in live)
-        self.on_update(Snapshot(prompts=self.last_prompts, status="ok"))
+        self.on_update(
+            Snapshot(
+                prompts=self.last_prompts,
+                status="ok",
+                total=page.total,
+                total_t4=page.total_t4,
+            )
+        )
 
     def _on_unreachable(self, now: datetime, exc: Exception) -> None:
         # Back-off state is recorded before on_update runs, so a failing
@@ -227,8 +249,17 @@ def _json_depth_exceeds(raw: bytes, limit: int) -> bool:
     return False
 
 
-def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
-    """POST `{}` to /pending and return the prompt list.
+def _count_or_none(value: object) -> int | None:
+    """A non-negative int (bool excluded) or None; anything else counts as absent."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def http_fetch(url: str, timeout: float = 5.0) -> PendingPage:
+    """POST `{}` to /pending and return the prompt list with the server totals.
+
+    Malformed or missing `total`/`total_t4` values are reported as None.
 
     Raises OSError (incl. URLError/HTTPError/timeout, or a non-200 status) when
     unreachable and ValueError on a non-http(s) URL, an oversized or malformed
@@ -268,7 +299,11 @@ def http_fetch(url: str, timeout: float = 5.0) -> list[dict[str, Any]]:
     prompts = data.get("prompts") if isinstance(data, dict) else None
     if not isinstance(prompts, list):
         raise ValueError("unexpected /pending response")
-    return prompts
+    return PendingPage(
+        prompts=prompts,
+        total=_count_or_none(data.get("total")),
+        total_t4=_count_or_none(data.get("total_t4")),
+    )
 
 
 def spawn_daemon(fn: Callable[[], None]) -> None:

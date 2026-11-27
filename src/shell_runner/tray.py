@@ -158,7 +158,13 @@ def render(snapshot: Snapshot, now: datetime, max_items: int, home: str) -> View
     built = _live_rows(snapshot.prompts, now, home)
     shown = tuple(row for row, _is_t4 in built[: max(0, max_items)])
     t4_count = sum(1 for _built_row, is_t4 in built if is_t4)
-    icon_name, label, tooltip = _chrome(snapshot.status, len(built), t4_count)
+    count = len(built)
+    # The server caps the row list; its live totals are never below the rows it sent.
+    if snapshot.total is not None:
+        count = max(count, snapshot.total)
+    if snapshot.total_t4 is not None:
+        t4_count = max(t4_count, snapshot.total_t4)
+    icon_name, label, tooltip = _chrome(snapshot.status, count, t4_count)
     header: str | None = None
     if snapshot.status == "unreachable":
         # Chosen from the rows actually shown: if no last-known prompt is still
@@ -170,7 +176,7 @@ def render(snapshot: Snapshot, now: datetime, max_items: int, home: str) -> View
         tooltip=tooltip,
         header=header,
         rows=shown,
-        overflow=len(built) - len(shown),
+        overflow=count - len(shown),
     )
 
 
