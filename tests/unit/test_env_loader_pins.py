@@ -65,21 +65,26 @@ def _assert_unpinnable(command: str, tmp_path: Path, name: str) -> None:
     assert cls.non_promotable is True, command
     assert name in " ".join(cls.decision_path), command
     pin = script_pin.compute_pin(command, str(tmp_path))
-    assert pin is not None and pin.sha256 == script_pin.UNPINNABLE, command
+    assert pin is not None, command
+    assert pin.sha256 == script_pin.UNPINNABLE, command
 
 
 def _assert_non_durable(command: str, tmp_path: Path, name: str) -> None:
     cls = classify(command, str(tmp_path), AGENT)
     assert cls.non_promotable is True, command
     assert cls.script_unpinnable is False, command
-    assert cls.non_durable_reason is not None and name in cls.non_durable_reason, command
+    assert cls.non_durable_reason is not None, command
+    assert name in cls.non_durable_reason, command
     notes = [n for n in cls.decision_path if n.startswith("non_durable:")]
-    assert notes and name in " ".join(notes), command
+    assert notes, command
+    assert name in " ".join(notes), command
     pin = script_pin.compute_pin(command, str(tmp_path))
-    assert pin is not None and pin.sha256 != script_pin.UNPINNABLE, command
+    assert pin is not None, command
+    assert pin.sha256 != script_pin.UNPINNABLE, command
     plan = script_pin.analyze(command, str(tmp_path))
     assert plan.unpinnable is False, command
-    assert plan.non_durable and name in " ".join(plan.non_durable), command
+    assert plan.non_durable, command
+    assert name in " ".join(plan.non_durable), command
 
 
 def _assert_pinnable(command: str, tmp_path: Path) -> None:
@@ -87,7 +92,8 @@ def _assert_pinnable(command: str, tmp_path: Path) -> None:
     assert cls.script_unpinnable is False, command
     assert cls.non_durable_reason is None, command
     pin = script_pin.compute_pin(command, str(tmp_path))
-    assert pin is not None and pin.sha256 != script_pin.UNPINNABLE, command
+    assert pin is not None, command
+    assert pin.sha256 != script_pin.UNPINNABLE, command
     assert script_pin.analyze(command, str(tmp_path)).non_durable == [], command
 
 
@@ -198,7 +204,8 @@ def test_make_operand_assignment_is_non_durable(tmp_path: Path, command: str, na
     (tmp_path / "Makefile").write_text("deploy_x all:\n\t@echo hi\n")
     cls = classify(command, str(tmp_path), AGENT)
     assert cls.non_promotable is True, command
-    assert cls.non_durable_reason is not None and name in cls.non_durable_reason, command
+    assert cls.non_durable_reason is not None, command
+    assert name in cls.non_durable_reason, command
 
 
 @pytest.mark.parametrize(
@@ -213,7 +220,8 @@ def test_non_script_command_with_loader_var_is_non_durable(
 ) -> None:
     cls = classify(command, str(tmp_path), AGENT)
     assert cls.non_promotable is True, command
-    assert cls.non_durable_reason is not None and name in cls.non_durable_reason, command
+    assert cls.non_durable_reason is not None, command
+    assert name in cls.non_durable_reason, command
 
 
 @pytest.mark.parametrize(
@@ -340,7 +348,8 @@ def test_s8_make_assignment_operators_are_non_durable(tmp_path: Path, command: s
     (tmp_path / "Makefile").write_text("all:\n\t@echo hi\n")
     cls = classify(command, str(tmp_path), AGENT)
     assert cls.non_promotable is True, command
-    assert cls.non_durable_reason is not None and "PYTHONPATH" in cls.non_durable_reason, command
+    assert cls.non_durable_reason is not None, command
+    assert "PYTHONPATH" in cls.non_durable_reason, command
 
 
 # S8 guard

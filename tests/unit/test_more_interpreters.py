@@ -510,9 +510,11 @@ def test_php_d_spaced_or_quoted_value_pins_file(tmp_path: Path, command: str) ->
     _make(tmp_path, ("p.php", "x.php"))
     _assert_pinned(command, tmp_path, ("p.php",))
     for ref in _plan(command, tmp_path).refs:
-        assert '"' not in ref.operand and "'" not in ref.operand, ref
+        assert '"' not in ref.operand, ref
+        assert "'" not in ref.operand, ref
     for path in _pin_paths(command, tmp_path):
-        assert '"' not in path and "'" not in path, path
+        assert '"' not in path, path
+        assert "'" not in path, path
 
 
 def test_php_d_include_path_is_non_durable(tmp_path: Path) -> None:
