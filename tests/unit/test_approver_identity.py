@@ -235,3 +235,37 @@ def test_list_pending_prompts_ordered_by_created_at_desc(tmp_path: Path) -> None
     pending = db.list_pending_prompts(include_resolved=True)
     ids = [row["id"] for row in pending]
     assert ids == [newest_id, middle_id, oldest_id]
+
+
+def test_count_live_pending_prompts_counts_past_the_list_cap(tmp_path: Path) -> None:
+    """Issue #140: the totals are not capped at list_pending_prompts' 100 rows."""
+    db = _make_db(tmp_path)
+    for _ in range(100):
+        _make_prompt(db, command_tier=3)
+    for _ in range(5):
+        _make_prompt(db, command_tier=4)
+    # Not live: expired, decided, consumed. Two are T4 to prove they are excluded.
+    expired_id = _make_prompt(db, command_tier=4)
+    decided_id = _make_prompt(db, command_tier=4)
+    consumed_id = _make_prompt(db, command_tier=3)
+    past = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+    with db._conn() as conn:
+        conn.execute("UPDATE pending_prompts SET expires_at = ? WHERE id = ?", (past, expired_id))
+    assert db.approve_prompt(prompt_id=decided_id, decision="approve_once") is not None
+    token = db.approve_prompt(prompt_id=consumed_id, decision="approve_once")
+    assert token is not None
+    assert db.consume_approve_token(token=token) is not None
+
+    assert db.count_live_pending_prompts() == (105, 5)
+    assert len(db.list_pending_prompts()) == 100
+
+
+def test_count_live_pending_prompts_empty_is_zero_not_none(tmp_path: Path) -> None:
+    assert _make_db(tmp_path).count_live_pending_prompts() == (0, 0)
+
+
+def test_count_live_pending_prompts_honours_now(tmp_path: Path) -> None:
+    db = _make_db(tmp_path)
+    _make_prompt(db, command_tier=4)
+    later = datetime.now(UTC) + timedelta(days=1)
+    assert db.count_live_pending_prompts(now=later) == (0, 0)

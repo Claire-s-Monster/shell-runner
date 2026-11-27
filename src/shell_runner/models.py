@@ -183,6 +183,10 @@ class GetPendingRequest(BaseModel):
 
 class GetPendingResponse(BaseModel):
     prompts: list[PendingPromptDetail]
+    # issue #140 — uncapped counts of live pending prompts (undecided, unconsumed,
+    # unexpired), set only when listing; None for a single prompt_id lookup.
+    total: int | None = None
+    total_t4: int | None = None
 
 
 class AuditRequest(BaseModel):

@@ -27,6 +27,7 @@ from shell_runner.notifier import (
     DEFAULT_UI_URL,
     MAX_RESPONSE_BYTES,
     Notifier,
+    PendingPage,
     Snapshot,
     clean,
     format_left,
@@ -186,6 +187,40 @@ def test_live_prompt_is_published_in_an_ok_snapshot() -> None:
     notifier_.tick()
     assert snapshots == [Snapshot(prompts=(prompt,), status="ok")]
     assert notifier_.last_prompts == (prompt,)
+
+
+def test_snapshot_totals_default_to_none() -> None:
+    notifier_, feed, _clock, snapshots = make_notifier()
+    feed.prompts = [make_prompt()]
+    notifier_.tick()  # plain-list fetcher: no totals
+    assert (snapshots[0].total, snapshots[0].total_t4) == (None, None)
+
+
+def test_snapshot_carries_the_totals_of_a_page_fetcher() -> None:
+    snapshots: list[Snapshot] = []
+    page = PendingPage(prompts=[make_prompt()], total=150, total_t4=7)
+    notifier_ = Notifier(fetch=lambda: page, on_update=snapshots.append, clock=Clock())
+    notifier_.tick()
+    assert ids(snapshots[0]) == ["p1"]
+    assert (snapshots[0].total, snapshots[0].total_t4) == (150, 7)
+
+
+def test_unreachable_snapshot_has_no_totals() -> None:
+    clock = Clock()
+    snapshots: list[Snapshot] = []
+    pages = [PendingPage(prompts=[make_prompt()], total=150, total_t4=7)]
+
+    def fetch() -> PendingPage:
+        if pages:
+            return pages.pop()
+        raise OSError("down")
+
+    notifier_ = Notifier(fetch=fetch, on_update=snapshots.append, clock=clock)
+    notifier_.tick()
+    clock.advance(1000)
+    notifier_.tick()
+    assert snapshots[1].status == "unreachable"
+    assert (snapshots[1].total, snapshots[1].total_t4) == (None, None)
 
 
 def test_snapshot_is_frozen() -> None:
@@ -529,13 +564,43 @@ def _url(server: HTTPServer) -> str:
 def test_http_fetch_posts_empty_json_and_returns_prompts() -> None:
     server, seen = _serve(json.dumps({"prompts": [{"id": "p1"}]}).encode())
     try:
-        assert http_fetch(_url(server)) == [{"id": "p1"}]
+        assert http_fetch(_url(server)).prompts == [{"id": "p1"}]
     finally:
         server.shutdown()
         server.server_close()
     assert seen["method"] == "POST"
     assert seen["path"] == "/pending"
     assert json.loads(seen["body"]) == {}
+
+
+def _fetch_page(payload: dict[str, Any]) -> PendingPage:
+    server, _seen = _serve(json.dumps(payload).encode())
+    try:
+        return http_fetch(_url(server))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_fetch_parses_the_server_totals() -> None:
+    page = _fetch_page({"prompts": [{"id": "p1"}], "total": 150, "total_t4": 7})
+    assert page == PendingPage(prompts=[{"id": "p1"}], total=150, total_t4=7)
+
+
+def test_http_fetch_without_totals_reports_them_absent() -> None:
+    page = _fetch_page({"prompts": []})
+    assert (page.total, page.total_t4) == (None, None)
+
+
+@pytest.mark.parametrize("bad", [-1, "150", 1.5, True, None, [3]])
+def test_http_fetch_treats_a_malformed_total_as_absent(bad: Any) -> None:
+    page = _fetch_page({"prompts": [], "total": bad, "total_t4": bad})
+    assert (page.total, page.total_t4) == (None, None)
+
+
+def test_http_fetch_keeps_a_valid_total_next_to_a_malformed_one() -> None:
+    page = _fetch_page({"prompts": [], "total": 9, "total_t4": "x"})
+    assert (page.total, page.total_t4) == (9, None)
 
 
 def test_http_fetch_rejects_unexpected_payload_as_value_error() -> None:

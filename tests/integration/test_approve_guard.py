@@ -11,6 +11,7 @@ for tests that don't need a restricted cwd jail.
 from __future__ import annotations
 
 import importlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -254,6 +255,42 @@ def test_pending_without_prompt_id_lists_outstanding(client: TestClient) -> None
     assert resp.status_code == 200
     ids = {p["id"] for p in resp.json()["prompts"]}
     assert {pid1, pid2} <= ids
+
+
+def test_pending_list_reports_live_totals(client: TestClient) -> None:
+    """Issue #140: the list branch carries live total / total_t4 (not capped)."""
+    _create_prompt(raw_cmd="pip install a", command_tier=4)
+    _create_prompt(raw_cmd="pip install b", command_tier=4)
+    _create_prompt(raw_cmd="make x", command_tier=3)
+    decided = _create_prompt(raw_cmd="pip install c", command_tier=4)
+    assert srv.db.approve_prompt(prompt_id=decided, decision="approve_once") is not None
+    body = client.post("/pending", json={"include_resolved": True}).json()
+    assert body["total"] == 3
+    assert body["total_t4"] == 2
+
+
+def test_pending_totals_come_from_the_same_snapshot_as_the_rows(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #140: a prompt created between the list and the count is in neither."""
+    _create_prompt(raw_cmd="pip install a", command_tier=4)
+    original = type(srv.db)._count_live_rows
+
+    def racing_count(conn: sqlite3.Connection, stamp: str) -> tuple[int, int]:
+        _create_prompt(raw_cmd="pip install late", command_tier=4)
+        return original(conn, stamp)
+
+    monkeypatch.setattr(type(srv.db), "_count_live_rows", staticmethod(racing_count))
+    body = client.post("/pending", json={}).json()
+    assert len(body["prompts"]) == 1
+    assert (body["total"], body["total_t4"]) == (1, 1)
+
+
+def test_pending_with_prompt_id_has_no_totals(client: TestClient) -> None:
+    pid = _create_prompt()
+    body = client.post("/pending", json={"prompt_id": pid}).json()
+    assert body["total"] is None
+    assert body["total_t4"] is None
 
 
 def test_pending_does_not_mutate_prompt(client: TestClient) -> None:
