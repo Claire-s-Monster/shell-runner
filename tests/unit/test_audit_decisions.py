@@ -320,7 +320,8 @@ def test_rows_and_revocations_unchanged(db: Persistence, tmp_path: Path) -> None
     assert rev["notes"] == []
     assert "decisions" not in rev
     rows = db.audit_query(mode="rows")
-    assert rows["rows"] == [] and rows["notes"] == []
+    assert rows["rows"] == []
+    assert rows["notes"] == []
     assert db.audit_query(mode="summary")["revocations"] == 3
 
 
