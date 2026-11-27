@@ -1402,6 +1402,26 @@ class Persistence:
             rows = conn.execute(query.format(where=where), (limit,)).fetchall()
             return [dict(row) for row in rows]
 
+    def count_live_pending_prompts(self, *, now: datetime | None = None) -> tuple[int, int]:
+        """Return (total, total_t4) of live pending prompts (issue #140).
+
+        Live means undecided, unconsumed and not yet expired. Unlike
+        list_pending_prompts this is not capped, so callers can show the true
+        backlog size.
+        """
+        stamp = (now or datetime.now(UTC)).isoformat()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt,
+                       COALESCE(SUM(CASE WHEN command_tier = 4 THEN 1 ELSE 0 END), 0) AS t4
+                FROM pending_prompts
+                WHERE approve_decision IS NULL AND consumed_at IS NULL AND expires_at > ?
+                """,
+                (stamp,),
+            ).fetchone()
+            return int(row["cnt"]), int(row["t4"])
+
     def peek_approve_token(self, *, token: str) -> dict | None:
         """Look up the prompt bound to `token` without consuming it.
 
