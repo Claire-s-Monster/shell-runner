@@ -11,6 +11,7 @@ for tests that don't need a restricted cwd jail.
 from __future__ import annotations
 
 import importlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -266,6 +267,23 @@ def test_pending_list_reports_live_totals(client: TestClient) -> None:
     body = client.post("/pending", json={"include_resolved": True}).json()
     assert body["total"] == 3
     assert body["total_t4"] == 2
+
+
+def test_pending_totals_come_from_the_same_snapshot_as_the_rows(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #140: a prompt created between the list and the count is in neither."""
+    _create_prompt(raw_cmd="pip install a", command_tier=4)
+    original = type(srv.db)._count_live_rows
+
+    def racing_count(conn: sqlite3.Connection, stamp: str) -> tuple[int, int]:
+        _create_prompt(raw_cmd="pip install late", command_tier=4)
+        return original(conn, stamp)
+
+    monkeypatch.setattr(type(srv.db), "_count_live_rows", staticmethod(racing_count))
+    body = client.post("/pending", json={}).json()
+    assert len(body["prompts"]) == 1
+    assert (body["total"], body["total_t4"]) == (1, 1)
 
 
 def test_pending_with_prompt_id_has_no_totals(client: TestClient) -> None:

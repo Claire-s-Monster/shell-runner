@@ -1387,6 +1387,13 @@ class Persistence:
         the approver benefits from seeing a just-expired prompt rather than
         it silently vanishing from the list.
         """
+        with self._conn() as conn:
+            return self._list_pending_rows(conn, include_resolved, limit)
+
+    @staticmethod
+    def _list_pending_rows(
+        conn: sqlite3.Connection, include_resolved: bool, limit: int
+    ) -> list[dict]:
         query = """
             SELECT id, raw_cmd, agent_id, cwd, normalized_template,
                    command_tier, matched_rule_category, expires_at,
@@ -1398,9 +1405,21 @@ class Persistence:
             LIMIT ?
         """
         where = "" if include_resolved else "WHERE approve_decision IS NULL AND consumed_at IS NULL"
-        with self._conn() as conn:
-            rows = conn.execute(query.format(where=where), (limit,)).fetchall()
-            return [dict(row) for row in rows]
+        rows = conn.execute(query.format(where=where), (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _count_live_rows(conn: sqlite3.Connection, stamp: str) -> tuple[int, int]:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt,
+                   COALESCE(SUM(CASE WHEN command_tier = 4 THEN 1 ELSE 0 END), 0) AS t4
+            FROM pending_prompts
+            WHERE approve_decision IS NULL AND consumed_at IS NULL AND expires_at > ?
+            """,
+            (stamp,),
+        ).fetchone()
+        return int(row["cnt"]), int(row["t4"])
 
     def count_live_pending_prompts(self, *, now: datetime | None = None) -> tuple[int, int]:
         """Return (total, total_t4) of live pending prompts (issue #140).
@@ -1411,16 +1430,25 @@ class Persistence:
         """
         stamp = (now or datetime.now(UTC)).isoformat()
         with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT COUNT(*) AS cnt,
-                       COALESCE(SUM(CASE WHEN command_tier = 4 THEN 1 ELSE 0 END), 0) AS t4
-                FROM pending_prompts
-                WHERE approve_decision IS NULL AND consumed_at IS NULL AND expires_at > ?
-                """,
-                (stamp,),
-            ).fetchone()
-            return int(row["cnt"]), int(row["t4"])
+            return self._count_live_rows(conn, stamp)
+
+    def list_pending_with_totals(
+        self, *, include_resolved: bool = False, limit: int = 100
+    ) -> tuple[list[dict], int, int]:
+        """list_pending_prompts plus count_live_pending_prompts from one snapshot.
+
+        Both reads run in a single read transaction on one connection, so a
+        concurrent writer cannot make the rows and the totals disagree.
+        """
+        stamp = datetime.now(UTC).isoformat()
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            try:
+                rows = self._list_pending_rows(conn, include_resolved, limit)
+                total, total_t4 = self._count_live_rows(conn, stamp)
+            finally:
+                conn.execute("COMMIT")
+            return rows, total, total_t4
 
     def peek_approve_token(self, *, token: str) -> dict | None:
         """Look up the prompt bound to `token` without consuming it.

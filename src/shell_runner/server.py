@@ -1962,8 +1962,7 @@ async def get_pending_route(body: GetPendingRequest) -> GetPendingResponse:
         if row is None:
             raise HTTPException(status_code=404, detail=f"prompt {body.prompt_id} not found")
         return GetPendingResponse(prompts=[_prompt_detail(row)])
-    rows = db.list_pending_prompts(include_resolved=body.include_resolved)
-    total, total_t4 = db.count_live_pending_prompts()
+    rows, total, total_t4 = db.list_pending_with_totals(include_resolved=body.include_resolved)
     return GetPendingResponse(
         prompts=[_prompt_detail(r) for r in rows], total=total, total_t4=total_t4
     )
