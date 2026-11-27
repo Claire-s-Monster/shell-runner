@@ -94,23 +94,34 @@ Approvals from this UI POST to the server's `/approve_pending` endpoint with
 reads the telemetry DB read-only and talks to the server at
 `$SHELL_RUNNER_API_URL` (default `http://127.0.0.1:4111`).
 
-## Desktop approval notifier
+## Desktop approval tray
 
-`shell-runner-notify` pops up a desktop notification for each new T3/T4 approval prompt so you do not have to keep the UI page open. It is read-only (it polls `POST /pending`, never approves), uses only the standard library plus the system `notify-send` / `xdg-open`, and is separate from the server.
+`shell-runner-tray` shows a silent icon in the Cinnamon panel with the number of pending T3/T4 approval prompts, so you do not have to keep the UI page open. No popups and no sounds. It is read-only (it polls `POST /pending` and never approves; the menu only opens the Pending Prompts page) and is separate from the server.
+
+| State | Icon | Label | Tooltip |
+|---|---|---|---|
+| Starting (before the first poll; menu holds only Open) | `security-high-symbolic` | empty | `shell-runner: starting…` |
+| 0 pending | `security-high-symbolic` | empty | `shell-runner: no pending prompts` |
+| N pending | `dialog-warning-symbolic` | `N` (`99+` above 99) | `shell-runner: N pending`, plus ` (k × T4)` when k > 0 |
+| Unreachable | `network-offline-symbolic` | `?` | `shell-runner unreachable — retrying (back-off up to 60s)` |
+
+Left or right click opens the menu: up to `--max-items` rows such as `T4 · agent-1 · curl -sI https://example.com · 4m left` (the command is cut at 50 characters and your home directory is shown as `~`), a `… and N more` row when there are more, then `Open Pending Prompts`. Clicking a row or Open runs `xdg-open` on the Pending Prompts page; there are no approve or deny actions in the panel. The time left refreshes on every poll. While the server is unreachable the menu keeps the last known rows that are still live under a `Server unreachable — showing last known` header (just `Server unreachable` when none is still live).
+
+It runs with the system Python 3 (not the project environment) and needs two Debian packages:
 
 ```bash
-PYTHONPATH=src pixi run -e dev python -m shell_runner.notifier      # defaults: poll every 3s
-PYTHONPATH=src pixi run -e dev python -m shell_runner.notifier --interval 5 \
+sudo apt install python3-gi gir1.2-xapp-1.0
+PYTHONPATH=src /usr/bin/python3 -m shell_runner.tray      # defaults: poll every 3s, 10 menu rows
+PYTHONPATH=src /usr/bin/python3 -m shell_runner.tray --interval 5 --max-items 5 \
   --url http://127.0.0.1:4111/pending --ui-url http://127.0.0.1:8511/Pending_Prompts
 ```
 
-`--interval` must be between 0.1 and 3600 seconds. `--url` and `--ui-url` must be http or https URLs with a host.
+`--interval` must be between 0.1 and 3600 seconds, `--max-items` at least 1, and `--url` / `--ui-url` must be http or https URLs with a host.
 
-There is no pixi task for it; it runs as a module from the repo root. To run it as a systemd user service, copy `scripts/shell-runner-notify.service.example` (installation steps are in the file).
+Exit codes: `2` = `python3-gi` or the XApp typelib is missing, or a bad flag (systemd does not restart it); `3` = no display (restarted); `1` = the poll worker crashed (restarted); `0` = stopped by SIGTERM/SIGINT.
 
-- One popup per new prompt (T4 is critical urgency), plus one reminder about 60 seconds before it expires if still undecided.
-- Popups show agent, cwd, the command (cut at 120 characters), time left and any scope warning. Decide on the Pending Prompts page; the popup's "Open" button opens it. If your `notify-send` has no `--action` support, the URL is appended to the popup body instead.
-- If the server is unreachable you get one popup, then quiet retries with back-off until it recovers.
+To run it as a systemd user service, copy `scripts/shell-runner-notify.service.example` to `~/.config/systemd/user/shell-runner-notify.service`. Installation steps, the `graphical-session.target` check and the fallback for sessions that never activate that target are in the file. The unit name is unchanged, so an existing notifier install upgrades in place.
+
 - `POST /pending` is unauthenticated, so keep the server bound to `127.0.0.1` (guarded by `tests/unit/test_service_bind.py`).
 
 ## Approval precedence & agent_cap
